@@ -1,4 +1,4 @@
-```markdown
+
 # PKU Badminton Court Booking Automation
 
 北京大学医学部体育馆羽毛球场地自动化预约工具集。支持定时抢场、空闲监控捡漏、多场地优先级策略等功能。
@@ -40,7 +40,7 @@
 ### 2. 主力脚本使用（final_book_v2.py）
 
 **默认抢 4 天后（第 5 天）的场地：**
-```bash
+
 python final_book_v2.py \
   -k "your_token" \
   -j "your_jsessionid" \
