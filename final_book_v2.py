@@ -52,7 +52,7 @@ class PriceAwareBookingBot:
         self.old_total, self.actual_total = self._calculate_price()
         
         # 场地队列
-        self.priority_list = [f"ymq{i}" for i in (args.priority or [1, 6, 7, 8, 9])]
+        self.priority_list = [f"ymq{i}" for i in (args.priority or [7, 8, 9, 1, 6])]
         self.backup_list = [f"ymq{i}" for i in (args.backup or [2, 3, 4, 5, 10, 11, 12])]
         
         print(f"[配置] 日期: {self.target_date} ({self._weekday_name()})")
@@ -281,7 +281,7 @@ class PriceAwareBookingBot:
             print(f"[错误] {e}")
             return
         
-        print(f"[开始] 启动预约（每1秒重试，最多{self.args.max_retry}次）...")
+        print(f"[开始] 启动预约（每0.5秒重试，最多{self.args.max_retry}次）...")
         
         for attempt in range(1, self.args.max_retry + 1):
             print(f"\n[第{attempt}次] {datetime.now().strftime('%H:%M:%S')}")
@@ -312,7 +312,7 @@ class PriceAwareBookingBot:
                 return
             
             if attempt < self.args.max_retry:
-                time.sleep(1)
+                time.sleep(0.5)
         
         print(f"\n[结束] 未达到目标")
 
@@ -345,7 +345,7 @@ def main():
     date_group.add_argument("--in-days", type=int, help="N天后")
     
     parser.add_argument("-t", "--time", required=True, help="时段 如9-11,14-16,16-18")
-    parser.add_argument("-p", "--priority", nargs="+", type=int, default=[1, 6, 7, 8, 9])
+    parser.add_argument("-p", "--priority", nargs="+", type=int, default=[7, 8, 9, 1, 6])
     parser.add_argument("--backup", nargs="+", type=int, default=[2, 3, 4, 5, 10, 11, 12])
     parser.add_argument("--force", action="store_true", help="立即执行")
     parser.add_argument("--max-retry", type=int, default=60)
@@ -365,18 +365,90 @@ def main():
 
 if __name__ == "__main__":
     main()
+# token oRjsg6asr0-oCgFLVvrunP9NmGOM"
+# cookie 63C410E47DB5E8401C58FEEBAFD4E426 旧的7684B1E6150ED89ACB6916B8FA8847E2
 # # 场景1:默认最新
 # 周四抢下周一(默认4天后)晚上18-20点,自动等到12:00
-# python final_book_v2.py -k oRjsg6asr0-oCgFLVvrunP9NmGOM  -j 7684B1E6150ED89ACB6916B8FA8847E2 -i 1894101490 -t 18-20
+# python final_book_v2.py -k oRjsg6asr0-oCgFLVvrunP9NmGOM  -j 63C410E47DB5E8401C58FEEBAFD4E426 -i 1894101490 -t 18-20
 
 # # 场景2:定时定点
 # 抢明天(1天后)下午14-16点(原价80,实付40)
-# python final_book_v2.py -k oRjsg6asr0-oCgFLVvrunP9NmGOM  -j 7684B1E6150ED89ACB6916B8FA8847E2 -i 1894101490 --in-days 1 -t 14-16
+# python final_book_v2.py -k oRjsg6asr0-oCgFLVvrunP9NmGOM  -j 63C410E47DB5E8401C58FEEBAFD4E426 -i 1894101490 --in-days 1 -t 14-16
 
 # # 场景3:特殊日期
 # 指定2月14日情人节晚上,只抢1号场
-# python final_book_v2.py -k oRjsg6asr0-oCgFLVvrunP9NmGOM  -j 7684B1E6150ED89ACB6916B8FA8847E2 -i 1894101490 -d 2026-02-14 -t 19-21 -p 1 --backup
+# python final_book_v2.py -k oRjsg6asr0-oCgFLVvrunP9NmGOM  -j 63C410E47DB5E8401C58FEEBAFD4E426 -i 1894101490 -d 2026-02-14 -t 19-21 -p 1 --backup
 
 # # 场景4:测试脚本(立即执行,不等待)
-# python final_book_v2.py -k oRjsg6asr0-oCgFLVvrunP9NmGOM  -j 7684B1E6150ED89ACB6916B8FA8847E2 -i 1894101490 -d 2026-02-05 -t 19-21 --force
-# python final_book_v2.py -k oRjsg6asr0-oCgFLVvrunP9NmGOM  -j 7684B1E6150ED89ACB6916B8FA8847E2 -i 1894101490 -d 2026-02-01 -t 17-19 --force
+# python final_book_v2.py -k oRjsg6asr0-oCgFLVvrunP9NmGOM  -j 63C410E47DB5E8401C58FEEBAFD4E426 -i 1894101490 -d 2026-02-05 -t 19-21 --force
+# python final_book_v2.py -k oRjsg6asr0-oCgFLVvrunP9NmGOM  -j 63C410E47DB5E8401C58FEEBAFD4E426 -i 1894101490 -d 2026-02-01 -t 17-19 --force
+
+
+# (base) billmrcchen@192 自动化抢场地 % python final_book_v2.py -k oRjsg6asr0-oCgFLVvrunP9NmGOM  -j 63C410E47DB5E8401C58FEEBAFD4E426 -i 1894101490 -d 2026-03-08 -t 19-21
+# [配置] 日期: 2026-03-08 (周日)
+# [配置] 时段: 19:00-21:00 (2小时)
+# [配置] 原价: ¥240, 实付: ¥60.00
+# [配置] 优先: ['ymq7', 'ymq8', 'ymq9', 'ymq1', 'ymq6']
+# [配置] 备选: ['ymq2', 'ymq3', 'ymq4', 'ymq5', 'ymq10', 'ymq11', 'ymq12']
+# [等待] 当前 11:41:36，等待到 12:00:00.001...
+#  11:42:00: [等待] 剩余 1079.753 秒...
+#  11:42:00: [等待] 剩余 1079.247 秒...
+#  11:43:00: [等待] 剩余 1019.794 秒...
+#  11:43:00: [等待] 剩余 1019.289 秒...
+#  11:44:00: [等待] 剩余 959.844 秒...
+#  11:44:00: [等待] 剩余 959.342 秒...
+#  11:45:00: [等待] 剩余 899.873 秒...
+#  11:45:00: [等待] 剩余 899.369 秒...
+#  11:46:00: [等待] 剩余 839.907 秒...
+#  11:46:00: [等待] 剩余 839.400 秒...
+#  11:47:00: [等待] 剩余 779.863 秒...
+#  11:47:00: [等待] 剩余 779.341 秒...
+#  11:48:00: [等待] 剩余 719.889 秒...
+#  11:48:00: [等待] 剩余 719.379 秒...
+#  11:49:00: [等待] 剩余 659.964 秒...
+#  11:49:00: [等待] 剩余 659.454 秒...
+#  11:50:00: [等待] 剩余 599.828 秒...
+#  11:50:00: [等待] 剩余 599.323 秒...
+#  11:51:00: [等待] 剩余 539.863 秒...
+#  11:51:00: [等待] 剩余 539.357 秒...
+#  11:52:00: [等待] 剩余 479.911 秒...
+#  11:52:00: [等待] 剩余 479.408 秒...
+#  11:53:00: [等待] 剩余 419.925 秒...
+#  11:53:00: [等待] 剩余 419.420 秒...
+#  11:54:00: [等待] 剩余 359.933 秒...
+#  11:54:00: [等待] 剩余 359.431 秒...
+#  11:55:00: [等待] 剩余 299.976 秒...
+#  11:55:00: [等待] 剩余 299.470 秒...
+#  11:56:00: [等待] 剩余 239.560 秒...
+#  11:56:00: [等待] 剩余 239.051 秒...
+#  11:57:00: [等待] 剩余 179.592 秒...
+#  11:57:00: [等待] 剩余 179.082 秒...
+#  11:58:00: [等待] 剩余 119.627 秒...
+#  11:58:00: [等待] 剩余 119.121 秒...
+#  11:59:00: [等待] 剩余 59.623 秒...
+#  11:59:00: [等待] 剩余 59.114 秒...
+#  12:00:00: [等待] 剩余 0.000 秒...
+# [触发] 12:00:00.001
+# [开始] 启动预约（每0.5秒重试，最多60次）...
+
+# [第1次] 12:00:00
+
+# [第2次] 12:00:01
+
+# [第3次] 12:00:02
+
+# [尝试] 羽毛球7 19:00-21:00
+#   [×] fail
+
+# [尝试] 羽毛球8 19:00-21:00
+#   [×] canBook 未通过
+
+# [尝试] 羽毛球5 19:00-21:00
+#   [×] canBook 未通过
+
+# [尝试] 羽毛球11 19:00-21:00
+# [✓] 预约成功！羽毛球11 2026-03-08 19:00-21:00
+
+# [完成] 预约成功！
+# (base) billmrcchen@192 自动化抢场地 % python final_book_v2.py -k oRjsg6asr0-oCgFLVvrunP9NmGOM  -j 7684B1E6150ED89ACB6916B8FA8847E2 -i 1894101490 -d 2026-03-08 -t 19-21
+# (base) billmrcchen@192 自动化抢场地 % 
