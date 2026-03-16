@@ -464,10 +464,10 @@ class MonitorBookingBot:
                 for court_id in self.court_order:
                     court_info = self.inspect_two_hour_slot(places, court_id, date_str, start_h)
                     if len(court_info["bookable_slots"]) != 2:
-                        self.logger.info(
-                            f"[跳过] {court_info['fullname']}({court_id}) "
-                            f"{date_str} {start_h}:00-{end_h}:00 | {court_info['state_summary']}"
-                        )
+                        # self.logger.info(
+                        #     f"[跳过] {court_info['fullname']}({court_id}) "
+                        #     f"{date_str} {start_h}:00-{end_h}:00 | {court_info['state_summary']}"
+                        # )
                         continue
 
                     success = self.attempt_book(court_info)
