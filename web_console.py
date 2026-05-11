@@ -8,6 +8,7 @@ Local web console for booking operations.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -25,7 +26,6 @@ from urllib.parse import parse_qs, urlsplit
 
 from easyserp_client import (
     DEFAULT_BASE_URL,
-    DEFAULT_CARD_INDEX,
     DEFAULT_JSESSIONID,
     DEFAULT_SHORT_NAME,
     DEFAULT_SHOP_NUM,
@@ -48,19 +48,30 @@ ROOT = Path(__file__).resolve().parent
 WEB_DIR = ROOT / "web"
 BOOKING_SCRIPT = ROOT / "enhanced_book_smart_v2.py"
 HISTORY_PATH = ROOT / "logs" / "booking_history.json"
+USERS_PATH = ROOT / "local" / "users.csv"
 DEFAULT_WEB_PORT = int(os.getenv("DAYDAYUP_WEB_PORT", "8788"))
 WALL_COURTS = {1, 5, 12}
+USER_FIELDS = ("type", "key", "label", "password", "token", "jsessionid", "card_name", "enabled")
+DEFAULT_CARD_NAME = "学生球类卡"
+DEFAULT_USER_KEY = "chen_qixuan"
+DEFAULT_USER_LABEL = "陈启轩"
 
 
 @dataclass
 class ServerConfig:
-    token: str
-    jsessionid: str
-    card_index: str
     shop_num: str
     base_url: str
     timeout: float
-    access_key: str
+
+
+@dataclass(frozen=True)
+class UserAccount:
+    key: str
+    label: str
+    token: str
+    jsessionid: str
+    card_name: str
+    enabled: bool
 
 
 @dataclass
@@ -76,6 +87,172 @@ class BookingJob:
     history_finalized: bool = False
 
 
+class UserStore:
+    def __init__(self, path: Path, *, default_token: str, default_jsessionid: str):
+        self.path = path
+        self.default_token = default_token
+        self.default_jsessionid = default_jsessionid
+        self.lock = threading.Lock()
+        self.ensure_exists()
+
+    def ensure_exists(self) -> None:
+        with self.lock:
+            if self.path.exists():
+                return
+            rows = [
+                {
+                    "type": "config",
+                    "key": "web_access",
+                    "label": "网页访问",
+                    "password": "abc123",
+                    "token": "",
+                    "jsessionid": "",
+                    "card_name": "",
+                    "enabled": "1",
+                },
+                {
+                    "type": "config",
+                    "key": "admin",
+                    "label": "用户管理",
+                    "password": "abc123",
+                    "token": "",
+                    "jsessionid": "",
+                    "card_name": "",
+                    "enabled": "1",
+                },
+                {
+                    "type": "user",
+                    "key": DEFAULT_USER_KEY,
+                    "label": DEFAULT_USER_LABEL,
+                    "password": "",
+                    "token": self.default_token,
+                    "jsessionid": self.default_jsessionid,
+                    "card_name": DEFAULT_CARD_NAME,
+                    "enabled": "1",
+                },
+            ]
+            self._write_rows_unlocked(rows)
+
+    def verify_access(self, value: str) -> bool:
+        return bool(value) and value == self.config_password("web_access")
+
+    def verify_admin(self, value: str) -> bool:
+        return bool(value) and value == self.config_password("admin")
+
+    def config_password(self, key: str) -> str:
+        with self.lock:
+            for row in self._read_rows_unlocked():
+                if row.get("type") == "config" and row.get("key") == key:
+                    return clean_string(row.get("password"))
+        return ""
+
+    def list_users(self) -> list[UserAccount]:
+        with self.lock:
+            return [self._row_to_account(row) for row in self._read_rows_unlocked() if row.get("type") == "user"]
+
+    def enabled_users(self) -> list[UserAccount]:
+        return [user for user in self.list_users() if user.enabled]
+
+    def get_user(self, user_key: str = "") -> UserAccount:
+        users = self.enabled_users()
+        if not users:
+            raise EasySerpError("no enabled users")
+        if not user_key:
+            return users[0]
+        for user in users:
+            if user.key == user_key:
+                return user
+        raise EasySerpError("selected user is not available")
+
+    def upsert_user(self, payload: dict[str, Any]) -> UserAccount:
+        key = clean_user_key(payload.get("key"))
+        label = clean_string(payload.get("label"))
+        token = clean_string(payload.get("token"))
+        jsessionid = clean_string(payload.get("jsessionid"))
+        card_name = clean_string(payload.get("card_name")) or DEFAULT_CARD_NAME
+        enabled = "1" if payload.get("enabled", True) else "0"
+        if not key:
+            key = clean_user_key(label)
+        if not key:
+            raise EasySerpError("user key is required")
+        if not label:
+            raise EasySerpError("user label is required")
+
+        with self.lock:
+            rows = self._read_rows_unlocked()
+            updated = False
+            saved_row = None
+            for row in rows:
+                if row.get("type") == "user" and row.get("key") == key:
+                    if not token:
+                        token = clean_string(row.get("token"))
+                    if not jsessionid:
+                        jsessionid = clean_string(row.get("jsessionid"))
+                    if not token:
+                        raise EasySerpError("token is required")
+                    row.update(
+                        {
+                            "label": label,
+                            "token": token,
+                            "jsessionid": jsessionid,
+                            "card_name": card_name,
+                            "enabled": enabled,
+                        }
+                    )
+                    updated = True
+                    saved_row = dict(row)
+                    break
+            if not updated:
+                if not token:
+                    raise EasySerpError("token is required")
+                rows.append(
+                    {
+                        "type": "user",
+                        "key": key,
+                        "label": label,
+                        "password": "",
+                        "token": token,
+                        "jsessionid": jsessionid,
+                        "card_name": card_name,
+                        "enabled": enabled,
+                    }
+                )
+                saved_row = dict(rows[-1])
+            self._write_rows_unlocked(rows)
+        return self._row_to_account(saved_row or {})
+
+    def _read_rows_unlocked(self) -> list[dict[str, str]]:
+        if not self.path.exists():
+            return []
+        with self.path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows = []
+            for row in reader:
+                rows.append({field: clean_string(row.get(field)) for field in USER_FIELDS})
+            return rows
+
+    def _write_rows_unlocked(self, rows: list[dict[str, str]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_suffix(".tmp")
+        with tmp_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=USER_FIELDS)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({field: row.get(field, "") for field in USER_FIELDS})
+        tmp_path.replace(self.path)
+
+    @staticmethod
+    def _row_to_account(row: dict[str, str]) -> UserAccount:
+        return UserAccount(
+            key=clean_string(row.get("key")),
+            label=clean_string(row.get("label")),
+            token=clean_string(row.get("token")),
+            jsessionid=clean_string(row.get("jsessionid")),
+            card_name=clean_string(row.get("card_name")) or DEFAULT_CARD_NAME,
+            enabled=clean_string(row.get("enabled")) != "0",
+        )
+
+
 class BookingHistoryStore:
     def __init__(self, path: Path):
         self.path = path
@@ -87,7 +264,7 @@ class BookingHistoryStore:
         records.sort(key=lambda item: item.get("requested_ts", 0), reverse=True)
         return records[:limit]
 
-    def create(self, payload: dict[str, Any], job_id: int, command_label: str) -> str:
+    def create(self, payload: dict[str, Any], job_id: int, command_label: str, user: UserAccount) -> str:
         now = time.time()
         record_id = str(int(now * 1000))
         record = {
@@ -97,6 +274,8 @@ class BookingHistoryStore:
             "requested_ts": now,
             "target_date": target_date_from_payload(payload),
             "target_time": clean_string(payload.get("time")) or "17-21",
+            "user_key": user.key,
+            "user_label": user.label,
             "success_target": "",
             "result": "运行中",
             "status": "running",
@@ -144,16 +323,16 @@ class JobManager:
         self.job: BookingJob | None = None
         self.next_id = 1
 
-    def start(self, payload: dict[str, Any]) -> BookingJob:
+    def start(self, payload: dict[str, Any], user: UserAccount, card_index: str) -> BookingJob:
         with self.lock:
             if self.job and self.job.status in ("running", "stopping"):
                 raise EasySerpError("a booking job is already running")
 
             command, command_label = build_booking_command(payload)
             env = os.environ.copy()
-            env["DAYDAYUP_TOKEN"] = self.config.token
-            env["DAYDAYUP_JSESSIONID"] = self.config.jsessionid
-            env["DAYDAYUP_CARD_INDEX"] = self.config.card_index
+            env["DAYDAYUP_TOKEN"] = user.token
+            env["DAYDAYUP_JSESSIONID"] = user.jsessionid
+            env["DAYDAYUP_CARD_INDEX"] = card_index
 
             process = subprocess.Popen(
                 command,
@@ -165,7 +344,7 @@ class JobManager:
                 bufsize=1,
             )
             job = BookingJob(self.next_id, process, time.time(), command_label, "")
-            job.history_id = self.history.create(payload, job.id, command_label)
+            job.history_id = self.history.create(payload, job.id, command_label, user)
             self.next_id += 1
             self.job = job
             threading.Thread(target=self._read_output, args=(job,), daemon=True).start()
@@ -287,6 +466,16 @@ def clean_string(value: Any) -> str:
     return str(value).strip()
 
 
+def clean_user_key(value: Any) -> str:
+    text = clean_string(value).lower()
+    text = re.sub(r"[^a-z0-9_]+", "_", text)
+    return re.sub(r"_+", "_", text).strip("_")
+
+
+def single_query(query: dict[str, list[str]], key: str) -> str:
+    return clean_string(query.get(key, [""])[0])
+
+
 def serialize_job(job: BookingJob) -> dict[str, Any]:
     return {
         "id": job.id,
@@ -349,63 +538,98 @@ def summarize_job_history(job: BookingJob) -> dict[str, Any]:
 
 
 class WebConsole:
-    def __init__(self, config: ServerConfig):
+    def __init__(self, config: ServerConfig, users: UserStore):
         self.config = config
+        self.users = users
         self.history = BookingHistoryStore(HISTORY_PATH)
         self.jobs = JobManager(config, self.history)
 
-    def client(self) -> EasySerpClient:
+    def client(self, user: UserAccount) -> EasySerpClient:
         return EasySerpClient(
             self.config.base_url,
-            self.config.token,
-            self.config.jsessionid,
+            user.token,
+            user.jsessionid,
             self.config.timeout,
         )
 
-    def status(self) -> dict[str, Any]:
+    def auth_login(self, payload: dict[str, Any]) -> dict[str, Any]:
+        password = clean_string(payload.get("password"))
+        if not self.users.verify_access(password):
+            raise EasySerpAuthError("invalid access password")
+        return {"ok": True}
+
+    def user_list(self) -> dict[str, Any]:
+        users = self.users.list_users()
+        default_user = self.users.get_user("")
         return {
-            "token": credential_state(self.config.token),
-            "jsessionid": credential_state(self.config.jsessionid),
-            "card_index": credential_state(self.config.card_index),
+            "users": [serialize_user(user) for user in users],
+            "default_user_key": default_user.key,
+            "updated_at": time.time(),
+        }
+
+    def unlock_users(self, payload: dict[str, Any]) -> dict[str, Any]:
+        admin_password = clean_string(payload.get("admin_password"))
+        if not self.users.verify_admin(admin_password):
+            raise EasySerpAuthError("invalid admin password")
+        return {"ok": True}
+
+    def save_user(self, payload: dict[str, Any]) -> dict[str, Any]:
+        admin_password = clean_string(payload.get("admin_password"))
+        if not self.users.verify_admin(admin_password):
+            raise EasySerpAuthError("invalid admin password")
+        user = self.users.upsert_user(payload)
+        return {"user": serialize_user(user), "users": [serialize_user(item) for item in self.users.list_users()]}
+
+    def status(self, user_key: str = "") -> dict[str, Any]:
+        user = self.users.get_user(user_key)
+        return {
+            "user": serialize_user(user),
+            "token": credential_state(user.token),
+            "jsessionid": credential_state(user.jsessionid),
+            "card_name": user.card_name,
             "base_url": self.config.base_url,
             "shop_num": self.config.shop_num,
         }
 
-    def cards(self) -> dict[str, Any]:
+    def cards(self, user_key: str = "") -> dict[str, Any]:
+        user = self.users.get_user(user_key)
         data = require_success(
-            self.client().get(
+            self.client(user).get(
                 "card/getCardByUser",
-                params={"shopNum": self.config.shop_num, "token": self.config.token},
+                params={"shopNum": self.config.shop_num, "token": user.token},
             ),
             "getCardByUser",
         )
         if not isinstance(data, list):
             raise EasySerpError("card response is not a list")
         cards = [serialize_card(card) for card in data]
-        positive = [card for card in cards if card["cash_balance_value"] > 0]
+        primary = select_primary_card(cards, user.card_name)
         return {
             "cards": cards,
-            "primary_card": positive[0] if positive else (cards[0] if cards else None),
+            "primary_card": primary,
+            "user": serialize_user(user),
             "updated_at": time.time(),
         }
 
-    def bookings(self, include_cancelled: bool = False, success_only: bool = False) -> dict[str, Any]:
+    def bookings(self, user_key: str = "", include_cancelled: bool = False, success_only: bool = False) -> dict[str, Any]:
+        user = self.users.get_user(user_key)
         orders = fetch_orders(
-            self.client(),
-            token=self.config.token,
+            self.client(user),
+            token=user.token,
             shop_num=self.config.shop_num,
             page_size=20,
             max_pages=5,
         )
         if success_only or not include_cancelled:
             orders = [order for order in orders if not is_cancelled(order)]
-        return {"bookings": [serialize_order(order) for order in orders], "updated_at": time.time()}
+        return {"bookings": [serialize_order(order) for order in orders], "user": serialize_user(user), "updated_at": time.time()}
 
-    def availability(self, days: int = 5) -> dict[str, Any]:
-        if not self.config.token:
+    def availability(self, user_key: str = "", days: int = 5) -> dict[str, Any]:
+        user = self.users.get_user(user_key)
+        if not user.token:
             raise EasySerpError("token is required for availability query")
         days = max(1, min(days, 7))
-        client = self.client()
+        client = self.client(user)
         results = []
         today = date.today()
         for offset in range(days):
@@ -418,7 +642,7 @@ class WebConsole:
                         "shopNum": self.config.shop_num,
                         "dateymd": date_value,
                         "shortName": DEFAULT_SHORT_NAME,
-                        "token": self.config.token,
+                        "token": user.token,
                     },
                 )
                 data = require_success(payload, "getPlaceInfoByShortNameDiscount")
@@ -434,10 +658,11 @@ class WebConsole:
                         "error": redact_sensitive_text(exc),
                     }
                 )
-        return {"days": results, "updated_at": time.time()}
+        return {"days": results, "user": serialize_user(user), "updated_at": time.time()}
 
-    def cancel_preview(self, bill_num: str) -> dict[str, Any]:
-        order = self._find_recent_order(bill_num)
+    def cancel_preview(self, bill_num: str, user_key: str = "") -> dict[str, Any]:
+        user = self.users.get_user(user_key)
+        order = self._find_recent_order(bill_num, user)
         if not order:
             raise EasySerpError("bill number was not found in recent bookings")
         if order and is_cancelled(order):
@@ -450,12 +675,12 @@ class WebConsole:
         refund_rule = None
         if short_name:
             rule_data = require_success(
-                self.client().get(
+                self.client(user).get(
                     "common/getRefundTime",
                     params={
                         "shortName": short_name,
                         "shopNum": self.config.shop_num,
-                        "token": self.config.token,
+                        "token": user.token,
                         "type": "place",
                     },
                 ),
@@ -465,9 +690,9 @@ class WebConsole:
                 refund_rule = rule_data[0]
 
         refund_money = require_success(
-            self.client().get(
+            self.client(user).get(
                 "place/getCanclePlaceMoney",
-                params={"billNum": bill_num, "token": self.config.token},
+                params={"billNum": bill_num, "token": user.token},
             ),
             "getCanclePlaceMoney",
         )
@@ -475,9 +700,11 @@ class WebConsole:
             "booking": serialize_order(order) if order else None,
             "refund": serialize_refund(refund_money),
             "rule": serialize_refund_rule(refund_rule),
+            "user": serialize_user(user),
         }
 
     def cancel(self, payload: dict[str, Any]) -> dict[str, Any]:
+        user = self.users.get_user(clean_string(payload.get("user_key")))
         bill_num = clean_string(payload.get("bill_num"))
         reason = clean_string(payload.get("reason")) or "weather"
         confirmation = clean_string(payload.get("confirmation"))
@@ -485,24 +712,24 @@ class WebConsole:
             raise EasySerpError("confirmation must be CANCEL")
         if not bill_num:
             raise EasySerpError("missing bill number")
-        order = self._find_recent_order(bill_num)
+        order = self._find_recent_order(bill_num, user)
         if not order:
             raise EasySerpError("bill number was not found in recent bookings")
         if is_cancelled(order):
             raise EasySerpError("booking is already cancelled")
 
-        response = self.client().post(
+        response = self.client(user).post(
             "place/canclePlaceAppointment",
             data={
                 "outtradeno": bill_num,
-                "token": self.config.token,
+                "token": user.token,
                 "reason": reason,
                 "affiliateCard": clean_string(payload.get("affiliate_card")),
             },
         )
         time.sleep(0.8)
-        bookings = self.bookings(include_cancelled=True)
-        cards = self.cards()
+        bookings = self.bookings(user.key, include_cancelled=True)
+        cards = self.cards(user.key)
         order = next((item for item in bookings["bookings"] if item["bill_num"] == bill_num), None)
         confirmed = order is None or "取消" in (order.get("status") or "")
         return {
@@ -512,22 +739,53 @@ class WebConsole:
             "bookings": bookings["bookings"],
             "cards": cards["cards"],
             "primary_card": cards["primary_card"],
+            "user": serialize_user(user),
             "updated_at": time.time(),
         }
 
     def start_booking(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if not self.config.token or not self.config.card_index:
-            raise EasySerpError("token and card index are required for booking")
-        job = self.jobs.start(payload)
-        return {"job": serialize_job(job)}
+        user = self.users.get_user(clean_string(payload.get("user_key")))
+        if not user.token:
+            raise EasySerpError("token is required for booking")
+        card = self.resolve_booking_card(user)
+        job = self.jobs.start(payload, user, card["card_index_raw"])
+        return {"job": serialize_job(job), "user": serialize_user(user), "card": mask_booking_card(card)}
 
-    def booking_history(self) -> dict[str, Any]:
-        return {"history": self.history.list(), "updated_at": time.time()}
+    def booking_history(self, user_key: str = "") -> dict[str, Any]:
+        history = self.history.list()
+        if user_key:
+            default_key = self.users.get_user("").key
+            history = [
+                item
+                for item in history
+                if item.get("user_key") == user_key or (not item.get("user_key") and user_key == default_key)
+            ]
+        return {"history": history, "updated_at": time.time()}
 
-    def _find_recent_order(self, bill_num: str) -> dict[str, Any] | None:
+    def resolve_booking_card(self, user: UserAccount) -> dict[str, Any]:
+        data = require_success(
+            self.client(user).get(
+                "card/getCardByUser",
+                params={"shopNum": self.config.shop_num, "token": user.token},
+            ),
+            "getCardByUser",
+        )
+        if not isinstance(data, list):
+            raise EasySerpError("card response is not a list")
+        matches = [card for card in data if card_name_matches(card, user.card_name) and float_or_zero(card.get("cardcash")) > 0]
+        if not matches:
+            raise EasySerpError(f"no positive balance card matched {user.card_name}")
+        raw_index = clean_string(matches[0].get("cardindex"))
+        if not raw_index:
+            raise EasySerpError("selected card has no card index")
+        card = serialize_card(matches[0])
+        card["card_index_raw"] = raw_index
+        return card
+
+    def _find_recent_order(self, bill_num: str, user: UserAccount) -> dict[str, Any] | None:
         orders = fetch_orders(
-            self.client(),
-            token=self.config.token,
+            self.client(user),
+            token=user.token,
             shop_num=self.config.shop_num,
             page_size=20,
             max_pages=5,
@@ -537,6 +795,23 @@ class WebConsole:
 
 def credential_state(value: str) -> dict[str, Any]:
     return {"present": bool(value), "length": len(value or "")}
+
+
+class EasySerpAuthError(EasySerpError):
+    pass
+
+
+def serialize_user(user: UserAccount) -> dict[str, Any]:
+    return {
+        "key": user.key,
+        "label": user.label,
+        "enabled": user.enabled,
+        "card_name": user.card_name,
+        "credential_status": {
+            "token": credential_state(user.token),
+            "jsessionid": credential_state(user.jsessionid),
+        },
+    }
 
 
 def serialize_card(card: dict[str, Any]) -> dict[str, Any]:
@@ -551,6 +826,25 @@ def serialize_card(card: dict[str, Any]) -> dict[str, Any]:
         "times_balance": card.get("cardtime") or card.get("shouChuCiShu") or "",
         "paid_amount": format_amount(card.get("shouChuJinE")),
     }
+
+
+def select_primary_card(cards: list[dict[str, Any]], card_name: str) -> dict[str, Any] | None:
+    preferred = [card for card in cards if card.get("cash_balance_value", 0) > 0 and card_name in str(card.get("card_name", ""))]
+    if preferred:
+        return preferred[0]
+    positive = [card for card in cards if card.get("cash_balance_value", 0) > 0]
+    return positive[0] if positive else (cards[0] if cards else None)
+
+
+def card_name_matches(card: dict[str, Any], card_name: str) -> bool:
+    text = " ".join(str(card.get(key) or "") for key in ("cardname", "shortcardname"))
+    return card_name in text
+
+
+def mask_booking_card(card: dict[str, Any]) -> dict[str, Any]:
+    result = dict(card)
+    result.pop("card_index_raw", None)
+    return result
 
 
 def serialize_order(order: dict[str, Any]) -> dict[str, Any]:
@@ -668,6 +962,8 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         try:
             self.route_get()
+        except EasySerpAuthError as exc:
+            self.write_json({"error": redact_sensitive_text(exc)}, HTTPStatus.UNAUTHORIZED)
         except EasySerpError as exc:
             self.write_json({"error": redact_sensitive_text(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
@@ -676,6 +972,8 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             self.route_post()
+        except EasySerpAuthError as exc:
+            self.write_json({"error": redact_sensitive_text(exc)}, HTTPStatus.UNAUTHORIZED)
         except EasySerpError as exc:
             self.write_json({"error": redact_sensitive_text(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
@@ -689,16 +987,21 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/status":
             if not self.authorized():
                 return
-            self.write_json(app.status())
+            self.write_json(app.status(single_query(query, "user_key")))
+        elif parsed.path == "/api/users":
+            if not self.authorized():
+                return
+            self.write_json(app.user_list())
         elif parsed.path == "/api/cards":
             if not self.authorized():
                 return
-            self.write_json(app.cards())
+            self.write_json(app.cards(single_query(query, "user_key")))
         elif parsed.path == "/api/bookings":
             if not self.authorized():
                 return
             self.write_json(
                 app.bookings(
+                    user_key=single_query(query, "user_key"),
                     include_cancelled=query.get("all", ["0"])[0] == "1",
                     success_only=query.get("success", ["0"])[0] == "1",
                 )
@@ -707,11 +1010,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return
             days = int(query.get("days", ["5"])[0] or "5")
-            self.write_json(app.availability(days=days))
+            self.write_json(app.availability(single_query(query, "user_key"), days=days))
         elif parsed.path == "/api/booking/history":
             if not self.authorized():
                 return
-            self.write_json(app.booking_history())
+            self.write_json(app.booking_history(single_query(query, "user_key")))
         elif parsed.path == "/api/booking/job":
             if not self.authorized():
                 return
@@ -725,15 +1028,22 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
     def route_post(self) -> None:
-        if self.path.startswith("/api/") and not self.authorized():
-            return
         app = self.console
         payload = self.read_json()
-        if self.path == "/api/cancel/preview":
+        if self.path == "/api/auth/login":
+            self.write_json(app.auth_login(payload))
+            return
+        if self.path.startswith("/api/") and not self.authorized():
+            return
+        if self.path == "/api/users/unlock":
+            self.write_json(app.unlock_users(payload))
+        elif self.path == "/api/users":
+            self.write_json(app.save_user(payload))
+        elif self.path == "/api/cancel/preview":
             bill_num = clean_string(payload.get("bill_num"))
             if not bill_num:
                 raise EasySerpError("missing bill number")
-            self.write_json(app.cancel_preview(bill_num))
+            self.write_json(app.cancel_preview(bill_num, clean_string(payload.get("user_key"))))
         elif self.path == "/api/cancel":
             self.write_json(app.cancel(payload))
         elif self.path == "/api/booking/start":
@@ -766,10 +1076,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def authorized(self) -> bool:
-        access_key = self.console.config.access_key
-        if not access_key:
-            return True
-        if self.headers.get("X-Daydayup-Key") == access_key:
+        if self.console.users.verify_access(self.headers.get("X-Daydayup-Key", "")):
             return True
         self.write_json({"error": "access key required"}, HTTPStatus.UNAUTHORIZED)
         return False
@@ -800,30 +1107,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=DEFAULT_WEB_PORT, help="port to bind")
     parser.add_argument("-k", "--token", default=DEFAULT_TOKEN, help="wechat token")
     parser.add_argument("-j", "--jsessionid", default=DEFAULT_JSESSIONID, help="JSESSIONID")
-    parser.add_argument("-i", "--card-index", default=DEFAULT_CARD_INDEX, help="card index / offer id")
     parser.add_argument("--shop-num", default=DEFAULT_SHOP_NUM, help="shop number")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="EasySERP API base URL")
     parser.add_argument("--timeout", type=float, default=10.0, help="request timeout in seconds")
-    parser.add_argument("--access-key", default=os.getenv("DAYDAYUP_WEB_KEY", ""), help="optional API access key")
+    parser.add_argument("--users-csv", default=str(USERS_PATH), help="local users CSV path")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     config = ServerConfig(
-        token=args.token,
-        jsessionid=args.jsessionid,
-        card_index=args.card_index,
         shop_num=args.shop_num,
         base_url=args.base_url,
         timeout=args.timeout,
-        access_key=args.access_key,
     )
+    users = UserStore(Path(args.users_csv), default_token=args.token, default_jsessionid=args.jsessionid)
     httpd = ThreadingHTTPServer((args.host, args.port), RequestHandler)
-    httpd.console = WebConsole(config)  # type: ignore[attr-defined]
+    httpd.console = WebConsole(config, users)  # type: ignore[attr-defined]
     print(f"Daydayup web console running at http://{args.host}:{args.port}")
-    print(f"Token present={bool(config.token)} JSESSIONID present={bool(config.jsessionid)} card present={bool(config.card_index)}")
-    print(f"Access key enabled={bool(config.access_key)}")
+    print(f"Users CSV={users.path}")
+    print(f"Enabled users={len(users.enabled_users())}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

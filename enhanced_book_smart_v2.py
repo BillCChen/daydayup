@@ -445,8 +445,10 @@ class SmartBookingBotV2:
             return False, "no_result"
         if result.status >= 500 or result.status == 0:
             return False, f"http_{result.status}"
-        if result.json_error or not result.json_data:
+        if result.json_error or result.json_data is None:
             return False, "invalid_json"
+        if not isinstance(result.json_data, dict):
+            return False, f"unexpected_json_type={type(result.json_data).__name__}"
         msg = result.json_data.get("msg")
         if msg == "success":
             return True, ""

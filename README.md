@@ -19,10 +19,10 @@ uv run python web_console.py
 
 Default URL: `http://127.0.0.1:8788`.
 
-For LAN access, set an access key and bind all interfaces:
+For LAN access, bind all interfaces and use the CSV access password:
 
 ```bash
-DAYDAYUP_WEB_KEY="local-key" uv run python web_console.py --host 0.0.0.0
+uv run python web_console.py --host 0.0.0.0
 ```
 
 ## CLI

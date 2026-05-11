@@ -8,6 +8,10 @@ const state = {
   startHour: 17,
   endHour: 21,
   priorityCourts: [7, 8, 9, 6],
+  users: [],
+  selectedUserKey: "",
+  userManagementUnlocked: false,
+  adminPassword: "",
 };
 
 const SAFE_COURTS = [2, 3, 4, 6, 7, 8, 9, 10, 11];
@@ -17,6 +21,15 @@ const MIN_HOUR = 8;
 const MAX_HOUR = 23;
 
 const els = {
+  authScreen: document.querySelector("#authScreen"),
+  authForm: document.querySelector("#authForm"),
+  authMessage: document.querySelector("#authMessage"),
+  appShell: document.querySelector("#appShell"),
+  userSelect: document.querySelector("#userSelect"),
+  activeUserLabel: document.querySelector("#activeUserLabel"),
+  userUnlockForm: document.querySelector("#userUnlockForm"),
+  lockUserPanel: document.querySelector("#lockUserPanel"),
+  userForm: document.querySelector("#userForm"),
   refreshAll: document.querySelector("#refreshAll"),
   refreshCards: document.querySelector("#refreshCards"),
   tokenState: document.querySelector("#tokenState"),
@@ -74,20 +87,57 @@ async function api(path, options = {}) {
     ...options,
   });
   if (response.status === 401) {
-    const value = window.prompt("请输入访问口令") || "";
-    if (value) {
-      localStorage.setItem("daydayupAccessKey", value);
-      response = await fetch(path, {
-        headers: { ...headers, "X-Daydayup-Key": value },
-        ...options,
-      });
-    }
+    localStorage.removeItem("daydayupAccessKey");
+    showLogin();
   }
   const payload = await response.json();
   if (!response.ok) {
     throw new Error(payload.error || "request failed");
   }
   return payload;
+}
+
+function userScopedPath(path) {
+  if (!state.selectedUserKey) {
+    return path;
+  }
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}user_key=${encodeURIComponent(state.selectedUserKey)}`;
+}
+
+async function login(event) {
+  event.preventDefault();
+  const password = new FormData(els.authForm).get("password") || "";
+  try {
+    await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    }).then(async (response) => {
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || "login failed");
+      }
+      return payload;
+    });
+    localStorage.setItem("daydayupAccessKey", password);
+    els.authForm.reset();
+    await showApp();
+  } catch (error) {
+    els.authMessage.textContent = `访问失败: ${error.message}`;
+  }
+}
+
+function showLogin() {
+  els.authScreen.classList.remove("hidden");
+  els.appShell.classList.add("hidden");
+}
+
+async function showApp() {
+  els.authScreen.classList.add("hidden");
+  els.appShell.classList.remove("hidden");
+  await loadUsers();
+  await refreshAll();
 }
 
 function setPill(el, text, tone = "") {
@@ -110,8 +160,47 @@ function addUiLog(text, strong = false) {
   }
 }
 
+async function loadUsers() {
+  const data = await api("/api/users");
+  state.users = data.users || [];
+  if (!state.selectedUserKey || !state.users.some((user) => user.key === state.selectedUserKey)) {
+    state.selectedUserKey = data.default_user_key || state.users[0]?.key || "";
+  }
+  renderUsers();
+  return data;
+}
+
+function renderUsers() {
+  els.userSelect.innerHTML = state.users.map((user) => `
+    <option value="${escapeAttr(user.key)}" ${user.key === state.selectedUserKey ? "selected" : ""}>
+      ${escapeHtml(user.label)}
+    </option>
+  `).join("");
+  const current = currentUser();
+  els.activeUserLabel.textContent = current ? current.label : "未选择";
+  if (current) {
+    els.userForm.elements.key.value = current.key;
+    els.userForm.elements.label.value = current.label;
+    els.userForm.elements.token.value = "";
+    els.userForm.elements.jsessionid.value = "";
+    els.userForm.elements.card_name.value = current.card_name || "学生球类卡";
+    els.userForm.elements.enabled.checked = current.enabled !== false;
+  }
+  renderUserManagementLock();
+}
+
+function currentUser() {
+  return state.users.find((user) => user.key === state.selectedUserKey) || null;
+}
+
+function renderUserManagementLock() {
+  els.userUnlockForm.classList.toggle("hidden", state.userManagementUnlocked);
+  els.userForm.classList.toggle("hidden", !state.userManagementUnlocked);
+  els.lockUserPanel.classList.toggle("hidden", !state.userManagementUnlocked);
+}
+
 async function loadStatus() {
-  const status = await api("/api/status");
+  const status = await api(userScopedPath("/api/status"));
   const hasSession = status.jsessionid.present;
   setPill(els.tokenState, status.token.present ? "Token ✅" : "Token ❌", status.token.present ? "ok" : "danger");
   setPill(
@@ -126,7 +215,7 @@ async function loadStatus() {
 }
 
 async function loadCards() {
-  const data = await api("/api/cards");
+  const data = await api(userScopedPath("/api/cards"));
   renderCards(data.cards, data.primary_card);
   els.lastRefresh.textContent = `余额 ${fmtTime()}`;
   els.lastRefresh.className = "status-pill ok";
@@ -158,7 +247,7 @@ function renderCards(cards, primaryCard) {
 }
 
 async function loadBookings() {
-  const data = await api("/api/bookings?success=1&all=0");
+  const data = await api(userScopedPath("/api/bookings?success=1&all=0"));
   state.bookings = data.bookings;
   renderBookings(data.bookings);
   els.lastRefresh.textContent = `活跃 ${fmtTime()}`;
@@ -269,7 +358,7 @@ async function loadCancelPreview(billNum) {
     addUiLog(`读取退款预览 ${billNum}`);
     const preview = await api("/api/cancel/preview", {
       method: "POST",
-      body: JSON.stringify({ bill_num: billNum }),
+      body: JSON.stringify({ bill_num: billNum, user_key: state.selectedUserKey }),
     });
     const booking = state.bookings.find((item) => item.bill_num === billNum);
     renderDetail(booking, preview);
@@ -291,7 +380,7 @@ async function cancelBooking(billNum) {
     addUiLog(`开始取消 ${billNum}`, true);
     const result = await api("/api/cancel", {
       method: "POST",
-      body: JSON.stringify({ bill_num: billNum, confirmation, reason: "天气原因" }),
+      body: JSON.stringify({ bill_num: billNum, confirmation, reason: "天气原因", user_key: state.selectedUserKey }),
     });
     addUiLog(result.confirmed ? "取消已确认，余额已刷新" : "取消接口返回后仍未确认状态", true);
     renderCards(result.cards || [], result.primary_card || null);
@@ -318,6 +407,7 @@ async function startBooking(event) {
     force: form.get("force") === "on",
     dry_run: form.get("dry_run") === "on",
     all_court: form.get("all_court") === "on",
+    user_key: state.selectedUserKey,
   };
 
   try {
@@ -336,7 +426,7 @@ async function startBooking(event) {
 }
 
 async function loadBookingHistory() {
-  const data = await api("/api/booking/history");
+  const data = await api(userScopedPath("/api/booking/history"));
   state.bookingHistory = data.history || [];
   renderBookingHistory(state.bookingHistory);
   return data;
@@ -354,7 +444,7 @@ function renderBookingHistory(history) {
       <div class="history-row">
         <div class="history-main">
           <span class="history-title">${escapeHtml(item.target_date || "-")} · ${escapeHtml(item.target_time || "-")}</span>
-          <span class="booking-meta">发起 ${escapeHtml(item.requested_at || "-")}</span>
+          <span class="booking-meta">${escapeHtml(item.user_label || "用户")} · 发起 ${escapeHtml(item.requested_at || "-")}</span>
           <span class="booking-meta">成功目标 ${escapeHtml(item.success_target || "-")}</span>
         </div>
         <span class="chip ${tone}">${escapeHtml(item.result || "未知")}</span>
@@ -395,7 +485,7 @@ async function scanAvailability() {
   `;
 
   try {
-    const data = await api("/api/availability?days=5");
+    const data = await api(userScopedPath("/api/availability?days=5"));
     renderAvailability(data.days || []);
     els.lastRefresh.textContent = `分布 ${fmtTime()}`;
     els.lastRefresh.className = "status-pill ok";
@@ -457,6 +547,73 @@ function renderAvailabilityHour(hour) {
       <span class="availability-courts">${courts}</span>
     </div>
   `;
+}
+
+async function unlockUserManagement(event) {
+  event.preventDefault();
+  const adminPassword = new FormData(els.userUnlockForm).get("admin_password") || "";
+  try {
+    await api("/api/users/unlock", {
+      method: "POST",
+      body: JSON.stringify({ admin_password: adminPassword }),
+    });
+    state.adminPassword = String(adminPassword);
+    state.userManagementUnlocked = true;
+    els.userUnlockForm.reset();
+    renderUserManagementLock();
+    addUiLog("用户管理已解锁", true);
+  } catch (error) {
+    addUiLog(`用户管理解锁失败: ${error.message}`, true);
+  }
+}
+
+function lockUserManagement() {
+  state.adminPassword = "";
+  state.userManagementUnlocked = false;
+  renderUserManagementLock();
+  addUiLog("用户管理已锁定");
+}
+
+async function saveUser(event) {
+  event.preventDefault();
+  if (!state.userManagementUnlocked || !state.adminPassword) {
+    addUiLog("用户保存失败: 请先输入管理密码", true);
+    return;
+  }
+  const form = new FormData(els.userForm);
+  const payload = {
+    admin_password: state.adminPassword,
+    key: form.get("key"),
+    label: form.get("label"),
+    token: form.get("token"),
+    jsessionid: form.get("jsessionid"),
+    card_name: form.get("card_name") || "学生球类卡",
+    enabled: form.get("enabled") === "on",
+  };
+  try {
+    const result = await api("/api/users", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    state.users = result.users || [];
+    state.selectedUserKey = result.user?.key || state.selectedUserKey;
+    els.userForm.elements.token.value = "";
+    els.userForm.elements.jsessionid.value = "";
+    renderUsers();
+    addUiLog(`用户已保存: ${result.user.label}`, true);
+    await refreshAll();
+  } catch (error) {
+    addUiLog(`用户保存失败: ${error.message}`, true);
+  }
+}
+
+async function changeUser() {
+  state.selectedUserKey = els.userSelect.value;
+  state.selectedBill = "";
+  renderDetail(null);
+  renderUsers();
+  addUiLog(`切换用户: ${currentUser()?.label || state.selectedUserKey}`, true);
+  await refreshAll();
 }
 
 async function stopJob() {
@@ -532,6 +689,7 @@ function summarizeJobLine(line) {
 
 async function refreshAll() {
   try {
+    await loadUsers();
     await Promise.all([loadStatus(), loadCards(), loadBookings(), loadBookingHistory(), loadJob()]);
     addUiLog("刷新完成");
   } catch (error) {
@@ -708,6 +866,11 @@ function escapeAttr(value) {
   return escapeHtml(value).replaceAll("`", "&#096;");
 }
 
+els.authForm.addEventListener("submit", login);
+els.userSelect.addEventListener("change", () => changeUser().catch((error) => addUiLog(`用户切换失败: ${error.message}`, true)));
+els.userUnlockForm.addEventListener("submit", unlockUserManagement);
+els.lockUserPanel.addEventListener("click", lockUserManagement);
+els.userForm.addEventListener("submit", saveUser);
 els.refreshAll.addEventListener("click", refreshAll);
 els.refreshCards.addEventListener("click", () => loadCards().catch((error) => addUiLog(`余额刷新失败: ${error.message}`, true)));
 els.refreshBookings.addEventListener("click", () => loadBookings().catch((error) => addUiLog(`活跃预约刷新失败: ${error.message}`, true)));
@@ -719,4 +882,8 @@ els.stopJob.addEventListener("click", stopJob);
 setupBookingDate();
 setupSessionHelp();
 setupTouchControls();
-refreshAll();
+if (localStorage.getItem("daydayupAccessKey")) {
+  showApp().catch(() => showLogin());
+} else {
+  showLogin();
+}

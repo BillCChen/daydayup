@@ -7,7 +7,20 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <div class="shell">
+    <main class="auth-screen" id="authScreen">
+      <form class="auth-card" id="authForm">
+        <p class="eyebrow">Daydayup</p>
+        <h1>预约操作台</h1>
+        <label>
+          <span>访问密码</span>
+          <input name="password" type="password" autocomplete="current-password" required />
+        </label>
+        <button class="button primary" type="submit">进入</button>
+        <p class="form-note" id="authMessage">本地访问密码默认 abc123。</p>
+      </form>
+    </main>
+
+    <div class="shell hidden" id="appShell">
       <aside class="rail" aria-label="桌面导航">
         <div class="rail-mark">D</div>
         <nav>
@@ -17,6 +30,7 @@
           <a href="#submit">提交</a>
           <a href="#bookingHistory">历史</a>
           <a href="#logs">日志</a>
+          <a href="#users">用户</a>
         </nav>
       </aside>
 
@@ -26,7 +40,13 @@
             <p class="eyebrow">Daydayup</p>
             <h1>预约操作台</h1>
           </div>
-          <button class="button secondary compact" id="refreshAll" type="button">刷新</button>
+          <div class="topbar-actions">
+            <label class="user-select">
+              <span>用户</span>
+              <select id="userSelect"></select>
+            </label>
+            <button class="button secondary compact" id="refreshAll" type="button">刷新</button>
+          </div>
         </header>
 
         <section class="status-band" aria-label="连接状态">
@@ -216,6 +236,53 @@
             <span class="chip" id="jobState">空闲</span>
           </div>
           <div class="log-stream" id="logStream" aria-live="polite"></div>
+        </section>
+
+        <section class="panel user-panel" id="users" aria-labelledby="usersTitle">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Users</p>
+              <h2 id="usersTitle">用户管理</h2>
+            </div>
+            <div class="user-panel-actions">
+              <span class="chip" id="activeUserLabel">未选择</span>
+              <button class="button secondary compact hidden" id="lockUserPanel" type="button">锁定</button>
+            </div>
+          </div>
+          <form class="user-unlock" id="userUnlockForm">
+            <label>
+              <span>管理密码</span>
+              <input name="admin_password" type="password" autocomplete="current-password" required />
+            </label>
+            <button class="button secondary" type="submit">进入管理</button>
+          </form>
+          <form class="user-form hidden" id="userForm">
+            <label>
+              <span>用户标识</span>
+              <input name="key" type="text" autocomplete="off" placeholder="friend_1" />
+            </label>
+            <label>
+              <span>用户名称</span>
+              <input name="label" type="text" autocomplete="off" required />
+            </label>
+            <label>
+              <span>Token</span>
+              <input name="token" type="password" autocomplete="off" />
+            </label>
+            <label>
+              <span>Session</span>
+              <input name="jsessionid" type="password" autocomplete="off" />
+            </label>
+            <label>
+              <span>卡名称</span>
+              <input name="card_name" type="text" value="学生球类卡" />
+            </label>
+            <label class="checkline">
+              <input name="enabled" type="checkbox" checked />
+              <span>启用</span>
+            </label>
+            <button class="button secondary" type="submit">保存用户</button>
+          </form>
         </section>
       </main>
 

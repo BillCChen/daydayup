@@ -56,6 +56,45 @@ button {
   padding: 12px;
 }
 
+.auth-screen {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 16px;
+}
+
+.auth-card {
+  display: grid;
+  gap: 14px;
+  width: min(100%, 380px);
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  padding: 18px;
+  box-shadow: var(--shadow-pane);
+}
+
+.auth-card h1 {
+  margin: 0;
+  font-size: 2rem;
+  line-height: 1.12;
+}
+
+.auth-card label,
+.user-form label,
+.user-select {
+  display: grid;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-weight: 650;
+}
+
+.form-note {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+
 .rail {
   display: none;
 }
@@ -78,6 +117,28 @@ button {
 
 .topbar {
   padding: 8px 2px 2px;
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+}
+
+.user-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.user-select select {
+  min-height: 40px;
+  min-width: 132px;
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  padding: 8px 10px;
 }
 
 .topbar h1,
@@ -392,6 +453,13 @@ select:focus-visible {
   margin-top: 14px;
 }
 
+.user-form,
+.user-unlock {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
 .booking-form label {
   display: grid;
   gap: 6px;
@@ -401,6 +469,9 @@ select:focus-visible {
 
 .booking-form input,
 .booking-form select,
+.auth-card input,
+.user-unlock input,
+.user-form input,
 .confirm-input {
   min-height: 48px;
   width: 100%;
@@ -765,7 +836,9 @@ select:focus-visible {
 }
 
 @media (min-width: 720px) {
-  .booking-form {
+  .booking-form,
+  .user-form,
+  .user-unlock {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -794,7 +867,9 @@ select:focus-visible {
   }
 
   .option-grid,
-  .action-row {
+  .action-row,
+  .user-form .checkline,
+  .user-form .button {
     grid-column: 1 / -1;
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
