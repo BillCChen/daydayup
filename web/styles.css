@@ -95,6 +95,14 @@ button {
   font-size: 0.875rem;
 }
 
+.form-note.success-text {
+  color: var(--success-green);
+}
+
+.form-note.danger-text {
+  color: var(--danger-red);
+}
+
 .rail {
   display: none;
 }
@@ -458,6 +466,35 @@ select:focus-visible {
   display: grid;
   gap: 12px;
   margin-top: 14px;
+}
+
+.token-helper {
+  display: grid;
+  gap: 12px;
+  border: 1px solid color-mix(in oklch, var(--primary-amber), var(--border-muted) 45%);
+  border-radius: 8px;
+  background: var(--primary-amber-soft);
+  padding: 12px;
+}
+
+.token-helper-head,
+.token-helper-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.token-helper-head p {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  line-height: 1.45;
+}
+
+.token-helper-grid {
+  display: grid;
+  gap: 10px;
 }
 
 .booking-form label {
@@ -843,8 +880,13 @@ select:focus-visible {
   }
 
   .time-control,
-  .priority-control {
+  .priority-control,
+  .token-helper {
     grid-column: 1 / -1;
+  }
+
+  .token-helper-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .segmented-control {

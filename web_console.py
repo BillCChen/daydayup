@@ -22,7 +22,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from easyserp_client import (
     DEFAULT_BASE_URL,
@@ -55,6 +55,7 @@ USER_FIELDS = ("type", "key", "label", "password", "token", "jsessionid", "card_
 DEFAULT_CARD_NAME = "学生球类卡"
 DEFAULT_USER_KEY = "chen_qixuan"
 DEFAULT_USER_LABEL = "陈启轩"
+DEFAULT_OAUTH_REDIRECT_URL = "https://www.147soft.cn/easyserp/index.html"
 
 
 @dataclass
@@ -476,6 +477,16 @@ def single_query(query: dict[str, list[str]], key: str) -> str:
     return clean_string(query.get(key, [""])[0])
 
 
+def extract_oauth_code(payload: dict[str, Any]) -> str:
+    code = clean_string(payload.get("code"))
+    if code:
+        return code
+    redirect_url = clean_string(payload.get("redirect_url"))
+    if not redirect_url:
+        return ""
+    return clean_string(parse_qs(urlsplit(redirect_url).query).get("code", [""])[0])
+
+
 def serialize_job(job: BookingJob) -> dict[str, Any]:
     return {
         "id": job.id,
@@ -579,6 +590,69 @@ class WebConsole:
             raise EasySerpAuthError("invalid admin password")
         user = self.users.upsert_user(payload)
         return {"user": serialize_user(user), "users": [serialize_user(item) for item in self.users.list_users()]}
+
+    def token_auth_url(self, payload: dict[str, Any]) -> dict[str, Any]:
+        admin_password = clean_string(payload.get("admin_password"))
+        if not self.users.verify_admin(admin_password):
+            raise EasySerpAuthError("invalid admin password")
+        club_member_code = clean_string(payload.get("club_member_code")) or "bdyxbtyg7"
+        redirect_url = clean_string(payload.get("redirect_url")) or DEFAULT_OAUTH_REDIRECT_URL
+        client = EasySerpClient(self.config.base_url, "", "", self.config.timeout)
+        data = require_success(
+            client.get("wechar/getWXConfigInfo", params={"clubMemberCode": club_member_code}),
+            "getWXConfigInfo",
+        )
+        if not isinstance(data, dict) or not data.get("appid"):
+            raise EasySerpError("missing appid")
+        auth_url = (
+            "https://open.weixin.qq.com/connect/oauth2/authorize"
+            f"?appid={quote(clean_string(data.get('appid')), safe='')}"
+            f"&redirect_uri={quote(redirect_url, safe='')}"
+            "&response_type=code&scope=snsapi_userinfo&state=123#wechat_redirect"
+        )
+        return {"auth_url": auth_url, "redirect_url": redirect_url, "club_member_code": club_member_code}
+
+    def token_exchange(self, payload: dict[str, Any]) -> dict[str, Any]:
+        admin_password = clean_string(payload.get("admin_password"))
+        if not self.users.verify_admin(admin_password):
+            raise EasySerpAuthError("invalid admin password")
+        username = clean_string(payload.get("username"))
+        password = clean_string(payload.get("password"))
+        code = extract_oauth_code(payload)
+        club_member_code = clean_string(payload.get("club_member_code")) or "bdyxbtyg7"
+        name = clean_string(payload.get("name")) or "wx"
+        if not username:
+            raise EasySerpError("username is required")
+        if not password:
+            raise EasySerpError("password is required")
+        if not code:
+            raise EasySerpError("oauth code is required")
+
+        client = EasySerpClient(self.config.base_url, "", "", self.config.timeout)
+        token = require_success(
+            client.get(
+                "wechar/member",
+                params={"code": code, "clubMemberCode": club_member_code, "name": name},
+            ),
+            "wechar/member",
+        )
+        if not isinstance(token, str) or not token:
+            raise EasySerpError("token response is empty")
+        require_success(
+            client.get(
+                "wechar/saveClubInfoByToken",
+                params={"token": token, "clubMemberCode": club_member_code, "shopNum": self.config.shop_num},
+            ),
+            "saveClubInfoByToken",
+        )
+        require_success(
+            client.get(
+                "memberLogin/logined",
+                params={"userName": username, "passWord": password, "token": token},
+            ),
+            "memberLogin/logined",
+        )
+        return {"token": token, "credential_status": credential_state(token)}
 
     def status(self, user_key: str = "") -> dict[str, Any]:
         user = self.users.get_user(user_key)
@@ -1039,6 +1113,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.write_json(app.unlock_users(payload))
         elif self.path == "/api/users":
             self.write_json(app.save_user(payload))
+        elif self.path == "/api/token/auth-url":
+            self.write_json(app.token_auth_url(payload))
+        elif self.path == "/api/token/exchange":
+            self.write_json(app.token_exchange(payload))
         elif self.path == "/api/cancel/preview":
             bill_num = clean_string(payload.get("bill_num"))
             if not bill_num:

@@ -259,15 +259,42 @@
           <form class="user-form hidden" id="userForm">
             <label>
               <span>用户标识</span>
-              <input name="key" type="text" autocomplete="off" placeholder="friend_1" />
+              <input name="key" type="text" autocomplete="off" placeholder="friend_1" required />
             </label>
             <label>
               <span>用户名称</span>
               <input name="label" type="text" autocomplete="off" required />
             </label>
+            <div class="token-helper">
+              <div class="token-helper-head">
+                <div>
+                  <strong>获取个人 Token</strong>
+                  <p>复制授权链接到电脑微信打开，把跳转后的地址粘回这里。</p>
+                </div>
+                <button class="button secondary compact" id="copyTokenAuthUrl" type="button">复制链接</button>
+              </div>
+              <div class="token-helper-grid">
+                <label>
+                  <span>账号</span>
+                  <input name="token_username" type="text" autocomplete="username" />
+                </label>
+                <label>
+                  <span>密码</span>
+                  <input name="token_password" type="password" autocomplete="current-password" />
+                </label>
+              </div>
+              <label>
+                <span>微信跳转地址</span>
+                <input name="token_redirect_url" type="url" autocomplete="off" placeholder="https://www.147soft.cn/easyserp/index.html?code=..." />
+              </label>
+              <div class="token-helper-actions">
+                <button class="button primary" id="exchangeToken" type="button">兑换并填入 Token</button>
+                <span class="form-note" id="tokenHelperMessage">不会保存账号密码。</span>
+              </div>
+            </div>
             <label>
               <span>Token</span>
-              <input name="token" type="password" autocomplete="off" />
+              <input name="token" type="password" autocomplete="off" required />
             </label>
             <label>
               <span>Session</span>
@@ -275,7 +302,7 @@
             </label>
             <label>
               <span>卡名称</span>
-              <input name="card_name" type="text" value="学生球类卡" />
+              <input name="card_name" type="text" autocomplete="off" placeholder="学生球类卡" required />
             </label>
             <label class="checkline">
               <input name="enabled" type="checkbox" checked />

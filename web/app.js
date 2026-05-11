@@ -30,6 +30,9 @@ const els = {
   userUnlockForm: document.querySelector("#userUnlockForm"),
   lockUserPanel: document.querySelector("#lockUserPanel"),
   userForm: document.querySelector("#userForm"),
+  copyTokenAuthUrl: document.querySelector("#copyTokenAuthUrl"),
+  exchangeToken: document.querySelector("#exchangeToken"),
+  tokenHelperMessage: document.querySelector("#tokenHelperMessage"),
   refreshAll: document.querySelector("#refreshAll"),
   refreshCards: document.querySelector("#refreshCards"),
   tokenState: document.querySelector("#tokenState"),
@@ -178,14 +181,6 @@ function renderUsers() {
   `).join("");
   const current = currentUser();
   els.activeUserLabel.textContent = current ? current.label : "未选择";
-  if (current) {
-    els.userForm.elements.key.value = current.key;
-    els.userForm.elements.label.value = current.label;
-    els.userForm.elements.token.value = "";
-    els.userForm.elements.jsessionid.value = "";
-    els.userForm.elements.card_name.value = current.card_name || "学生球类卡";
-    els.userForm.elements.enabled.checked = current.enabled !== false;
-  }
   renderUserManagementLock();
 }
 
@@ -560,6 +555,7 @@ async function unlockUserManagement(event) {
     state.adminPassword = String(adminPassword);
     state.userManagementUnlocked = true;
     els.userUnlockForm.reset();
+    resetUserForm();
     renderUserManagementLock();
     addUiLog("用户管理已解锁", true);
   } catch (error) {
@@ -567,9 +563,16 @@ async function unlockUserManagement(event) {
   }
 }
 
+function resetUserForm() {
+  els.userForm.reset();
+  els.userForm.elements.enabled.checked = true;
+  setTokenHelperMessage("不会保存账号密码。");
+}
+
 function lockUserManagement() {
   state.adminPassword = "";
   state.userManagementUnlocked = false;
+  resetUserForm();
   renderUserManagementLock();
   addUiLog("用户管理已锁定");
 }
@@ -597,13 +600,85 @@ async function saveUser(event) {
     });
     state.users = result.users || [];
     state.selectedUserKey = result.user?.key || state.selectedUserKey;
-    els.userForm.elements.token.value = "";
-    els.userForm.elements.jsessionid.value = "";
+    resetUserForm();
     renderUsers();
     addUiLog(`用户已保存: ${result.user.label}`, true);
     await refreshAll();
   } catch (error) {
     addUiLog(`用户保存失败: ${error.message}`, true);
+  }
+}
+
+function setTokenHelperMessage(text, tone = "") {
+  els.tokenHelperMessage.textContent = text;
+  els.tokenHelperMessage.className = `form-note ${tone}`.trim();
+}
+
+async function copyTokenAuthUrl() {
+  if (!state.userManagementUnlocked || !state.adminPassword) {
+    setTokenHelperMessage("请先输入管理密码。", "danger-text");
+    return;
+  }
+  try {
+    const result = await api("/api/token/auth-url", {
+      method: "POST",
+      body: JSON.stringify({ admin_password: state.adminPassword }),
+    });
+    await copyText(result.auth_url);
+    setTokenHelperMessage("授权链接已复制，在电脑微信内打开。", "success-text");
+    addUiLog("Token 授权链接已复制");
+  } catch (error) {
+    setTokenHelperMessage(`复制失败: ${error.message}`, "danger-text");
+  }
+}
+
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "readonly");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.append(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) {
+    throw new Error("clipboard unavailable");
+  }
+}
+
+async function exchangeUserToken() {
+  if (!state.userManagementUnlocked || !state.adminPassword) {
+    setTokenHelperMessage("请先输入管理密码。", "danger-text");
+    return;
+  }
+  const form = new FormData(els.userForm);
+  const payload = {
+    admin_password: state.adminPassword,
+    username: form.get("token_username"),
+    password: form.get("token_password"),
+    redirect_url: form.get("token_redirect_url"),
+  };
+  try {
+    els.exchangeToken.disabled = true;
+    setTokenHelperMessage("正在兑换并校验账号。", "");
+    const result = await api("/api/token/exchange", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    els.userForm.elements.token.value = result.token || "";
+    els.userForm.elements.token_password.value = "";
+    setTokenHelperMessage("Token 已填入，保存用户即可。", "success-text");
+    addUiLog("Token 已兑换并填入用户表单", true);
+  } catch (error) {
+    setTokenHelperMessage(`兑换失败: ${error.message}`, "danger-text");
+    addUiLog(`Token 兑换失败: ${error.message}`, true);
+  } finally {
+    els.exchangeToken.disabled = false;
   }
 }
 
@@ -871,6 +946,8 @@ els.userSelect.addEventListener("change", () => changeUser().catch((error) => ad
 els.userUnlockForm.addEventListener("submit", unlockUserManagement);
 els.lockUserPanel.addEventListener("click", lockUserManagement);
 els.userForm.addEventListener("submit", saveUser);
+els.copyTokenAuthUrl.addEventListener("click", copyTokenAuthUrl);
+els.exchangeToken.addEventListener("click", exchangeUserToken);
 els.refreshAll.addEventListener("click", refreshAll);
 els.refreshCards.addEventListener("click", () => loadCards().catch((error) => addUiLog(`余额刷新失败: ${error.message}`, true)));
 els.refreshBookings.addEventListener("click", () => loadBookings().catch((error) => addUiLog(`活跃预约刷新失败: ${error.message}`, true)));
