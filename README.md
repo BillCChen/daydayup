@@ -1,0 +1,160 @@
+
+# PKU Badminton Court Booking Automation
+
+北京大学医学部体育馆羽毛球场地自动化预约工具集。支持定时抢场、空闲监控捡漏、多场地优先级策略等功能。
+
+## 功能特性
+
+- **定时抢场**：自动等待至 12:00 开放预约，支持多线程并发
+- **价格智能计算**：自动区分工作日/周末、不同时段的价格（学生价 20/30 元）
+- **捡漏监控**：持续监控目标日期，发现连续 2 小时空闲场地立即预约并邮件通知
+- **灵活日期**：支持指定具体日期、相对天数（N 天后）或默认 4 天后
+- **场地优先级**：优先尝试 1/6/7/8/9 号场，失败后自动切换备选场地
+- **连续时段合并**：自动合并连续 1 小时段为 2 小时预约（如 16-17 + 17-18 = 16-18）
+
+## 文件说明
+
+| 文件 | 功能描述 | 适用场景 |
+|------|---------|---------|
+| `final_book_v2.py` | **主力抢场脚本**，支持价格修正、智能等待、重试机制 | 正常抢场（推荐） |
+| `court_monitor.py` | **捡漏监控**，后台运行至截止前一日 18:00，发现空闲立即预约并邮件通知 | 候补捡漏 |
+| `daydayup.py` | 多线程并发抢场，支持灵活日期指定（绝对日期/相对天数） | 高峰期抢购 |
+| `diagnose.py` | 诊断工具，打印场地状态码，用于调试 | 排查问题 |
+| `final_book.py` | 基础版完整流程演示，含 canBook 预检步骤 | 学习/调试 |
+
+## 环境要求
+
+- Python 3.11+
+- uv：`uv sync`
+
+## 快速开始
+
+### 1. 获取身份凭证（抓包）
+
+使用 Reqable/HttpCanary 抓取微信预约页面请求：
+
+- **Token**: URL 参数中的 `token`，建议写入 `DAYDAYUP_TOKEN`
+- **JSESSIONID**: Cookie 中的 `JSESSIONID`，建议写入 `DAYDAYUP_JSESSIONID`
+- **Card Index**: 会员卡号，建议写入 `DAYDAYUP_CARD_INDEX`
+
+### 2. 主力脚本使用（final_book_v2.py）
+
+**默认抢 4 天后（第 5 天）的场地：**
+
+```bash
+uv run python final_book_v2.py \
+  -k "$DAYDAYUP_TOKEN" \
+  -j "$DAYDAYUP_JSESSIONID" \
+  -i "$DAYDAYUP_CARD_INDEX" \
+  -t 18-20
+```
+
+**指定具体日期：**
+```bash
+uv run python final_book_v2.py \
+  -k "$DAYDAYUP_TOKEN" -j "$DAYDAYUP_JSESSIONID" -i "$DAYDAYUP_CARD_INDEX" \
+  -d 2026-02-14 \
+  -t 19-21 \
+  -p 1 6 7
+```
+
+**立即执行（测试模式，不等待 12:00）：**
+```bash
+uv run python final_book_v2.py \
+  -k "$DAYDAYUP_TOKEN" -j "$DAYDAYUP_JSESSIONID" -i "$DAYDAYUP_CARD_INDEX" \
+  -d 2026-02-05 \
+  -t 16-18 \
+  --force
+```
+
+### 3. 捡漏监控（court_monitor.py）
+
+适用于已有场地但想换更好的，或临时起意要打球：
+
+```bash
+uv run python court_monitor.py \
+  -k "$DAYDAYUP_TOKEN" -j "$DAYDAYUP_JSESSIONID" -i "$DAYDAYUP_CARD_INDEX" \
+  -d 2026-02-05 \
+  -p 1 6 7 8 9
+```
+
+- 自动运行至目标日期前一日 18:00（退订截止）
+- 发现连续 2 小时空闲立即预约
+- 每小时发送状态汇报邮件
+- 预约成功/程序终止时邮件通知
+
+### 4. 多线程抢购（daydayup.py）
+
+适合高峰期（如开学初）多场地并发尝试：
+
+```bash
+uv run python daydayup.py \
+  -k "$DAYDAYUP_TOKEN" -j "$DAYDAYUP_JSESSIONID" -i "$DAYDAYUP_CARD_INDEX" \
+  --date 2026-02-14 \
+  -t 18-20 19-21 \
+  -p 1 6 7 8 9 \
+  -b 2 3 4 5 10 11 12
+```
+
+## 参数说明
+
+### 通用参数
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `-k, --token` | 微信身份令牌 | `$DAYDAYUP_TOKEN` |
+| `-j, --jsessionid` | 会话 ID | `$DAYDAYUP_JSESSIONID` |
+| `-i, --card-index` | 会员卡号 | `$DAYDAYUP_CARD_INDEX` |
+| `-d, --date` | 指定日期（YYYY-MM-DD） | `2026-02-14` |
+| `--in-days` | N 天后 | `4` |
+| `-t, --time` | 时段（24小时制） | `18-20`、`14-16` |
+| `-p, --priority` | 优先场地列表 | `1 6 7 8 9` |
+| `--backup` | 备选场地列表 | `2 3 4 5 10 11 12` |
+| `--force` | 立即执行（不等待 12:00） | - |
+
+### court_monitor 特有参数
+
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `--priority` | 优先场地编号 | `1 6 7 8 9` |
+
+## 价格计算规则
+
+脚本自动根据日期和时间计算学生优惠价：
+
+- **工作日（周一-周五）**:
+  - 09:00-15:00: 20元/小时（原价 80）
+  - 15:00-22:00: 30元/小时（原价 120）
+
+- **周末（周六-周日）**:
+  - 09:00-21:00: 30元/小时（原价 120）
+  - 21:00 关门
+
+**跨时段示例**：14:00-16:00（工作日）= 20元 + 30元 = 50元
+
+## 注意事项
+
+1. **时间同步**：确保本机时间准确，建议使用 NTP 同步，否则可能导致 12:00 抢场失败
+2. **网络环境**：建议在校园网或低延迟网络环境下运行
+3. **并发风险**：`daydayup.py` 使用多线程高频请求，可能被服务器暂时限制，建议谨慎使用
+4. **凭证安全**：Token 和 JSESSIONID 包含敏感信息，请勿上传到公共仓库
+5. **合规使用**：本工具仅供学习交流，请遵守体育馆预约规则，勿用于商业用途
+
+## 故障排查
+
+**Q: 提示 "canBook 未通过"**
+A: 该时段可能已被预约或未到开放时间，使用 `diagnose.py` 查看实时状态：
+```bash
+uv run python diagnose.py -k "$DAYDAYUP_TOKEN" -j "$DAYDAYUP_JSESSIONID" -d 2026-02-05 -c ymq8
+```
+
+**Q: 价格计算错误**
+A: 确保使用 `final_book_v2.py`，该版本修正了工作日/周末的价格逻辑
+
+**Q: 监控脚本收不到邮件**
+A: 检查 SMTP 配置（默认使用 QQ 邮箱），需开启 SMTP 服务并使用授权码而非登录密码
+
+## 免责声明
+
+本项目仅用于技术研究和个人学习，使用本项目产生的任何后果（包括但不限于预约失败、账号限制等）由使用者自行承担。请合理使用自动化工具，遵守北京大学体育场馆管理规定。
+```
