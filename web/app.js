@@ -1,4 +1,5 @@
 const state = {
+  config: null,
   bookings: [],
   bookingHistory: [],
   selectedBill: "",
@@ -8,10 +9,6 @@ const state = {
   startHour: 17,
   endHour: 21,
   priorityCourts: [7, 8, 9, 6],
-  users: [],
-  selectedUserKey: "",
-  userManagementUnlocked: false,
-  adminPassword: "",
 };
 
 const SAFE_COURTS = [2, 3, 4, 6, 7, 8, 9, 10, 11];
@@ -21,18 +18,15 @@ const MIN_HOUR = 8;
 const MAX_HOUR = 23;
 
 const els = {
-  authScreen: document.querySelector("#authScreen"),
-  authForm: document.querySelector("#authForm"),
-  authMessage: document.querySelector("#authMessage"),
+  setupScreen: document.querySelector("#setupScreen"),
+  setupForm: document.querySelector("#setupForm"),
+  setupCopyAuthUrl: document.querySelector("#setupCopyAuthUrl"),
+  setupMessage: document.querySelector("#setupMessage"),
   appShell: document.querySelector("#appShell"),
-  userSelect: document.querySelector("#userSelect"),
-  activeUserLabel: document.querySelector("#activeUserLabel"),
-  userUnlockForm: document.querySelector("#userUnlockForm"),
-  lockUserPanel: document.querySelector("#lockUserPanel"),
-  userForm: document.querySelector("#userForm"),
+  tokenConfigForm: document.querySelector("#tokenConfigForm"),
   copyTokenAuthUrl: document.querySelector("#copyTokenAuthUrl"),
-  exchangeToken: document.querySelector("#exchangeToken"),
-  tokenHelperMessage: document.querySelector("#tokenHelperMessage"),
+  saveManualConfig: document.querySelector("#saveManualConfig"),
+  tokenConfigMessage: document.querySelector("#tokenConfigMessage"),
   refreshAll: document.querySelector("#refreshAll"),
   refreshCards: document.querySelector("#refreshCards"),
   tokenState: document.querySelector("#tokenState"),
@@ -70,77 +64,24 @@ function fmtTime(ts = Date.now()) {
 }
 
 function dateInputValue(offsetDays = 0) {
-  const date = new Date();
-  date.setDate(date.getDate() + offsetDays);
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
+  const value = new Date();
+  value.setDate(value.getDate() + offsetDays);
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
 
 async function api(path, options = {}) {
-  const headers = { "Content-Type": "application/json" };
-  const accessKey = localStorage.getItem("daydayupAccessKey");
-  if (accessKey) {
-    headers["X-Daydayup-Key"] = accessKey;
-  }
-
-  let response = await fetch(path, {
-    headers,
+  const response = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
     ...options,
   });
-  if (response.status === 401) {
-    localStorage.removeItem("daydayupAccessKey");
-    showLogin();
-  }
   const payload = await response.json();
   if (!response.ok) {
     throw new Error(payload.error || "request failed");
   }
   return payload;
-}
-
-function userScopedPath(path) {
-  if (!state.selectedUserKey) {
-    return path;
-  }
-  const separator = path.includes("?") ? "&" : "?";
-  return `${path}${separator}user_key=${encodeURIComponent(state.selectedUserKey)}`;
-}
-
-async function login(event) {
-  event.preventDefault();
-  const password = new FormData(els.authForm).get("password") || "";
-  try {
-    await fetch("/api/auth/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password }),
-    }).then(async (response) => {
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.error || "login failed");
-      }
-      return payload;
-    });
-    localStorage.setItem("daydayupAccessKey", password);
-    els.authForm.reset();
-    await showApp();
-  } catch (error) {
-    els.authMessage.textContent = `访问失败: ${error.message}`;
-  }
-}
-
-function showLogin() {
-  els.authScreen.classList.remove("hidden");
-  els.appShell.classList.add("hidden");
-}
-
-async function showApp() {
-  els.authScreen.classList.add("hidden");
-  els.appShell.classList.remove("hidden");
-  await loadUsers();
-  await refreshAll();
 }
 
 function setPill(el, text, tone = "") {
@@ -153,6 +94,16 @@ function setChip(el, text, tone = "") {
   el.textContent = text;
 }
 
+function setSetupMessage(text, tone = "") {
+  els.setupMessage.textContent = text;
+  els.setupMessage.className = `form-note ${tone}`.trim();
+}
+
+function setConfigMessage(text, tone = "") {
+  els.tokenConfigMessage.textContent = text;
+  els.tokenConfigMessage.className = `form-note wide-field ${tone}`.trim();
+}
+
 function addUiLog(text, strong = false) {
   const line = document.createElement("div");
   line.className = strong ? "log-line strong" : "log-line";
@@ -163,54 +114,167 @@ function addUiLog(text, strong = false) {
   }
 }
 
-async function loadUsers() {
-  const data = await api("/api/users");
-  state.users = data.users || [];
-  if (!state.selectedUserKey || !state.users.some((user) => user.key === state.selectedUserKey)) {
-    state.selectedUserKey = data.default_user_key || state.users[0]?.key || "";
+async function boot() {
+  setupBookingDate();
+  setupSessionHelp();
+  setupTouchControls();
+  const config = await loadConfig();
+  if (config.configured) {
+    await showApp();
+  } else {
+    showSetup();
   }
-  renderUsers();
-  return data;
 }
 
-function renderUsers() {
-  els.userSelect.innerHTML = state.users.map((user) => `
-    <option value="${escapeAttr(user.key)}" ${user.key === state.selectedUserKey ? "selected" : ""}>
-      ${escapeHtml(user.label)}
-    </option>
-  `).join("");
-  const current = currentUser();
-  els.activeUserLabel.textContent = current ? current.label : "未选择";
-  renderUserManagementLock();
+async function loadConfig() {
+  const config = await api("/api/config");
+  state.config = config;
+  renderConfig(config);
+  return config;
 }
 
-function currentUser() {
-  return state.users.find((user) => user.key === state.selectedUserKey) || null;
-}
-
-function renderUserManagementLock() {
-  els.userUnlockForm.classList.toggle("hidden", state.userManagementUnlocked);
-  els.userForm.classList.toggle("hidden", !state.userManagementUnlocked);
-  els.lockUserPanel.classList.toggle("hidden", !state.userManagementUnlocked);
-}
-
-async function loadStatus() {
-  const status = await api(userScopedPath("/api/status"));
-  const hasSession = status.jsessionid.present;
-  setPill(els.tokenState, status.token.present ? "Token ✅" : "Token ❌", status.token.present ? "ok" : "danger");
-  setPill(
-    els.sessionState,
-    hasSession ? "Session ✅" : "Session ❌",
-    hasSession ? "ok" : "warn",
-  );
+function renderConfig(config) {
+  const hasToken = config.token?.present;
+  const hasSession = config.jsessionid?.present;
+  setPill(els.tokenState, hasToken ? "Token ✅" : "Token ❌", hasToken ? "ok" : "danger");
+  setPill(els.sessionState, hasSession ? "Session ✅" : "Session ❌", hasSession ? "ok" : "warn");
   els.sessionHelpWrap.classList.toggle("session-ok", hasSession);
   els.sessionHelpTrigger.hidden = hasSession;
   els.sessionHelp.hidden = hasSession;
   els.sessionHelpTrigger.setAttribute("aria-expanded", "false");
+  if (config.card_name) {
+    els.tokenConfigForm.elements.card_name.value = config.card_name;
+  }
+}
+
+function showSetup() {
+  els.setupScreen.classList.remove("hidden");
+  els.appShell.classList.add("hidden");
+}
+
+async function showApp() {
+  els.setupScreen.classList.add("hidden");
+  els.appShell.classList.remove("hidden");
+  await refreshAll();
+}
+
+async function copyAuthUrl(target = "setup") {
+  try {
+    const result = await api("/api/token/auth-url", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    await copyText(result.auth_url);
+    const message = "授权链接已复制，在电脑微信内打开。";
+    if (target === "setup") {
+      setSetupMessage(message, "success-text");
+    } else {
+      setConfigMessage(message, "success-text");
+      addUiLog("Token 授权链接已复制");
+    }
+  } catch (error) {
+    if (target === "setup") {
+      setSetupMessage(`复制失败: ${error.message}`, "danger-text");
+    } else {
+      setConfigMessage(`复制失败: ${error.message}`, "danger-text");
+    }
+  }
+}
+
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "readonly");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.append(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) {
+    throw new Error("clipboard unavailable");
+  }
+}
+
+async function exchangeTokenFromForm(form, target = "setup") {
+  const data = new FormData(form);
+  const payload = {
+    username: data.get("username"),
+    password: data.get("password"),
+    redirect_url: data.get("redirect_url"),
+    card_name: data.get("card_name") || "学生球类卡",
+  };
+  const setMessage = target === "setup" ? setSetupMessage : setConfigMessage;
+  setMessage("正在兑换并校验账号。");
+  const result = await api("/api/token/exchange", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  state.config = result.config;
+  renderConfig(result.config);
+  form.elements.password.value = "";
+  form.elements.redirect_url.value = "";
+  setMessage("Token 已保存到本地配置。", "success-text");
+  return result;
+}
+
+async function initializeToken(event) {
+  event.preventDefault();
+  try {
+    await exchangeTokenFromForm(els.setupForm, "setup");
+    await showApp();
+  } catch (error) {
+    setSetupMessage(`初始化失败: ${error.message}`, "danger-text");
+  }
+}
+
+async function overwriteToken(event) {
+  event.preventDefault();
+  try {
+    await exchangeTokenFromForm(els.tokenConfigForm, "config");
+    addUiLog("Token 已覆盖并保存", true);
+    await refreshAll();
+  } catch (error) {
+    setConfigMessage(`保存失败: ${error.message}`, "danger-text");
+    addUiLog(`Token 覆盖失败: ${error.message}`, true);
+  }
+}
+
+async function saveManualConfig() {
+  const form = new FormData(els.tokenConfigForm);
+  const payload = {
+    jsessionid: form.get("jsessionid"),
+    card_name: form.get("card_name") || "学生球类卡",
+  };
+  try {
+    const result = await api("/api/config", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    state.config = result.config;
+    renderConfig(result.config);
+    els.tokenConfigForm.elements.jsessionid.value = "";
+    setConfigMessage("配置已保存。", "success-text");
+    addUiLog("本地配置已保存");
+    await refreshAll();
+  } catch (error) {
+    setConfigMessage(`保存失败: ${error.message}`, "danger-text");
+  }
+}
+
+async function loadStatus() {
+  const status = await api("/api/status");
+  state.config = status;
+  renderConfig(status);
+  return status;
 }
 
 async function loadCards() {
-  const data = await api(userScopedPath("/api/cards"));
+  const data = await api("/api/cards");
   renderCards(data.cards, data.primary_card);
   els.lastRefresh.textContent = `余额 ${fmtTime()}`;
   els.lastRefresh.className = "status-pill ok";
@@ -242,7 +306,7 @@ function renderCards(cards, primaryCard) {
 }
 
 async function loadBookings() {
-  const data = await api(userScopedPath("/api/bookings?success=1&all=0"));
+  const data = await api("/api/bookings?success=1&all=0");
   state.bookings = data.bookings;
   renderBookings(data.bookings);
   els.lastRefresh.textContent = `活跃 ${fmtTime()}`;
@@ -315,15 +379,8 @@ function renderDetail(booking, preview = null, error = "") {
     ${previewMarkup}
   `;
 
-  const previewButton = document.querySelector("#previewCancel");
-  if (previewButton) {
-    previewButton.addEventListener("click", () => loadCancelPreview(booking.bill_num));
-  }
-
-  const cancelButton = document.querySelector("#confirmCancel");
-  if (cancelButton) {
-    cancelButton.addEventListener("click", () => cancelBooking(booking.bill_num));
-  }
+  document.querySelector("#previewCancel")?.addEventListener("click", () => loadCancelPreview(booking.bill_num));
+  document.querySelector("#confirmCancel")?.addEventListener("click", () => cancelBooking(booking.bill_num));
 }
 
 function renderPreview(preview) {
@@ -353,7 +410,7 @@ async function loadCancelPreview(billNum) {
     addUiLog(`读取退款预览 ${billNum}`);
     const preview = await api("/api/cancel/preview", {
       method: "POST",
-      body: JSON.stringify({ bill_num: billNum, user_key: state.selectedUserKey }),
+      body: JSON.stringify({ bill_num: billNum }),
     });
     const booking = state.bookings.find((item) => item.bill_num === billNum);
     renderDetail(booking, preview);
@@ -375,7 +432,7 @@ async function cancelBooking(billNum) {
     addUiLog(`开始取消 ${billNum}`, true);
     const result = await api("/api/cancel", {
       method: "POST",
-      body: JSON.stringify({ bill_num: billNum, confirmation, reason: "天气原因", user_key: state.selectedUserKey }),
+      body: JSON.stringify({ bill_num: billNum, confirmation, reason: "天气原因" }),
     });
     addUiLog(result.confirmed ? "取消已确认，余额已刷新" : "取消接口返回后仍未确认状态", true);
     renderCards(result.cards || [], result.primary_card || null);
@@ -402,7 +459,6 @@ async function startBooking(event) {
     force: form.get("force") === "on",
     dry_run: form.get("dry_run") === "on",
     all_court: form.get("all_court") === "on",
-    user_key: state.selectedUserKey,
   };
 
   try {
@@ -421,7 +477,7 @@ async function startBooking(event) {
 }
 
 async function loadBookingHistory() {
-  const data = await api(userScopedPath("/api/booking/history"));
+  const data = await api("/api/booking/history");
   state.bookingHistory = data.history || [];
   renderBookingHistory(state.bookingHistory);
   return data;
@@ -439,7 +495,7 @@ function renderBookingHistory(history) {
       <div class="history-row">
         <div class="history-main">
           <span class="history-title">${escapeHtml(item.target_date || "-")} · ${escapeHtml(item.target_time || "-")}</span>
-          <span class="booking-meta">${escapeHtml(item.user_label || "用户")} · 发起 ${escapeHtml(item.requested_at || "-")}</span>
+          <span class="booking-meta">发起 ${escapeHtml(item.requested_at || "-")}</span>
           <span class="booking-meta">成功目标 ${escapeHtml(item.success_target || "-")}</span>
         </div>
         <span class="chip ${tone}">${escapeHtml(item.result || "未知")}</span>
@@ -480,7 +536,7 @@ async function scanAvailability() {
   `;
 
   try {
-    const data = await api(userScopedPath("/api/availability?days=5"));
+    const data = await api("/api/availability?days=5");
     renderAvailability(data.days || []);
     els.lastRefresh.textContent = `分布 ${fmtTime()}`;
     els.lastRefresh.className = "status-pill ok";
@@ -544,153 +600,6 @@ function renderAvailabilityHour(hour) {
   `;
 }
 
-async function unlockUserManagement(event) {
-  event.preventDefault();
-  const adminPassword = new FormData(els.userUnlockForm).get("admin_password") || "";
-  try {
-    await api("/api/users/unlock", {
-      method: "POST",
-      body: JSON.stringify({ admin_password: adminPassword }),
-    });
-    state.adminPassword = String(adminPassword);
-    state.userManagementUnlocked = true;
-    els.userUnlockForm.reset();
-    resetUserForm();
-    renderUserManagementLock();
-    addUiLog("用户管理已解锁", true);
-  } catch (error) {
-    addUiLog(`用户管理解锁失败: ${error.message}`, true);
-  }
-}
-
-function resetUserForm() {
-  els.userForm.reset();
-  els.userForm.elements.enabled.checked = true;
-  setTokenHelperMessage("不会保存账号密码。");
-}
-
-function lockUserManagement() {
-  state.adminPassword = "";
-  state.userManagementUnlocked = false;
-  resetUserForm();
-  renderUserManagementLock();
-  addUiLog("用户管理已锁定");
-}
-
-async function saveUser(event) {
-  event.preventDefault();
-  if (!state.userManagementUnlocked || !state.adminPassword) {
-    addUiLog("用户保存失败: 请先输入管理密码", true);
-    return;
-  }
-  const form = new FormData(els.userForm);
-  const payload = {
-    admin_password: state.adminPassword,
-    key: form.get("key"),
-    label: form.get("label"),
-    token: form.get("token"),
-    jsessionid: form.get("jsessionid"),
-    card_name: form.get("card_name") || "学生球类卡",
-    enabled: form.get("enabled") === "on",
-  };
-  try {
-    const result = await api("/api/users", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    state.users = result.users || [];
-    state.selectedUserKey = result.user?.key || state.selectedUserKey;
-    resetUserForm();
-    renderUsers();
-    addUiLog(`用户已保存: ${result.user.label}`, true);
-    await refreshAll();
-  } catch (error) {
-    addUiLog(`用户保存失败: ${error.message}`, true);
-  }
-}
-
-function setTokenHelperMessage(text, tone = "") {
-  els.tokenHelperMessage.textContent = text;
-  els.tokenHelperMessage.className = `form-note ${tone}`.trim();
-}
-
-async function copyTokenAuthUrl() {
-  if (!state.userManagementUnlocked || !state.adminPassword) {
-    setTokenHelperMessage("请先输入管理密码。", "danger-text");
-    return;
-  }
-  try {
-    const result = await api("/api/token/auth-url", {
-      method: "POST",
-      body: JSON.stringify({ admin_password: state.adminPassword }),
-    });
-    await copyText(result.auth_url);
-    setTokenHelperMessage("授权链接已复制，在电脑微信内打开。", "success-text");
-    addUiLog("Token 授权链接已复制");
-  } catch (error) {
-    setTokenHelperMessage(`复制失败: ${error.message}`, "danger-text");
-  }
-}
-
-async function copyText(text) {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
-  }
-  const textarea = document.createElement("textarea");
-  textarea.value = text;
-  textarea.setAttribute("readonly", "readonly");
-  textarea.style.position = "fixed";
-  textarea.style.left = "-9999px";
-  document.body.append(textarea);
-  textarea.select();
-  const copied = document.execCommand("copy");
-  textarea.remove();
-  if (!copied) {
-    throw new Error("clipboard unavailable");
-  }
-}
-
-async function exchangeUserToken() {
-  if (!state.userManagementUnlocked || !state.adminPassword) {
-    setTokenHelperMessage("请先输入管理密码。", "danger-text");
-    return;
-  }
-  const form = new FormData(els.userForm);
-  const payload = {
-    admin_password: state.adminPassword,
-    username: form.get("token_username"),
-    password: form.get("token_password"),
-    redirect_url: form.get("token_redirect_url"),
-  };
-  try {
-    els.exchangeToken.disabled = true;
-    setTokenHelperMessage("正在兑换并校验账号。", "");
-    const result = await api("/api/token/exchange", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    els.userForm.elements.token.value = result.token || "";
-    els.userForm.elements.token_password.value = "";
-    setTokenHelperMessage("Token 已填入，保存用户即可。", "success-text");
-    addUiLog("Token 已兑换并填入用户表单", true);
-  } catch (error) {
-    setTokenHelperMessage(`兑换失败: ${error.message}`, "danger-text");
-    addUiLog(`Token 兑换失败: ${error.message}`, true);
-  } finally {
-    els.exchangeToken.disabled = false;
-  }
-}
-
-async function changeUser() {
-  state.selectedUserKey = els.userSelect.value;
-  state.selectedBill = "";
-  renderDetail(null);
-  renderUsers();
-  addUiLog(`切换用户: ${currentUser()?.label || state.selectedUserKey}`, true);
-  await refreshAll();
-}
-
 async function stopJob() {
   try {
     await api("/api/booking/stop", { method: "POST", body: "{}" });
@@ -739,16 +648,16 @@ async function loadJob() {
 function summarizeJobLine(line) {
   const text = String(line || "");
   if (text.includes("[dry-run]")) {
-    return text.replace(/^.*\\|\\s*/, "");
+    return text.replace(/^.*\|\s*/, "");
   }
   if (text.includes("[汇总]")) {
-    return text.replace(/^.*\\|\\s*/, "");
+    return text.replace(/^.*\|\s*/, "");
   }
   if (text.includes("[成功]")) {
-    return text.replace(/^.*\\|\\s*/, "");
+    return text.replace(/^.*\|\s*/, "");
   }
   if (text.includes("[失败]")) {
-    return text.replace(/^.*\\|\\s*/, "");
+    return text.replace(/^.*\|\s*/, "");
   }
   if (text.includes("[get_places] 成功")) {
     return "场地数据已刷新";
@@ -757,15 +666,19 @@ function summarizeJobLine(line) {
     return "预约任务已启动";
   }
   if (text.includes("[配置] 日期=")) {
-    return text.replace(/^.*\\|\\s*\\[配置\\]\\s*/, "配置: ");
+    return text.replace(/^.*\|\s*\[配置\]\s*/, "配置: ");
   }
   return "";
 }
 
 async function refreshAll() {
   try {
-    await loadUsers();
-    await Promise.all([loadStatus(), loadCards(), loadBookings(), loadBookingHistory(), loadJob()]);
+    await loadStatus();
+    if (!state.config?.configured) {
+      showSetup();
+      return;
+    }
+    await Promise.all([loadCards(), loadBookings(), loadBookingHistory(), loadJob()]);
     addUiLog("刷新完成");
   } catch (error) {
     addUiLog(`刷新失败: ${error.message}`, true);
@@ -941,13 +854,11 @@ function escapeAttr(value) {
   return escapeHtml(value).replaceAll("`", "&#096;");
 }
 
-els.authForm.addEventListener("submit", login);
-els.userSelect.addEventListener("change", () => changeUser().catch((error) => addUiLog(`用户切换失败: ${error.message}`, true)));
-els.userUnlockForm.addEventListener("submit", unlockUserManagement);
-els.lockUserPanel.addEventListener("click", lockUserManagement);
-els.userForm.addEventListener("submit", saveUser);
-els.copyTokenAuthUrl.addEventListener("click", copyTokenAuthUrl);
-els.exchangeToken.addEventListener("click", exchangeUserToken);
+els.setupForm.addEventListener("submit", initializeToken);
+els.setupCopyAuthUrl.addEventListener("click", () => copyAuthUrl("setup"));
+els.tokenConfigForm.addEventListener("submit", overwriteToken);
+els.copyTokenAuthUrl.addEventListener("click", () => copyAuthUrl("config"));
+els.saveManualConfig.addEventListener("click", saveManualConfig);
 els.refreshAll.addEventListener("click", refreshAll);
 els.refreshCards.addEventListener("click", () => loadCards().catch((error) => addUiLog(`余额刷新失败: ${error.message}`, true)));
 els.refreshBookings.addEventListener("click", () => loadBookings().catch((error) => addUiLog(`活跃预约刷新失败: ${error.message}`, true)));
@@ -956,11 +867,7 @@ els.refreshBookingHistory.addEventListener("click", () => loadBookingHistory().c
 els.bookingForm.addEventListener("submit", startBooking);
 els.stopJob.addEventListener("click", stopJob);
 
-setupBookingDate();
-setupSessionHelp();
-setupTouchControls();
-if (localStorage.getItem("daydayupAccessKey")) {
-  showApp().catch(() => showLogin());
-} else {
-  showLogin();
-}
+boot().catch((error) => {
+  setSetupMessage(`启动失败: ${error.message}`, "danger-text");
+  showSetup();
+});

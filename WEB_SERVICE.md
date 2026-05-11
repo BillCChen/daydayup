@@ -6,7 +6,7 @@ Local URL:
 http://127.0.0.1:8788
 ```
 
-Start once:
+Start:
 
 ```bash
 uv run python web_console.py --host 127.0.0.1 --port 8788
@@ -38,16 +38,10 @@ Pause background service:
 launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.billchen.daydayup.webconsole.plist"
 ```
 
-Service config:
+Local config:
 
 ```bash
-$HOME/Library/LaunchAgents/com.billchen.daydayup.webconsole.plist
-```
-
-Local user CSV:
-
-```bash
-local/users.csv
+local/config.json
 ```
 
 Logs:

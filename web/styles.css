@@ -81,8 +81,7 @@ button {
 }
 
 .auth-card label,
-.user-form label,
-.user-select {
+.token-config-form label {
   display: grid;
   gap: 6px;
   color: var(--text-secondary);
@@ -131,22 +130,6 @@ button {
   display: flex;
   align-items: end;
   gap: 8px;
-}
-
-.user-panel-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.user-select select {
-  min-height: 40px;
-  min-width: 132px;
-  border: 1px solid var(--border-muted);
-  border-radius: 8px;
-  background: var(--surface-raised);
-  color: var(--text-primary);
-  padding: 8px 10px;
 }
 
 .topbar h1,
@@ -461,40 +444,10 @@ select:focus-visible {
   margin-top: 14px;
 }
 
-.user-form,
-.user-unlock {
+.token-config-form {
   display: grid;
   gap: 12px;
   margin-top: 14px;
-}
-
-.token-helper {
-  display: grid;
-  gap: 12px;
-  border: 1px solid color-mix(in oklch, var(--primary-amber), var(--border-muted) 45%);
-  border-radius: 8px;
-  background: var(--primary-amber-soft);
-  padding: 12px;
-}
-
-.token-helper-head,
-.token-helper-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.token-helper-head p {
-  margin: 4px 0 0;
-  color: var(--text-secondary);
-  font-size: 0.875rem;
-  line-height: 1.45;
-}
-
-.token-helper-grid {
-  display: grid;
-  gap: 10px;
 }
 
 .booking-form label {
@@ -507,8 +460,7 @@ select:focus-visible {
 .booking-form input,
 .booking-form select,
 .auth-card input,
-.user-unlock input,
-.user-form input,
+.token-config-form input,
 .confirm-input {
   min-height: 48px;
   width: 100%;
@@ -874,19 +826,14 @@ select:focus-visible {
 
 @media (min-width: 720px) {
   .booking-form,
-  .user-form,
-  .user-unlock {
+  .token-config-form {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .time-control,
   .priority-control,
-  .token-helper {
+  .wide-field {
     grid-column: 1 / -1;
-  }
-
-  .token-helper-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .segmented-control {
@@ -909,9 +856,7 @@ select:focus-visible {
   }
 
   .option-grid,
-  .action-row,
-  .user-form .checkline,
-  .user-form .button {
+  .action-row {
     grid-column: 1 / -1;
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }

@@ -7,16 +7,32 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main class="auth-screen" id="authScreen">
-      <form class="auth-card" id="authForm">
+    <main class="auth-screen" id="setupScreen">
+      <form class="auth-card token-setup-card" id="setupForm">
         <p class="eyebrow">Daydayup</p>
-        <h1>预约操作台</h1>
+        <h1>初始化 Token</h1>
+        <p class="form-note">复制授权链接到电脑微信打开，把跳转后的地址粘回这里，输入账号密码完成本地初始化。</p>
         <label>
-          <span>访问密码</span>
+          <span>账号</span>
+          <input name="username" type="text" autocomplete="username" required />
+        </label>
+        <label>
+          <span>密码</span>
           <input name="password" type="password" autocomplete="current-password" required />
         </label>
-        <button class="button primary" type="submit">进入</button>
-        <p class="form-note" id="authMessage">本地访问密码默认 abc123。</p>
+        <label>
+          <span>微信跳转地址</span>
+          <input name="redirect_url" type="url" autocomplete="off" placeholder="https://www.147soft.cn/easyserp/index.html?code=..." required />
+        </label>
+        <label>
+          <span>卡名称</span>
+          <input name="card_name" type="text" autocomplete="off" placeholder="学生球类卡" required />
+        </label>
+        <div class="action-row">
+          <button class="button secondary" id="setupCopyAuthUrl" type="button">复制授权链接</button>
+          <button class="button primary" type="submit">保存并进入</button>
+        </div>
+        <p class="form-note" id="setupMessage">账号密码只用于本次兑换，不写入本地配置。</p>
       </form>
     </main>
 
@@ -24,13 +40,13 @@
       <aside class="rail" aria-label="桌面导航">
         <div class="rail-mark">D</div>
         <nav>
+          <a href="#tokenSetup">配置</a>
           <a href="#wallet">余额</a>
           <a href="#bookings">活跃</a>
           <a href="#availability">分布</a>
           <a href="#submit">提交</a>
           <a href="#bookingHistory">历史</a>
           <a href="#logs">日志</a>
-          <a href="#users">用户</a>
         </nav>
       </aside>
 
@@ -40,13 +56,7 @@
             <p class="eyebrow">Daydayup</p>
             <h1>预约操作台</h1>
           </div>
-          <div class="topbar-actions">
-            <label class="user-select">
-              <span>用户</span>
-              <select id="userSelect"></select>
-            </label>
-            <button class="button secondary compact" id="refreshAll" type="button">刷新</button>
-          </div>
+          <button class="button secondary compact" id="refreshAll" type="button">刷新</button>
         </header>
 
         <section class="status-band" aria-label="连接状态">
@@ -55,11 +65,48 @@
             <div class="status-pill" id="sessionState">Session 检查中</div>
             <button class="help-dot" id="sessionHelpTrigger" type="button" aria-label="查看 Session 指引" aria-expanded="false" aria-describedby="sessionHelp">?</button>
             <div class="status-popover" id="sessionHelp" role="tooltip">
-              <strong>为什么会显示 Session 未传</strong>
-              <p>当前服务没有收到 `DAYDAYUP_JSESSIONID` 或 `-j` 参数，所以请求不会携带登录 Cookie。查询余额和活跃预约通常只需要 Token；正式预约前建议手动登录微信页面，用 Reqable 抓取 Cookie 里的 JSESSIONID，再重启本地服务。</p>
+              <strong>Session 可选</strong>
+              <p>余额、活跃预约和预约链路主要依赖 Token。Session 可手动补充，但初始化版本不会内置个人 Cookie。</p>
             </div>
           </div>
           <div class="status-pill" id="lastRefresh">尚未刷新</div>
+        </section>
+
+        <section class="panel" id="tokenSetup" aria-labelledby="tokenSetupTitle">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Config</p>
+              <h2 id="tokenSetupTitle">Token 配置</h2>
+            </div>
+            <button class="button secondary compact" id="copyTokenAuthUrl" type="button">复制授权链接</button>
+          </div>
+          <form class="token-config-form" id="tokenConfigForm">
+            <label>
+              <span>账号</span>
+              <input name="username" type="text" autocomplete="username" />
+            </label>
+            <label>
+              <span>密码</span>
+              <input name="password" type="password" autocomplete="current-password" />
+            </label>
+            <label class="wide-field">
+              <span>微信跳转地址</span>
+              <input name="redirect_url" type="url" autocomplete="off" placeholder="https://www.147soft.cn/easyserp/index.html?code=..." />
+            </label>
+            <label>
+              <span>卡名称</span>
+              <input name="card_name" type="text" autocomplete="off" placeholder="学生球类卡" />
+            </label>
+            <label>
+              <span>Session</span>
+              <input name="jsessionid" type="password" autocomplete="off" placeholder="可选" />
+            </label>
+            <div class="action-row wide-field">
+              <button class="button primary" type="submit">兑换并保存 Token</button>
+              <button class="button secondary" id="saveManualConfig" type="button">保存手动配置</button>
+            </div>
+            <p class="form-note wide-field" id="tokenConfigMessage">可随时重新走流程覆盖当前 Token。</p>
+          </form>
         </section>
 
         <section class="panel wallet-panel" id="wallet" aria-labelledby="walletTitle">
@@ -236,80 +283,6 @@
             <span class="chip" id="jobState">空闲</span>
           </div>
           <div class="log-stream" id="logStream" aria-live="polite"></div>
-        </section>
-
-        <section class="panel user-panel" id="users" aria-labelledby="usersTitle">
-          <div class="section-head">
-            <div>
-              <p class="eyebrow">Users</p>
-              <h2 id="usersTitle">用户管理</h2>
-            </div>
-            <div class="user-panel-actions">
-              <span class="chip" id="activeUserLabel">未选择</span>
-              <button class="button secondary compact hidden" id="lockUserPanel" type="button">锁定</button>
-            </div>
-          </div>
-          <form class="user-unlock" id="userUnlockForm">
-            <label>
-              <span>管理密码</span>
-              <input name="admin_password" type="password" autocomplete="current-password" required />
-            </label>
-            <button class="button secondary" type="submit">进入管理</button>
-          </form>
-          <form class="user-form hidden" id="userForm">
-            <label>
-              <span>用户标识</span>
-              <input name="key" type="text" autocomplete="off" placeholder="friend_1" required />
-            </label>
-            <label>
-              <span>用户名称</span>
-              <input name="label" type="text" autocomplete="off" required />
-            </label>
-            <div class="token-helper">
-              <div class="token-helper-head">
-                <div>
-                  <strong>获取个人 Token</strong>
-                  <p>复制授权链接到电脑微信打开，把跳转后的地址粘回这里。</p>
-                </div>
-                <button class="button secondary compact" id="copyTokenAuthUrl" type="button">复制链接</button>
-              </div>
-              <div class="token-helper-grid">
-                <label>
-                  <span>账号</span>
-                  <input name="token_username" type="text" autocomplete="username" />
-                </label>
-                <label>
-                  <span>密码</span>
-                  <input name="token_password" type="password" autocomplete="current-password" />
-                </label>
-              </div>
-              <label>
-                <span>微信跳转地址</span>
-                <input name="token_redirect_url" type="url" autocomplete="off" placeholder="https://www.147soft.cn/easyserp/index.html?code=..." />
-              </label>
-              <div class="token-helper-actions">
-                <button class="button primary" id="exchangeToken" type="button">兑换并填入 Token</button>
-                <span class="form-note" id="tokenHelperMessage">不会保存账号密码。</span>
-              </div>
-            </div>
-            <label>
-              <span>Token</span>
-              <input name="token" type="password" autocomplete="off" required />
-            </label>
-            <label>
-              <span>Session</span>
-              <input name="jsessionid" type="password" autocomplete="off" />
-            </label>
-            <label>
-              <span>卡名称</span>
-              <input name="card_name" type="text" autocomplete="off" placeholder="学生球类卡" required />
-            </label>
-            <label class="checkline">
-              <input name="enabled" type="checkbox" checked />
-              <span>启用</span>
-            </label>
-            <button class="button secondary" type="submit">保存用户</button>
-          </form>
         </section>
       </main>
 
