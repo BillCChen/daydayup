@@ -12,6 +12,25 @@ Start:
 uv run python web_console.py --host 127.0.0.1 --port 8788
 ```
 
+Build macOS App:
+
+```bash
+scripts/build_macos_app.sh
+```
+
+App build outputs:
+
+```bash
+dist/Daydayup.app
+dist/Daydayup-v0.1.0-macos.zip
+```
+
+Packaged App runtime data:
+
+```bash
+$HOME/Library/Application Support/Daydayup
+```
+
 Check port:
 
 ```bash

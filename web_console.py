@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from http import HTTPStatus
@@ -43,11 +44,17 @@ from easyserp_client import (
 )
 
 
-ROOT = Path(__file__).resolve().parent
-WEB_DIR = ROOT / "web"
-BOOKING_SCRIPT = ROOT / "enhanced_book_smart_v2.py"
-CONFIG_PATH = ROOT / "local" / "config.json"
-HISTORY_PATH = ROOT / "logs" / "booking_history.json"
+SOURCE_ROOT = Path(__file__).resolve().parent
+RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", SOURCE_ROOT))
+DATA_ROOT = (
+    Path.home() / "Library" / "Application Support" / "Daydayup"
+    if getattr(sys, "frozen", False)
+    else SOURCE_ROOT
+)
+WEB_DIR = RESOURCE_ROOT / "web"
+BOOKING_SCRIPT = RESOURCE_ROOT / "enhanced_book_smart_v2.py"
+CONFIG_PATH = DATA_ROOT / "local" / "config.json"
+HISTORY_PATH = DATA_ROOT / "logs" / "booking_history.json"
 DEFAULT_WEB_PORT = int(os.getenv("DAYDAYUP_WEB_PORT", "8788"))
 DEFAULT_CARD_NAME = "学生球类卡"
 DEFAULT_OAUTH_REDIRECT_URL = "https://www.147soft.cn/easyserp/index.html"
@@ -207,7 +214,8 @@ class JobManager:
             if self.job and self.job.status in ("running", "stopping"):
                 raise EasySerpError("a booking job is already running")
 
-            command, command_label = build_booking_command(payload)
+            script_args, command_label = build_booking_command(payload)
+            command = build_booking_process_command(script_args)
             env = os.environ.copy()
             env["DAYDAYUP_TOKEN"] = account.token
             env["DAYDAYUP_JSESSIONID"] = account.jsessionid
@@ -215,7 +223,7 @@ class JobManager:
 
             process = subprocess.Popen(
                 command,
-                cwd=ROOT,
+                cwd=DATA_ROOT,
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -545,44 +553,44 @@ class WebConsole:
 
 
 def build_booking_command(payload: dict[str, Any]) -> tuple[list[str], str]:
-    command = [sys.executable, str(BOOKING_SCRIPT)]
+    script_args: list[str] = []
     labels: list[str] = []
 
     date_value = clean_string(payload.get("date"))
     in_days = clean_string(payload.get("in_days"))
     if date_value:
-        command.extend(["-d", date_value])
+        script_args.extend(["-d", date_value])
         labels.append(f"date={date_value}")
     elif in_days:
-        command.extend(["--in-days", in_days])
+        script_args.extend(["--in-days", in_days])
         labels.append(f"in_days={in_days}")
     else:
-        command.extend(["--in-days", "4"])
+        script_args.extend(["--in-days", "4"])
         labels.append("in_days=4")
 
     time_range = clean_string(payload.get("time")) or "17-21"
     duration = clean_string(payload.get("duration")) or "2"
-    command.extend(["-t", time_range, "--duration", duration])
+    script_args.extend(["-t", time_range, "--duration", duration])
     labels.extend([f"time={time_range}", f"duration={duration}"])
 
     for flag, key in (("-p", "priority"), ("--backup", "backup")):
         values = parse_int_list(payload.get(key))
         if values:
-            command.append(flag)
-            command.extend(str(value) for value in values)
+            script_args.append(flag)
+            script_args.extend(str(value) for value in values)
             labels.append(f"{key}={','.join(str(value) for value in values)}")
 
     force = bool(payload.get("force", True))
     dry_run = bool(payload.get("dry_run", False))
     all_court = bool(payload.get("all_court", False))
     if force:
-        command.append("--force")
+        script_args.append("--force")
         labels.append("force")
     if dry_run:
-        command.append("--dry-run")
+        script_args.append("--dry-run")
         labels.append("dry_run")
     if all_court:
-        command.append("--all-court")
+        script_args.append("--all-court")
         labels.append("all_court")
 
     for cli_name, payload_key, default_value in (
@@ -591,9 +599,15 @@ def build_booking_command(payload: dict[str, Any]) -> tuple[list[str], str]:
         ("--error-backoff", "error_backoff", "0.25"),
     ):
         value = clean_string(payload.get(payload_key)) or default_value
-        command.extend([cli_name, value])
+        script_args.extend([cli_name, value])
 
-    return command, " ".join(labels)
+    return script_args, " ".join(labels)
+
+
+def build_booking_process_command(script_args: list[str]) -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--booking-worker", *script_args]
+    return [sys.executable, str(BOOKING_SCRIPT), *script_args]
 
 
 def parse_int_list(value: Any) -> list[int]:
@@ -974,6 +988,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="EasySERP API base URL")
     parser.add_argument("--timeout", type=float, default=10.0, help="request timeout in seconds")
     parser.add_argument("--config", default=str(CONFIG_PATH), help="local config JSON path")
+    parser.add_argument("--open-browser", action="store_true", help="open the local web UI after start")
     return parser.parse_args()
 
 
@@ -983,9 +998,12 @@ def main() -> int:
     store = ConfigStore(Path(args.config), token=args.token, jsessionid=args.jsessionid, card_name=args.card_name)
     httpd = ThreadingHTTPServer((args.host, args.port), RequestHandler)
     httpd.console = WebConsole(config, store)  # type: ignore[attr-defined]
-    print(f"Daydayup web console running at http://{args.host}:{args.port}")
+    url = f"http://{args.host}:{args.port}"
+    print(f"Daydayup web console running at {url}")
     print(f"Config={store.path}")
     print(f"Token configured={store.get().token != ''}")
+    if args.open_browser:
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
