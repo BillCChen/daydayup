@@ -10,6 +10,10 @@ const state = {
   primaryCard: null,
   exactBookingLoading: false,
   availabilityWarningTimer: null,
+  scanTasks: [],
+  scanEvents: [],
+  scanTargetCounter: 0,
+  scanTaskLoading: false,
   startHour: 17,
   endHour: 21,
   priorityCourts: [7, 8, 9, 6],
@@ -59,6 +63,12 @@ const els = {
   exactSelectionTotal: document.querySelector("#exactSelectionTotal"),
   exactSelectionBalance: document.querySelector("#exactSelectionBalance"),
   exactSubmit: document.querySelector("#exactSubmit"),
+  scanTaskForm: document.querySelector("#scanTaskForm"),
+  scanTargetList: document.querySelector("#scanTargetList"),
+  addScanTarget: document.querySelector("#addScanTarget"),
+  refreshScanTasks: document.querySelector("#refreshScanTasks"),
+  scanTaskList: document.querySelector("#scanTaskList"),
+  scanEventList: document.querySelector("#scanEventList"),
   refreshBookingHistory: document.querySelector("#refreshBookingHistory"),
   bookingHistoryList: document.querySelector("#bookingHistoryList"),
   bookingForm: document.querySelector("#bookingForm"),
@@ -882,6 +892,234 @@ async function submitExactBooking() {
   }
 }
 
+async function loadScanTasks() {
+  const data = await api(userScopedPath("/api/scan/tasks"));
+  state.scanTasks = data.tasks || [];
+  state.scanEvents = data.events || [];
+  renderScanTasks();
+  renderScanEvents();
+  return data;
+}
+
+function renderScanTasks() {
+  if (!state.scanTasks.length) {
+    els.scanTaskList.innerHTML = `<div class="empty-state">还没有扫描任务。</div>`;
+    return;
+  }
+  els.scanTaskList.innerHTML = state.scanTasks.map((task) => {
+    const tone = scanTaskTone(task.status);
+    const targets = task.targets || [];
+    const done = targets.filter((target) => target.status === "booked").length;
+    const nextScan = task.next_scan_at || "-";
+    return `
+      <div class="scan-task-row">
+        <div class="scan-task-main">
+          <span>
+            <strong>${escapeHtml(task.name || task.id)}</strong>
+            <span class="chip ${tone}">${escapeHtml(scanTaskStatusLabel(task.status))}</span>
+          </span>
+          <span class="booking-meta">${escapeHtml(done)}/${escapeHtml(targets.length)} 个目标 · 下次 ${escapeHtml(nextScan)}</span>
+          <span class="booking-meta">${escapeHtml(scanTaskOptionsLabel(task))}</span>
+          <div class="scan-target-summary">
+            ${targets.map(renderScanTargetSummary).join("")}
+          </div>
+        </div>
+        <div class="scan-task-actions">
+          ${renderScanTaskActions(task)}
+        </div>
+      </div>
+    `;
+  }).join("");
+  els.scanTaskList.querySelectorAll("[data-scan-action]").forEach((button) => {
+    button.addEventListener("click", () => updateScanTask(button.dataset.scanId, button.dataset.scanAction));
+  });
+}
+
+function renderScanEvents() {
+  if (!els.scanEventList) {
+    return;
+  }
+  const events = (state.scanEvents || []).filter((event) => event.important).slice(0, 8);
+  if (!events.length) {
+    els.scanEventList.innerHTML = `<div class="empty-state compact">暂无重要决策。</div>`;
+    return;
+  }
+  els.scanEventList.innerHTML = `
+    <div class="availability-tool-head">
+      <strong>最近重要决策</strong>
+      <span class="booking-meta">预约、取消、重约、完成、过期</span>
+    </div>
+    ${events.map((event) => `
+      <div class="scan-event-row">
+        <span>
+          <strong>${escapeHtml(event.title || event.type)}</strong>
+          <span class="booking-meta">${escapeHtml(event.task_name || "系统")} · ${escapeHtml(event.created_at || "-")}</span>
+        </span>
+        <span class="scan-event-message">${escapeHtml(event.message || "")}</span>
+      </div>
+    `).join("")}
+  `;
+}
+
+function renderScanTargetSummary(target) {
+  const slots = target.booked_slots || [];
+  const booked = slots.length ? ` · ${slots.map((slot) => slot.name || slot.id).join(" + ")}` : "";
+  return `
+    <span class="scan-target-chip">
+      <span class="numeric">${escapeHtml(target.date)} ${escapeHtml(target.start_time)}-${escapeHtml(target.end_time)}</span>
+      <span>${escapeHtml(scanTargetStatusLabel(target.status))}${escapeHtml(booked)}</span>
+    </span>
+  `;
+}
+
+function renderScanTaskActions(task) {
+  if (task.status === "active") {
+    return `
+      <button class="button secondary compact" type="button" data-scan-id="${escapeAttr(task.id)}" data-scan-action="pause">暂停</button>
+      <button class="button secondary compact" type="button" data-scan-id="${escapeAttr(task.id)}" data-scan-action="stop">停止</button>
+    `;
+  }
+  if (task.status === "paused") {
+    return `
+      <button class="button secondary compact" type="button" data-scan-id="${escapeAttr(task.id)}" data-scan-action="resume">恢复</button>
+      <button class="button secondary compact" type="button" data-scan-id="${escapeAttr(task.id)}" data-scan-action="stop">停止</button>
+    `;
+  }
+  return "";
+}
+
+function scanTaskOptionsLabel(task) {
+  const mode = task.success_mode === "all" ? "全部目标成功" : "任一目标成功";
+  const courts = task.court_mode === "all" ? "全部场地" : `部分场地 ${task.selected_courts?.join(" ") || ""}`;
+  const same = task.same_court_required ? "同场地" : "可跨场地";
+  const optimize = task.iterative_optimization ? "自动优化" : "不优化";
+  return `${mode} · ${courts} · ${same} · ${optimize}`;
+}
+
+function scanTaskTone(status) {
+  if (status === "completed") {
+    return "success";
+  }
+  if (status === "active" || status === "paused") {
+    return "warning";
+  }
+  if (status === "expired" || status === "stopped") {
+    return "";
+  }
+  return "danger";
+}
+
+function scanTaskStatusLabel(status) {
+  return {
+    active: "扫描中",
+    paused: "已暂停",
+    stopped: "已停止",
+    completed: "已完成",
+    expired: "已退出",
+  }[status] || "异常";
+}
+
+function scanTargetStatusLabel(status) {
+  return {
+    pending: "等待扫描",
+    booked: "已预约",
+    partial: "部分成功",
+    failed: "失败",
+    expired: "已过期",
+  }[status] || "等待扫描";
+}
+
+function addScanTargetRow(values = {}) {
+  state.scanTargetCounter += 1;
+  const id = `scanTarget${state.scanTargetCounter}`;
+  const row = document.createElement("div");
+  row.className = "scan-target-row";
+  row.dataset.scanTargetRow = "1";
+  row.innerHTML = `
+    <label>
+      <span>日期</span>
+      <input name="target_date" type="date" value="${escapeAttr(values.date || dateInputValue(5))}" required />
+    </label>
+    <label>
+      <span>开始</span>
+      <input name="target_start" type="time" value="${escapeAttr(values.start_time || "18:00")}" required />
+    </label>
+    <label>
+      <span>结束</span>
+      <input name="target_end" type="time" value="${escapeAttr(values.end_time || "22:00")}" required />
+    </label>
+    <button class="button secondary compact" type="button" aria-label="删除目标" data-remove-target="${escapeAttr(id)}">删除</button>
+  `;
+  els.scanTargetList.append(row);
+  row.querySelector("[data-remove-target]").addEventListener("click", () => {
+    if (els.scanTargetList.querySelectorAll("[data-scan-target-row]").length <= 1) {
+      addUiLog("至少保留一个扫描目标", true);
+      return;
+    }
+    row.remove();
+  });
+}
+
+function scanTargetsFromForm() {
+  return Array.from(els.scanTargetList.querySelectorAll("[data-scan-target-row]")).map((row) => ({
+    date: row.querySelector('input[name="target_date"]').value,
+    start_time: row.querySelector('input[name="target_start"]').value,
+    end_time: row.querySelector('input[name="target_end"]').value,
+  }));
+}
+
+async function createScanTask(event) {
+  event.preventDefault();
+  if (state.scanTaskLoading) {
+    return;
+  }
+  const form = new FormData(els.scanTaskForm);
+  const payload = {
+    user_key: state.selectedUserKey,
+    name: form.get("name"),
+    targets: scanTargetsFromForm(),
+    scan_interval_minutes: form.get("scan_interval_minutes"),
+    success_mode: form.get("success_mode"),
+    court_mode: form.get("court_mode"),
+    selected_courts: form.get("selected_courts"),
+    same_court_required: form.get("same_court_required") === "on",
+    iterative_optimization: form.get("iterative_optimization") === "on",
+  };
+  state.scanTaskLoading = true;
+  try {
+    await api("/api/scan/tasks", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    addUiLog("扫描任务已发布", true);
+    els.scanTaskForm.reset();
+    els.scanTargetList.innerHTML = "";
+    addScanTargetRow();
+    await loadScanTasks();
+  } catch (error) {
+    addUiLog(`扫描任务发布失败: ${error.message}`, true);
+  } finally {
+    state.scanTaskLoading = false;
+  }
+}
+
+async function updateScanTask(id, action) {
+  try {
+    await api("/api/scan/tasks/update", {
+      method: "POST",
+      body: JSON.stringify({ id, action }),
+    });
+    addUiLog(`扫描任务已${scanTaskActionText(action)}`, true);
+    await loadScanTasks();
+  } catch (error) {
+    addUiLog(`扫描任务更新失败: ${error.message}`, true);
+  }
+}
+
+function scanTaskActionText(action) {
+  return { pause: "暂停", resume: "恢复", stop: "停止" }[action] || "更新";
+}
+
 async function unlockUserManagement(event) {
   event.preventDefault();
   const adminPassword = new FormData(els.userUnlockForm).get("admin_password") || "";
@@ -1103,7 +1341,7 @@ function summarizeJobLine(line) {
 async function refreshAll() {
   try {
     await loadUsers();
-    await Promise.all([loadStatus(), loadCards(), loadBookings(), loadBookingHistory(), loadJob()]);
+    await Promise.all([loadStatus(), loadCards(), loadBookings(), loadBookingHistory(), loadScanTasks(), loadJob()]);
     addUiLog("刷新完成");
   } catch (error) {
     addUiLog(`刷新失败: ${error.message}`, true);
@@ -1291,6 +1529,9 @@ els.refreshCards.addEventListener("click", () => loadCards().catch((error) => ad
 els.refreshBookings.addEventListener("click", () => loadBookings().catch((error) => addUiLog(`活跃预约刷新失败: ${error.message}`, true)));
 els.scanAvailability.addEventListener("click", scanAvailability);
 els.exactSubmit.addEventListener("click", () => submitExactBooking());
+els.refreshScanTasks.addEventListener("click", () => loadScanTasks().catch((error) => addUiLog(`扫描任务刷新失败: ${error.message}`, true)));
+els.addScanTarget.addEventListener("click", () => addScanTargetRow());
+els.scanTaskForm.addEventListener("submit", createScanTask);
 els.refreshBookingHistory.addEventListener("click", () => loadBookingHistory().catch((error) => addUiLog(`历史预约刷新失败: ${error.message}`, true)));
 els.bookingForm.addEventListener("submit", startBooking);
 els.stopJob.addEventListener("click", stopJob);
@@ -1298,6 +1539,7 @@ els.stopJob.addEventListener("click", stopJob);
 setupBookingDate();
 setupSessionHelp();
 setupTouchControls();
+addScanTargetRow();
 if (localStorage.getItem("daydayupAccessKey")) {
   showApp().catch(() => showLogin());
 } else {
