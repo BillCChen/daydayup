@@ -421,7 +421,7 @@ def build_booking_command(payload: dict[str, Any]) -> tuple[list[str], str]:
             command.extend(str(value) for value in values)
             labels.append(f"{key}={','.join(str(value) for value in values)}")
 
-    force = bool(payload.get("force", True))
+    force = bool(payload.get("force", False))
     dry_run = bool(payload.get("dry_run", False))
     all_court = bool(payload.get("all_court", False))
     if force:
