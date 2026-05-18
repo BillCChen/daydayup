@@ -5,6 +5,11 @@ const state = {
   jobTimer: null,
   lastJobLineCount: 0,
   availabilityLoading: false,
+  availabilityDays: [],
+  selectedAvailabilitySlots: [],
+  primaryCard: null,
+  exactBookingLoading: false,
+  availabilityWarningTimer: null,
   startHour: 17,
   endHour: 21,
   priorityCourts: [7, 8, 9, 6],
@@ -47,6 +52,13 @@ const els = {
   refreshBookings: document.querySelector("#refreshBookings"),
   scanAvailability: document.querySelector("#scanAvailability"),
   availabilityList: document.querySelector("#availabilityList"),
+  availabilityWarning: document.querySelector("#availabilityWarning"),
+  availabilityCombos: document.querySelector("#availabilityCombos"),
+  availabilitySelection: document.querySelector("#availabilitySelection"),
+  exactSelectionList: document.querySelector("#exactSelectionList"),
+  exactSelectionTotal: document.querySelector("#exactSelectionTotal"),
+  exactSelectionBalance: document.querySelector("#exactSelectionBalance"),
+  exactSubmit: document.querySelector("#exactSubmit"),
   refreshBookingHistory: document.querySelector("#refreshBookingHistory"),
   bookingHistoryList: document.querySelector("#bookingHistoryList"),
   bookingForm: document.querySelector("#bookingForm"),
@@ -218,9 +230,11 @@ async function loadCards() {
 }
 
 function renderCards(cards, primaryCard) {
+  state.primaryCard = primaryCard || null;
   if (!primaryCard) {
     els.primaryCard.innerHTML = `<div class="empty-state">未查询到会员卡</div>`;
     els.otherCards.innerHTML = "";
+    renderAvailabilityTools();
     return;
   }
 
@@ -239,6 +253,7 @@ function renderCards(cards, primaryCard) {
       </div>
     `).join("")
     : `<div class="mini-item"><span>没有其他卡</span></div>`;
+  renderAvailabilityTools();
 }
 
 async function loadBookings() {
@@ -481,7 +496,10 @@ async function scanAvailability() {
 
   try {
     const data = await api(userScopedPath("/api/availability?days=5"));
+    state.availabilityDays = data.days || [];
+    state.selectedAvailabilitySlots = [];
     renderAvailability(data.days || []);
+    renderAvailabilityTools();
     els.lastRefresh.textContent = `分布 ${fmtTime()}`;
     els.lastRefresh.className = "status-pill ok";
     addUiLog("可约分布查询完成");
@@ -498,6 +516,7 @@ async function scanAvailability() {
 function renderAvailability(days) {
   if (!days.length) {
     els.availabilityList.innerHTML = `<div class="empty-state">没有返回可约分布</div>`;
+    renderAvailabilityTools();
     return;
   }
 
@@ -515,10 +534,10 @@ function renderAvailability(days) {
     }
     const hours = day.hours || [];
     const hourMarkup = hours.length
-      ? hours.map(renderAvailabilityHour).join("")
+      ? hours.map((hour) => renderAvailabilityHour(day, hour)).join("")
       : `<div class="availability-empty">没有可约场地</div>`;
     return `
-      <div class="availability-day">
+      <div class="availability-day" data-date="${escapeAttr(day.date)}">
         <div class="availability-head">
           <strong>${escapeHtml(day.label)} ${escapeHtml(day.date)}</strong>
           <span class="chip ${day.total ? "success" : ""}">${escapeHtml(day.total)} 个可约时段</span>
@@ -527,13 +546,28 @@ function renderAvailability(days) {
       </div>
     `;
   }).join("");
+
+  els.availabilityList.querySelectorAll("[data-availability-slot]").forEach((button) => {
+    button.addEventListener("click", () => toggleAvailabilitySlot(button));
+  });
 }
 
-function renderAvailabilityHour(hour) {
+function renderAvailabilityHour(day, hour) {
   const courts = (hour.courts || []).map((court) => `
-    <span class="court-chip ${court.wall ? "wall" : ""}" title="${court.wall ? "靠墙场地" : "普通场地"}">
-      ${escapeHtml(court.name)}${court.price ? ` · ${escapeHtml(court.price)}` : ""}
-    </span>
+    <button
+      class="court-chip selectable ${court.wall ? "wall" : ""} ${isAvailabilitySlotSelected(day.date, hour, court) ? "selected" : ""}"
+      type="button"
+      data-availability-slot="1"
+      data-date="${escapeAttr(day.date)}"
+      data-time="${escapeAttr(hour.time)}"
+      data-court-id="${escapeAttr(court.id)}"
+      aria-pressed="${isAvailabilitySlotSelected(day.date, hour, court) ? "true" : "false"}"
+      title="${court.wall ? "靠墙场地" : "普通场地"}"
+    >
+      <span class="court-check" aria-hidden="true"></span>
+      <span>${escapeHtml(court.name)}</span>
+      <span class="court-price">实扣 ${escapeHtml(court.pay || court.pay_value || "-")}</span>
+    </button>
   `).join("");
   return `
     <div class="availability-hour">
@@ -542,6 +576,310 @@ function renderAvailabilityHour(hour) {
       <span class="availability-courts">${courts}</span>
     </div>
   `;
+}
+
+function toggleAvailabilitySlot(button) {
+  const slot = availabilitySlotFromDataset(button.dataset);
+  if (!slot) {
+    return;
+  }
+  const selectedKey = exactSlotKey(slot);
+  if (state.selectedAvailabilitySlots.some((item) => exactSlotKey(item) === selectedKey)) {
+    state.selectedAvailabilitySlots = state.selectedAvailabilitySlots.filter((item) => exactSlotKey(item) !== selectedKey);
+    renderAvailability(state.availabilityDays);
+    renderAvailabilityTools();
+    return;
+  }
+
+  let next = [...state.selectedAvailabilitySlots];
+  if (next.length && next[0].date !== slot.date) {
+    next = [];
+  }
+  const hourKey = exactHourKey(slot);
+  const existingHourIndex = next.findIndex((item) => exactHourKey(item) === hourKey);
+  if (existingHourIndex >= 0) {
+    next.splice(existingHourIndex, 1, slot);
+  } else {
+    const distinctHours = new Set(next.map(exactHourKey));
+    if (distinctHours.size >= 2) {
+      showAvailabilityWarning("同一天最多选择两个时间段");
+      return;
+    }
+    next.push(slot);
+  }
+  next.sort(sortExactSlots);
+  if (!selectionWithinBalance(next)) {
+    showAvailabilityWarning("已选时间段总实扣超过卡余额");
+    return;
+  }
+  state.selectedAvailabilitySlots = next;
+  renderAvailability(state.availabilityDays);
+  renderAvailabilityTools();
+}
+
+function renderAvailabilityTools() {
+  renderAvailabilityCombos();
+  renderExactSelection();
+}
+
+function renderAvailabilityCombos() {
+  if (!els.availabilityCombos) {
+    return;
+  }
+  const combos = buildAvailabilityCombos(state.availabilityDays);
+  if (!combos.length) {
+    els.availabilityCombos.innerHTML = "";
+    return;
+  }
+  els.availabilityCombos.innerHTML = `
+    <div class="availability-tool-head">
+      <strong>自动组合</strong>
+      <span class="booking-meta">连续两小时推荐</span>
+    </div>
+    <div class="combo-list">
+      ${combos.map((combo, index) => renderAvailabilityCombo(combo, index)).join("")}
+    </div>
+  `;
+  els.availabilityCombos.querySelectorAll("[data-combo-index]").forEach((button) => {
+    button.addEventListener("click", () => selectAvailabilityCombo(combos[Number(button.dataset.comboIndex)]));
+  });
+}
+
+function renderAvailabilityCombo(combo, index) {
+  const total = exactSlotsTotal(combo.slots);
+  const disabledClass = selectionWithinBalance(combo.slots) ? "" : " over-limit";
+  const courtText = combo.slots.map((slot) => `${slot.name}`).join(" + ");
+  return `
+    <button class="combo-option${disabledClass}" type="button" data-combo-index="${index}">
+      <span>
+        <strong>${escapeHtml(combo.date)} ${escapeHtml(combo.time)}</strong>
+        <span class="booking-meta">${escapeHtml(courtText)}</span>
+      </span>
+      <span class="numeric">实扣 ${formatMoney(total)}</span>
+    </button>
+  `;
+}
+
+function selectAvailabilityCombo(combo) {
+  if (!combo || !combo.slots) {
+    return;
+  }
+  const slots = combo.slots.slice().sort(sortExactSlots);
+  if (!selectionWithinBalance(slots)) {
+    showAvailabilityWarning("自动组合总实扣超过卡余额");
+    return;
+  }
+  state.selectedAvailabilitySlots = slots;
+  renderAvailability(state.availabilityDays);
+  renderAvailabilityTools();
+}
+
+function renderExactSelection() {
+  if (!els.availabilitySelection) {
+    return;
+  }
+  const slots = state.selectedAvailabilitySlots;
+  const total = exactSlotsTotal(slots);
+  const balance = currentBalanceValue();
+  els.availabilitySelection.classList.toggle("has-selection", slots.length > 0);
+  els.exactSelectionList.innerHTML = slots.length
+    ? slots.map((slot) => `
+      <div class="exact-slot-row">
+        <span>
+          <strong>${escapeHtml(slot.time)}</strong>
+          <span class="booking-meta">${escapeHtml(slot.date)} · ${escapeHtml(slot.name)}</span>
+        </span>
+        <span class="numeric">实扣 ${formatMoney(slot.pay_value)}</span>
+      </div>
+    `).join("")
+    : `<div class="empty-state compact">从可约分布里选择 1 到 2 个时间段。</div>`;
+  els.exactSelectionTotal.textContent = `合计 ${formatMoney(total)}`;
+  els.exactSelectionBalance.textContent = `余额 ${formatMoney(balance)}`;
+  els.exactSubmit.disabled = !slots.length || state.exactBookingLoading;
+  els.exactSubmit.textContent = state.exactBookingLoading ? "提交中" : "提交预约";
+}
+
+function availabilitySlotFromDataset(dataset) {
+  const day = state.availabilityDays.find((item) => item.date === dataset.date);
+  const hour = day?.hours?.find((item) => item.time === dataset.time);
+  const court = hour?.courts?.find((item) => item.id === dataset.courtId);
+  if (!day || !hour || !court) {
+    return null;
+  }
+  return exactSlotFromParts(day, hour, court);
+}
+
+function exactSlotFromParts(day, hour, court) {
+  const startTime = court.start_time || hour.start_time || String(hour.time || "").split("-")[0];
+  const endTime = court.end_time || hour.end_time || String(hour.time || "").split("-")[1];
+  return {
+    date: day.date,
+    label: day.label,
+    time: hour.time,
+    start_time: startTime,
+    end_time: endTime,
+    id: court.id,
+    name: court.name,
+    number: court.number,
+    wall: Boolean(court.wall),
+    price_value: Number(court.price_value || 0),
+    pay_value: Number(court.pay_value || 0),
+  };
+}
+
+function buildAvailabilityCombos(days) {
+  const combos = [];
+  (days || []).forEach((day) => {
+    const hours = (day.hours || []).slice().sort((a, b) => String(a.start_time || a.time).localeCompare(String(b.start_time || b.time)));
+    for (let index = 0; index < hours.length - 1; index += 1) {
+      const current = hours[index];
+      const next = hours[index + 1];
+      if (!current.end_time || !next.start_time || current.end_time !== next.start_time) {
+        continue;
+      }
+      const firstCourt = bestComboCourt(current.courts || [], next.courts || null);
+      const secondCourt = bestComboCourt(next.courts || [], [firstCourt].filter(Boolean));
+      if (!firstCourt || !secondCourt) {
+        continue;
+      }
+      const slots = [
+        exactSlotFromParts(day, current, firstCourt),
+        exactSlotFromParts(day, next, secondCourt),
+      ];
+      combos.push({ date: day.date, time: `${current.start_time}-${next.end_time}`, slots });
+    }
+  });
+  return combos;
+}
+
+function bestComboCourt(courts, preferredMatches) {
+  const list = (courts || []).slice();
+  if (preferredMatches?.length) {
+    const match = list.find((court) => preferredMatches.some((item) => item.id === court.id));
+    if (match) {
+      return match;
+    }
+  }
+  list.sort((a, b) => courtScore(a) - courtScore(b));
+  return list[0] || null;
+}
+
+function courtScore(court) {
+  const number = Number(court.number);
+  const priorityIndex = state.priorityCourts.indexOf(number);
+  if (priorityIndex >= 0) {
+    return priorityIndex;
+  }
+  const safeIndex = SAFE_COURTS.indexOf(number);
+  if (safeIndex >= 0) {
+    return 100 + safeIndex;
+  }
+  const allIndex = ALL_COURTS.indexOf(number);
+  return allIndex >= 0 ? 200 + allIndex : 999;
+}
+
+function isAvailabilitySlotSelected(dateValue, hour, court) {
+  const startTime = court.start_time || hour.start_time || String(hour.time || "").split("-")[0];
+  const endTime = court.end_time || hour.end_time || String(hour.time || "").split("-")[1];
+  return state.selectedAvailabilitySlots.some((slot) => (
+    slot.date === dateValue
+    && slot.start_time === startTime
+    && slot.end_time === endTime
+    && slot.id === court.id
+  ));
+}
+
+function exactSlotKey(slot) {
+  return `${slot.date}|${slot.start_time}|${slot.end_time}|${slot.id}`;
+}
+
+function exactHourKey(slot) {
+  return `${slot.date}|${slot.start_time}`;
+}
+
+function sortExactSlots(a, b) {
+  return `${a.date} ${a.start_time} ${a.id}`.localeCompare(`${b.date} ${b.start_time} ${b.id}`);
+}
+
+function exactSlotsTotal(slots) {
+  return roundMoney((slots || []).reduce((sum, slot) => sum + Number(slot.pay_value || 0), 0));
+}
+
+function currentBalanceValue() {
+  return Number(state.primaryCard?.cash_balance_value || 0);
+}
+
+function selectionWithinBalance(slots) {
+  return exactSlotsTotal(slots) <= currentBalanceValue();
+}
+
+function formatMoney(value) {
+  return Number(value || 0).toFixed(2);
+}
+
+function roundMoney(value) {
+  return Math.round(Number(value || 0) * 100) / 100;
+}
+
+function showAvailabilityWarning(message) {
+  if (!els.availabilityWarning) {
+    return;
+  }
+  els.availabilityWarning.textContent = message;
+  els.availabilityWarning.hidden = false;
+  if (state.availabilityWarningTimer) {
+    window.clearTimeout(state.availabilityWarningTimer);
+  }
+  state.availabilityWarningTimer = window.setTimeout(() => {
+    els.availabilityWarning.hidden = true;
+    state.availabilityWarningTimer = null;
+  }, 3000);
+}
+
+async function submitExactBooking() {
+  if (state.exactBookingLoading || !state.selectedAvailabilitySlots.length) {
+    return;
+  }
+  if (!selectionWithinBalance(state.selectedAvailabilitySlots)) {
+    showAvailabilityWarning("已选时间段总实扣超过卡余额");
+    return;
+  }
+  state.exactBookingLoading = true;
+  renderExactSelection();
+  const payload = {
+    user_key: state.selectedUserKey,
+    dry_run: els.bookingForm.elements.dry_run.checked,
+    slots: state.selectedAvailabilitySlots.map((slot) => ({
+      date: slot.date,
+      start_time: slot.start_time,
+      end_time: slot.end_time,
+      id: slot.id,
+      name: slot.name,
+      price_value: slot.price_value,
+    })),
+  };
+  try {
+    const result = await api("/api/booking/exact", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    const successCount = result.successes?.length || 0;
+    const failureCount = result.failures?.length || 0;
+    addUiLog(`精确预约${result.result_label}: 成功 ${successCount}，失败 ${failureCount}`, true);
+    if (failureCount) {
+      result.failures.forEach((item) => addUiLog(`精确预约失败: ${item.error}`, true));
+    }
+    state.selectedAvailabilitySlots = [];
+    await Promise.all([loadBookings(), loadCards(), loadBookingHistory()]);
+    renderAvailability(state.availabilityDays);
+    renderAvailabilityTools();
+  } catch (error) {
+    showAvailabilityWarning(error.message);
+    addUiLog(`精确预约失败: ${error.message}`, true);
+  } finally {
+    state.exactBookingLoading = false;
+    renderExactSelection();
+  }
 }
 
 async function unlockUserManagement(event) {
@@ -952,6 +1290,7 @@ els.refreshAll.addEventListener("click", refreshAll);
 els.refreshCards.addEventListener("click", () => loadCards().catch((error) => addUiLog(`余额刷新失败: ${error.message}`, true)));
 els.refreshBookings.addEventListener("click", () => loadBookings().catch((error) => addUiLog(`活跃预约刷新失败: ${error.message}`, true)));
 els.scanAvailability.addEventListener("click", scanAvailability);
+els.exactSubmit.addEventListener("click", () => submitExactBooking());
 els.refreshBookingHistory.addEventListener("click", () => loadBookingHistory().catch((error) => addUiLog(`历史预约刷新失败: ${error.message}`, true)));
 els.bookingForm.addEventListener("submit", startBooking);
 els.stopJob.addEventListener("click", stopJob);

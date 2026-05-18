@@ -102,6 +102,21 @@
           <div class="availability-list" id="availabilityList">
             <div class="empty-state">点击按钮后查询今天到 4 天后的全部可约场地。</div>
           </div>
+          <div class="availability-warning" id="availabilityWarning" role="status" aria-live="polite" hidden></div>
+          <div class="availability-combos" id="availabilityCombos"></div>
+          <div class="availability-selection" id="availabilitySelection">
+            <div class="availability-tool-head">
+              <strong>已选场地</strong>
+              <span class="chip" id="exactSelectionTotal">合计 0.00</span>
+            </div>
+            <div class="exact-selection-list" id="exactSelectionList">
+              <div class="empty-state compact">从可约分布里选择 1 到 2 个时间段。</div>
+            </div>
+            <div class="exact-selection-actions">
+              <span class="chip success" id="exactSelectionBalance">余额 0.00</span>
+              <button class="button primary" id="exactSubmit" type="button" disabled>提交预约</button>
+            </div>
+          </div>
         </section>
 
         <section class="panel" id="submit" aria-labelledby="submitTitle">

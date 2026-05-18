@@ -56,6 +56,9 @@ DEFAULT_CARD_NAME = "学生球类卡"
 DEFAULT_USER_KEY = "chen_qixuan"
 DEFAULT_USER_LABEL = "陈启轩"
 DEFAULT_OAUTH_REDIRECT_URL = "https://www.147soft.cn/easyserp/index.html"
+PROJECT_TYPE = "3"
+BOOKING_ITEM_TYPE = "羽毛球"
+BOOKING_CALL_DELAY_SECONDS = 0.03
 
 
 @dataclass
@@ -281,6 +284,37 @@ class BookingHistoryStore:
             "result": "运行中",
             "status": "running",
             "command_label": command_label,
+        }
+        with self.lock:
+            records = self._read_unlocked()
+            records.append(record)
+            self._write_unlocked(records)
+        return record_id
+
+    def create_exact(self, payload: dict[str, Any], result: dict[str, Any], user: UserAccount) -> str:
+        now = time.time()
+        record_id = str(int(now * 1000))
+        slots = payload.get("slots") if isinstance(payload.get("slots"), list) else []
+        target_date = clean_string(slots[0].get("date")) if slots and isinstance(slots[0], dict) else ""
+        target_time = "；".join(
+            slot_label(slot)
+            for slot in slots
+            if isinstance(slot, dict)
+        )
+        record = {
+            "id": record_id,
+            "job_id": "",
+            "requested_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+            "requested_ts": now,
+            "target_date": target_date,
+            "target_time": target_time,
+            "user_key": user.key,
+            "user_label": user.label,
+            "success_target": "；".join(result.get("success_targets") or []),
+            "result": clean_string(result.get("result_label")) or "失败",
+            "status": clean_string(result.get("status")) or "failed",
+            "command_label": "exact_booking",
+            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
         }
         with self.lock:
             records = self._read_unlocked()
@@ -825,6 +859,59 @@ class WebConsole:
         job = self.jobs.start(payload, user, card["card_index_raw"])
         return {"job": serialize_job(job), "user": serialize_user(user), "card": mask_booking_card(card)}
 
+    def book_exact(self, payload: dict[str, Any]) -> dict[str, Any]:
+        user = self.users.get_user(clean_string(payload.get("user_key")))
+        if not user.token:
+            raise EasySerpError("token is required for booking")
+        slots = normalize_exact_slots(payload.get("slots"))
+        card = self.resolve_booking_card(user)
+        total_pay = round(sum(slot["pay_value"] for slot in slots), 2)
+        balance = float_or_zero(card.get("cash_balance_value"))
+        if total_pay > balance:
+            raise EasySerpError(f"selected total {total_pay:.2f} exceeds card balance {balance:.2f}")
+
+        dry_run = bool(payload.get("dry_run", False))
+        client = self.client(user)
+        places_by_date: dict[str, list[dict[str, Any]]] = {}
+        successes: list[dict[str, Any]] = []
+        failures: list[dict[str, Any]] = []
+
+        for slot in slots:
+            places = places_by_date.get(slot["date"])
+            if places is None:
+                places = self._fetch_places(client, user, slot["date"])
+                places_by_date[slot["date"]] = places
+            current = find_current_slot(slot, places)
+            if not current:
+                failures.append({"slot": public_exact_slot(slot), "error": "selected slot is no longer bookable"})
+                continue
+            if dry_run:
+                successes.append({"slot": public_exact_slot(current), "dry_run": True})
+                continue
+            try:
+                self._reserve_exact_slot(client, user, card["card_index_raw"], current)
+                successes.append({"slot": public_exact_slot(current)})
+            except EasySerpError as exc:
+                failures.append({"slot": public_exact_slot(current), "error": redact_sensitive_text(exc)})
+
+        status, result_label = exact_result_status(successes, failures, dry_run)
+        result = {
+            "ok": bool(successes) and not failures,
+            "status": status,
+            "result_label": result_label,
+            "dry_run": dry_run,
+            "successes": successes,
+            "failures": failures,
+            "success_targets": [slot_success_target(item["slot"]) for item in successes],
+            "total_pay": format_amount(total_pay),
+            "total_pay_value": total_pay,
+            "card": mask_booking_card(card),
+            "user": serialize_user(user),
+            "updated_at": time.time(),
+        }
+        result["history_id"] = self.history.create_exact({"slots": slots}, result, user)
+        return result
+
     def booking_history(self, user_key: str = "") -> dict[str, Any]:
         history = self.history.list()
         if user_key:
@@ -855,6 +942,109 @@ class WebConsole:
         card = serialize_card(matches[0])
         card["card_index_raw"] = raw_index
         return card
+
+    def _fetch_places(self, client: EasySerpClient, user: UserAccount, date_value: str) -> list[dict[str, Any]]:
+        payload = client.get(
+            "datediscount/getPlaceInfoByShortNameDiscount",
+            params={
+                "shopNum": self.config.shop_num,
+                "dateymd": date_value,
+                "shortName": DEFAULT_SHORT_NAME,
+                "token": user.token,
+            },
+        )
+        data = require_success(payload, "getPlaceInfoByShortNameDiscount")
+        places = data.get("placeArray", []) if isinstance(data, dict) else []
+        if not isinstance(places, list):
+            raise EasySerpError("placeArray response is not a list")
+        return places
+
+    def _reserve_exact_slot(
+        self,
+        client: EasySerpClient,
+        user: UserAccount,
+        card_index: str,
+        slot: dict[str, Any],
+    ) -> None:
+        canbook_fields = [
+            {
+                "day": slot["date"],
+                "startTime": slot["start_time"],
+                "endTime": slot["end_time"],
+                "placeShortName": slot["id"],
+            }
+        ]
+        field_info_full = [
+            {
+                "day": slot["date"],
+                "startTime": slot["start_time"],
+                "endTime": slot["end_time"],
+                "placeShortName": slot["id"],
+                "name": slot["name"],
+                "stageTypeShortName": DEFAULT_SHORT_NAME,
+            }
+        ]
+        field_info = json.dumps(field_info_full, ensure_ascii=False)
+        require_success(
+            client.post(
+                "place/canBook",
+                data={
+                    "fieldinfo": json.dumps(canbook_fields, ensure_ascii=False),
+                    "shopNum": self.config.shop_num,
+                    "token": user.token,
+                },
+            ),
+            "canBook",
+        )
+        time.sleep(BOOKING_CALL_DELAY_SECONDS)
+        require_success(
+            client.post(
+                "common/getOfferInfo",
+                data={
+                    "token": user.token,
+                    "payMoney": format_amount(slot["price_value"]),
+                    "shopNum": self.config.shop_num,
+                    "projectType": PROJECT_TYPE,
+                    "projectInfo": field_info,
+                },
+            ),
+            "getOfferInfo",
+        )
+        time.sleep(BOOKING_CALL_DELAY_SECONDS)
+        require_success(
+            client.post(
+                "common/getUseCardInfo",
+                data={
+                    "token": user.token,
+                    "shopNum": self.config.shop_num,
+                    "projectType": PROJECT_TYPE,
+                    "projectInfo": field_info,
+                },
+            ),
+            "getUseCardInfo",
+        )
+        time.sleep(BOOKING_CALL_DELAY_SECONDS)
+        require_success(
+            client.post(
+                "place/reservationPlace",
+                data={
+                    "token": user.token,
+                    "shopNum": self.config.shop_num,
+                    "fieldinfo": field_info,
+                    "oldTotal": format_amount(slot["price_value"]),
+                    "cardPayType": "0",
+                    "type": BOOKING_ITEM_TYPE,
+                    "offerId": card_index,
+                    "offerType": PROJECT_TYPE,
+                    "total": format_amount(slot["pay_value"]),
+                    "premerother": "",
+                    "cardIndex": card_index,
+                    "masterCardNum": "",
+                    "zengzhiMoney": "0",
+                },
+            ),
+            "reservationPlace",
+        )
 
     def _find_recent_order(self, bill_num: str, user: UserAccount) -> dict[str, Any] | None:
         orders = fetch_orders(
@@ -971,15 +1161,25 @@ def serialize_availability_day(date_value: str, places: list[dict[str, Any]]) ->
             time_range = slot_time_range(slot)
             if not time_range:
                 continue
-            hour = hour_map.setdefault(time_range, {"time": time_range, "count": 0, "courts": []})
-            price = format_amount(slot.get("oldMoney") or slot.get("money"))
+            start_time, end_time = split_time_range(time_range)
+            hour = hour_map.setdefault(
+                time_range,
+                {"time": time_range, "start_time": start_time, "end_time": end_time, "count": 0, "courts": []},
+            )
+            price_value = slot_price_value(slot, date_value, start_time)
+            pay_value = slot_pay_value(date_value, start_time)
             hour["courts"].append(
                 {
                     "id": court_id,
                     "name": court_name,
                     "number": court_number,
                     "wall": court_number in WALL_COURTS if court_number is not None else False,
-                    "price": price,
+                    "price": format_amount(price_value),
+                    "price_value": price_value,
+                    "pay": format_amount(pay_value),
+                    "pay_value": pay_value,
+                    "start_time": start_time,
+                    "end_time": end_time,
                 }
             )
             hour["count"] += 1
@@ -1005,6 +1205,172 @@ def slot_time_range(slot: dict[str, Any]) -> str:
     return f"{start}-{end}"
 
 
+def split_time_range(time_range: str) -> tuple[str, str]:
+    if "-" not in time_range:
+        return time_range, ""
+    start, end = time_range.split("-", 1)
+    return trim_time(start), trim_time(end)
+
+
+def slot_price_value(slot: dict[str, Any], date_value: str, start_time: str) -> float:
+    for key in ("oldMoney", "money"):
+        value = float_or_none(slot.get(key))
+        if value is not None:
+            return value
+    return slot_pay_value(date_value, start_time)
+
+
+def slot_pay_value(date_value: str, start_time: str) -> float:
+    try:
+        target_day = date.fromisoformat(date_value)
+    except ValueError as exc:
+        raise EasySerpError("invalid slot date") from exc
+    hour = hour_from_time(start_time)
+    if target_day.weekday() < 5 and hour < 16:
+        return 20.0
+    return 30.0
+
+
+def hour_from_time(value: str) -> int:
+    try:
+        return int(trim_time(value).split(":", 1)[0])
+    except (TypeError, ValueError, IndexError) as exc:
+        raise EasySerpError("invalid slot time") from exc
+
+
+def normalize_exact_slots(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise EasySerpError("slots must be a list")
+    if not 1 <= len(value) <= 2:
+        raise EasySerpError("select one or two slots")
+
+    dates: set[str] = set()
+    starts: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise EasySerpError("slot must be an object")
+        date_value = clean_string(item.get("date"))
+        try:
+            date.fromisoformat(date_value)
+        except ValueError as exc:
+            raise EasySerpError("invalid slot date") from exc
+        start_time = normalize_slot_time(item.get("start_time"))
+        end_time = normalize_slot_time(item.get("end_time"))
+        if end_time <= start_time:
+            raise EasySerpError("slot end time must be after start time")
+        court_id = clean_string(item.get("id") or item.get("court_id"))
+        if not court_id:
+            raise EasySerpError("slot court id is required")
+        key = f"{date_value}|{start_time}"
+        if key in starts:
+            raise EasySerpError("only one court can be selected for each hour")
+        dates.add(date_value)
+        starts.add(key)
+        result.append(
+            {
+                "date": date_value,
+                "start_time": start_time,
+                "end_time": end_time,
+                "time": f"{start_time}-{end_time}",
+                "id": court_id,
+                "name": clean_string(item.get("name")) or court_id,
+                "number": court_number_from_text(court_id),
+                "price_value": float_or_zero(item.get("price_value")),
+                "pay_value": slot_pay_value(date_value, start_time),
+                "wall": False,
+            }
+        )
+    if len(dates) != 1:
+        raise EasySerpError("selected slots must be on the same date")
+    result.sort(key=lambda item: (item["date"], item["start_time"], item["id"]))
+    return result
+
+
+def normalize_slot_time(value: Any) -> str:
+    text = trim_time(value)
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        raise EasySerpError("invalid slot time")
+    return f"{int(match.group(1)):02d}:{match.group(2)}"
+
+
+def find_current_slot(target: dict[str, Any], places: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for place in places:
+        project = place.get("projectName", {}) if isinstance(place, dict) else {}
+        court_id = clean_string(project.get("shortname"))
+        if court_id != target["id"]:
+            continue
+        court_name = clean_string(project.get("name")) or court_id
+        court_number = court_number_from_text(court_id) or court_number_from_text(court_name)
+        for slot in place.get("projectInfo", []):
+            if not isinstance(slot, dict) or str(slot.get("state")) != "1":
+                continue
+            time_range = slot_time_range(slot)
+            if not time_range:
+                continue
+            start_time, end_time = split_time_range(time_range)
+            if start_time == target["start_time"] and end_time == target["end_time"]:
+                price_value = slot_price_value(slot, target["date"], start_time)
+                pay_value = slot_pay_value(target["date"], start_time)
+                return {
+                    **target,
+                    "name": court_name,
+                    "number": court_number,
+                    "wall": court_number in WALL_COURTS if court_number is not None else False,
+                    "price_value": price_value,
+                    "pay_value": pay_value,
+                    "price": format_amount(price_value),
+                    "pay": format_amount(pay_value),
+                }
+    return None
+
+
+def public_exact_slot(slot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date": slot.get("date"),
+        "time": slot.get("time") or f"{slot.get('start_time')}-{slot.get('end_time')}",
+        "start_time": slot.get("start_time"),
+        "end_time": slot.get("end_time"),
+        "id": slot.get("id"),
+        "name": slot.get("name"),
+        "number": slot.get("number"),
+        "price": format_amount(slot.get("price_value")),
+        "price_value": float_or_zero(slot.get("price_value")),
+        "pay": format_amount(slot.get("pay_value")),
+        "pay_value": float_or_zero(slot.get("pay_value")),
+        "wall": bool(slot.get("wall")),
+    }
+
+
+def exact_result_status(
+    successes: list[dict[str, Any]],
+    failures: list[dict[str, Any]],
+    dry_run: bool,
+) -> tuple[str, str]:
+    if dry_run and successes and not failures:
+        return "dry_run", "演练完成"
+    if successes and failures:
+        return "partial_success", "部分成功"
+    if successes:
+        return "success", "成功"
+    return "failed", "失败"
+
+
+def slot_success_target(slot: dict[str, Any]) -> str:
+    return f"{clean_string(slot.get('name')) or clean_string(slot.get('id'))} {clean_string(slot.get('time'))}"
+
+
+def slot_label(slot: dict[str, Any]) -> str:
+    return f"{clean_string(slot.get('time')) or slot_time_from_parts(slot)} {clean_string(slot.get('name')) or clean_string(slot.get('id'))}"
+
+
+def slot_time_from_parts(slot: dict[str, Any]) -> str:
+    start_time = clean_string(slot.get("start_time"))
+    end_time = clean_string(slot.get("end_time"))
+    return f"{start_time}-{end_time}" if start_time or end_time else ""
+
+
 def court_number_from_text(value: Any) -> int | None:
     match = re.search(r"(\d+)", str(value or ""))
     if not match:
@@ -1028,6 +1394,13 @@ def float_or_zero(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -1126,6 +1499,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.write_json(app.cancel(payload))
         elif self.path == "/api/booking/start":
             self.write_json(app.start_booking(payload))
+        elif self.path == "/api/booking/exact":
+            self.write_json(app.book_exact(payload))
         elif self.path == "/api/booking/stop":
             self.write_json(app.jobs.stop())
         else:
