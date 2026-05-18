@@ -1,0 +1,952 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Direct-book 与退订操作动画记录</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --surface-page: oklch(0.985 0.008 82);
+        --surface-panel: oklch(0.964 0.014 82);
+        --surface-raised: oklch(0.996 0.006 82);
+        --text-primary: oklch(0.235 0.018 72);
+        --text-secondary: oklch(0.435 0.026 72);
+        --border-muted: oklch(0.865 0.024 82);
+        --primary-amber: oklch(0.735 0.145 72);
+        --primary-amber-soft: oklch(0.925 0.055 78);
+        --action-blue: oklch(0.56 0.13 238);
+        --action-blue-pressed: oklch(0.47 0.12 238);
+        --success-green: oklch(0.64 0.12 148);
+        --success-green-soft: oklch(0.93 0.055 148);
+        --danger-red: oklch(0.58 0.16 28);
+        --danger-red-soft: oklch(0.94 0.048 28);
+        --shadow-pane: 0 18px 54px color-mix(in oklch, var(--text-primary), transparent 88%);
+        --font-body: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        --font-numeric: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-width: 320px;
+        background: var(--surface-page);
+        color: var(--text-primary);
+        font-family: var(--font-body);
+        font-size: 15px;
+        line-height: 1.5;
+      }
+
+      button {
+        font: inherit;
+      }
+
+      .page {
+        display: grid;
+        gap: 18px;
+        width: min(1180px, calc(100% - 28px));
+        margin: 0 auto;
+        padding: 18px 0 28px;
+      }
+
+      .topbar,
+      .section-head,
+      .status-band,
+      .demo-actions,
+      .booking-row,
+      .availability-head,
+      .availability-hour,
+      .tool-head,
+      .slot-row,
+      .dialog-head,
+      .dialog-actions {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .topbar {
+        align-items: end;
+        padding: 4px 2px;
+      }
+
+      .eyebrow {
+        margin: 0 0 2px;
+        color: var(--text-secondary);
+        font-size: 0.75rem;
+        font-weight: 650;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+
+      h1 {
+        font-size: clamp(1.7rem, 4vw, 2.3rem);
+        line-height: 1.12;
+      }
+
+      h2 {
+        font-size: 1.25rem;
+        line-height: 1.18;
+      }
+
+      h3 {
+        font-size: 1rem;
+        line-height: 1.25;
+      }
+
+      .button {
+        min-height: 42px;
+        border: 1px solid var(--border-muted);
+        border-radius: 8px;
+        background: var(--surface-raised);
+        color: var(--text-primary);
+        padding: 10px 14px;
+        font-weight: 650;
+      }
+
+      .button.primary {
+        border-color: var(--action-blue);
+        background: var(--action-blue);
+        color: var(--surface-raised);
+      }
+
+      .button.danger {
+        border-color: var(--danger-red);
+        background: var(--danger-red);
+        color: var(--surface-raised);
+      }
+
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        min-height: 30px;
+        border: 1px solid var(--border-muted);
+        border-radius: 6px;
+        background: var(--surface-raised);
+        padding: 5px 9px;
+        color: var(--text-primary);
+        font-size: 0.8125rem;
+        font-weight: 650;
+        white-space: nowrap;
+      }
+
+      .chip.success {
+        border-color: color-mix(in oklch, var(--success-green), var(--border-muted) 45%);
+        background: var(--success-green-soft);
+      }
+
+      .chip.warning {
+        border-color: color-mix(in oklch, var(--primary-amber), var(--border-muted) 45%);
+        background: var(--primary-amber-soft);
+      }
+
+      .chip.danger {
+        border-color: color-mix(in oklch, var(--danger-red), var(--border-muted) 45%);
+        background: var(--danger-red-soft);
+      }
+
+      .status-band,
+      .panel,
+      .stage,
+      .record-card {
+        border: 1px solid var(--border-muted);
+        border-radius: 8px;
+        background: var(--surface-panel);
+      }
+
+      .status-band {
+        flex-wrap: wrap;
+        padding: 12px;
+      }
+
+      .panel,
+      .stage,
+      .record-card {
+        padding: 16px;
+      }
+
+      .demo-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 14px;
+      }
+
+      .stage {
+        display: grid;
+        gap: 14px;
+        overflow: hidden;
+      }
+
+      .viewport {
+        position: relative;
+        overflow: hidden;
+        border: 1px solid var(--border-muted);
+        border-radius: 8px;
+        background: var(--surface-raised);
+        min-height: 600px;
+        padding: 14px;
+      }
+
+      .demo-screen {
+        display: grid;
+        gap: 12px;
+        transition: transform 260ms cubic-bezier(0.22, 1, 0.36, 1);
+      }
+
+      .availability-list,
+      .selection-box,
+      .booking-list,
+      .detail-pane,
+      .dialog-body,
+      .log-stream {
+        display: grid;
+        gap: 10px;
+      }
+
+      .availability-day,
+      .selection-box,
+      .booking-row,
+      .detail-pane,
+      .log-stream,
+      .refund-box,
+      .warning-box,
+      .confirm-zone,
+      .modal-panel {
+        border: 1px solid var(--border-muted);
+        border-radius: 8px;
+        background: var(--surface-raised);
+        padding: 12px;
+      }
+
+      .availability-hours {
+        display: grid;
+        gap: 8px;
+      }
+
+      .availability-hour {
+        align-items: flex-start;
+        border-top: 1px solid var(--border-muted);
+        padding-top: 8px;
+      }
+
+      .availability-hour:first-child {
+        border-top: 0;
+        padding-top: 0;
+      }
+
+      .availability-time,
+      .availability-count,
+      .numeric,
+      .log-line {
+        font-family: var(--font-numeric);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .availability-time,
+      .availability-count {
+        font-weight: 650;
+        white-space: nowrap;
+      }
+
+      .availability-count,
+      .muted,
+      .booking-meta {
+        color: var(--text-secondary);
+      }
+
+      .availability-courts {
+        display: flex;
+        flex: 1;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 6px;
+      }
+
+      .court-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        min-height: 36px;
+        border: 1px solid color-mix(in oklch, var(--success-green), var(--border-muted) 52%);
+        border-radius: 6px;
+        background: var(--success-green-soft);
+        padding: 4px 8px;
+        color: var(--text-primary);
+        font-size: 0.8125rem;
+      }
+
+      .court-check {
+        width: 14px;
+        height: 14px;
+        border: 1px solid currentColor;
+        border-radius: 4px;
+        background: var(--surface-raised);
+      }
+
+      .court-chip.selected {
+        border-color: var(--action-blue);
+        background: color-mix(in oklch, var(--action-blue), var(--surface-raised) 86%);
+        box-shadow: 0 0 0 4px color-mix(in oklch, var(--action-blue), transparent 82%);
+      }
+
+      .court-chip.selected .court-check {
+        background:
+          linear-gradient(135deg, transparent 46%, var(--surface-raised) 48% 54%, transparent 56%),
+          var(--action-blue);
+        border-color: var(--action-blue);
+      }
+
+      .court-price {
+        color: var(--text-secondary);
+        font-family: var(--font-numeric);
+      }
+
+      .slot-row {
+        min-height: 48px;
+        border: 1px solid var(--border-muted);
+        border-radius: 8px;
+        background: var(--surface-panel);
+        padding: 10px 12px;
+      }
+
+      .booking-row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        min-height: 72px;
+        text-align: left;
+      }
+
+      .booking-main {
+        display: grid;
+        gap: 4px;
+      }
+
+      .booking-row.selected {
+        border-color: var(--primary-amber);
+        background: color-mix(in oklch, var(--primary-amber-soft), var(--surface-raised) 45%);
+      }
+
+      .detail-grid,
+      .refund-grid {
+        display: grid;
+        gap: 8px;
+      }
+
+      .data-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        border-bottom: 1px solid var(--border-muted);
+        padding: 8px 0;
+      }
+
+      .data-row span:first-child {
+        color: var(--text-secondary);
+      }
+
+      .refund-box {
+        border-color: color-mix(in oklch, var(--primary-amber), var(--border-muted) 45%);
+        background: var(--primary-amber-soft);
+      }
+
+      .warning-box,
+      .confirm-zone {
+        border-color: color-mix(in oklch, var(--danger-red), var(--border-muted) 45%);
+        background: var(--danger-red-soft);
+      }
+
+      .confirm-input {
+        width: 100%;
+        min-height: 44px;
+        border: 1px solid var(--border-muted);
+        border-radius: 8px;
+        background: var(--surface-raised);
+        color: var(--text-primary);
+        padding: 10px 12px;
+        font: 650 1rem/1.2 var(--font-numeric);
+      }
+
+      .modal-backdrop {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        background: color-mix(in oklch, var(--text-primary), transparent 58%);
+        padding: 14px;
+        opacity: 0;
+        pointer-events: none;
+        transform: scale(1.02);
+        transition:
+          opacity 260ms cubic-bezier(0.22, 1, 0.36, 1),
+          transform 260ms cubic-bezier(0.22, 1, 0.36, 1);
+      }
+
+      .modal-panel {
+        display: grid;
+        gap: 12px;
+        width: min(520px, 100%);
+        box-shadow: var(--shadow-pane);
+      }
+
+      .modal-close {
+        display: inline-grid;
+        width: 38px;
+        height: 38px;
+        place-items: center;
+        border: 1px solid var(--border-muted);
+        border-radius: 8px;
+        background: var(--surface-raised);
+        color: var(--text-primary);
+        font-size: 1.25rem;
+      }
+
+      .log-stream {
+        background: color-mix(in oklch, var(--surface-panel), var(--surface-raised) 52%);
+      }
+
+      .log-line {
+        color: var(--text-secondary);
+        font-size: 0.8125rem;
+      }
+
+      .log-line.strong {
+        color: var(--text-primary);
+        font-weight: 650;
+      }
+
+      .cursor {
+        position: absolute;
+        z-index: 8;
+        width: 22px;
+        height: 22px;
+        border-radius: 999px;
+        background: var(--action-blue);
+        box-shadow: 0 0 0 8px color-mix(in oklch, var(--action-blue), transparent 82%);
+        opacity: 0;
+        transform: translate(-50%, -50%);
+      }
+
+      .callout {
+        position: absolute;
+        z-index: 7;
+        max-width: min(280px, calc(100% - 32px));
+        border: 1px solid var(--border-muted);
+        border-radius: 8px;
+        background: var(--surface-raised);
+        box-shadow: var(--shadow-pane);
+        padding: 10px 12px;
+        color: var(--text-primary);
+        font-weight: 650;
+        opacity: 0;
+        transform: translateY(8px);
+      }
+
+      .progress {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 8px;
+      }
+
+      .progress-item {
+        min-height: 8px;
+        border-radius: 999px;
+        background: color-mix(in oklch, var(--border-muted), var(--surface-raised) 45%);
+        overflow: hidden;
+      }
+
+      .progress-item span {
+        display: block;
+        width: 0;
+        height: 100%;
+        border-radius: inherit;
+        background: var(--action-blue);
+      }
+
+      .record-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 14px;
+      }
+
+      .record-card {
+        display: grid;
+        gap: 10px;
+      }
+
+      .record-card ul {
+        display: grid;
+        gap: 6px;
+        margin: 0;
+        padding-left: 18px;
+        color: var(--text-secondary);
+      }
+
+      .playing-direct .direct .cursor {
+        animation: direct-cursor 9600ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+      }
+
+      .playing-direct .direct .callout {
+        animation: direct-callout 9600ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+      }
+
+      .playing-direct .direct .select-a {
+        animation: direct-select-a 9600ms linear infinite;
+      }
+
+      .playing-direct .direct .select-b {
+        animation: direct-select-b 9600ms linear infinite;
+      }
+
+      .playing-direct .direct .selection-box {
+        animation: selection-focus 9600ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+      }
+
+      .playing-direct .direct .submit-button {
+        animation: direct-submit 9600ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+      }
+
+      .playing-direct .direct .log-direct {
+        animation: log-rise 9600ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+      }
+
+      .playing-cancel .cancel .cursor {
+        animation: cancel-cursor 11200ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+      }
+
+      .playing-cancel .cancel .callout {
+        animation: cancel-callout 11200ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+      }
+
+      .playing-cancel .cancel .booking-row {
+        animation: booking-select 11200ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+      }
+
+      .playing-cancel .cancel .modal-backdrop {
+        animation: modal-show 11200ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+      }
+
+      .playing-cancel .cancel .typed-value::after {
+        content: "";
+        animation: type-cancel 11200ms linear infinite;
+      }
+
+      .playing-cancel .cancel .confirm-button {
+        animation: confirm-enable 11200ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+      }
+
+      .playing-cancel .cancel .log-cancel {
+        animation: log-rise-cancel 11200ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+      }
+
+      .playing-cancel .cancel .cancelled-state {
+        animation: cancelled-state 11200ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+      }
+
+      .playing-direct .direct .progress-item span,
+      .playing-cancel .cancel .progress-item span {
+        animation: progress-fill 2400ms linear infinite;
+      }
+
+      .playing-direct .direct .progress-item:nth-child(2) span,
+      .playing-cancel .cancel .progress-item:nth-child(2) span {
+        animation-delay: 2400ms;
+      }
+
+      .playing-direct .direct .progress-item:nth-child(3) span,
+      .playing-cancel .cancel .progress-item:nth-child(3) span {
+        animation-delay: 4800ms;
+      }
+
+      .playing-direct .direct .progress-item:nth-child(4) span,
+      .playing-cancel .cancel .progress-item:nth-child(4) span {
+        animation-delay: 7200ms;
+      }
+
+      @keyframes direct-cursor {
+        0%, 8% { left: 77%; top: 25%; opacity: 0; }
+        12%, 22% { left: 77%; top: 25%; opacity: 1; }
+        28%, 38% { left: 70%; top: 33%; opacity: 1; }
+        45%, 55% { left: 80%; top: 69%; opacity: 1; }
+        64%, 100% { left: 80%; top: 69%; opacity: 0; }
+      }
+
+      @keyframes direct-callout {
+        0%, 9% { top: 13%; left: 4%; opacity: 0; }
+        14%, 26% { top: 13%; left: 4%; opacity: 1; transform: translateY(0); }
+        35%, 45% { top: 43%; left: 4%; opacity: 1; transform: translateY(0); }
+        58%, 72% { top: 79%; left: 4%; opacity: 1; transform: translateY(0); }
+        82%, 100% { top: 79%; left: 4%; opacity: 0; }
+      }
+
+      @keyframes direct-select-a {
+        0%, 15% { box-shadow: none; border-color: color-mix(in oklch, var(--success-green), var(--border-muted) 52%); }
+        18%, 100% { border-color: var(--action-blue); background: color-mix(in oklch, var(--action-blue), var(--surface-raised) 86%); box-shadow: 0 0 0 4px color-mix(in oklch, var(--action-blue), transparent 82%); }
+      }
+
+      @keyframes direct-select-b {
+        0%, 31% { box-shadow: none; border-color: color-mix(in oklch, var(--success-green), var(--border-muted) 52%); }
+        34%, 100% { border-color: var(--action-blue); background: color-mix(in oklch, var(--action-blue), var(--surface-raised) 86%); box-shadow: 0 0 0 4px color-mix(in oklch, var(--action-blue), transparent 82%); }
+      }
+
+      @keyframes selection-focus {
+        0%, 35% { transform: none; border-color: var(--border-muted); }
+        43%, 62% { transform: translateY(-2px); border-color: var(--action-blue); box-shadow: 0 10px 26px color-mix(in oklch, var(--action-blue), transparent 88%); }
+        76%, 100% { transform: none; border-color: var(--border-muted); box-shadow: none; }
+      }
+
+      @keyframes direct-submit {
+        0%, 45% { background: var(--action-blue); }
+        52%, 63% { background: var(--action-blue-pressed); transform: translateY(1px); }
+        72%, 100% { background: var(--success-green); transform: none; }
+      }
+
+      @keyframes log-rise {
+        0%, 56% { opacity: 0.35; transform: translateY(8px); }
+        66%, 100% { opacity: 1; transform: translateY(0); }
+      }
+
+      @keyframes cancel-cursor {
+        0%, 8% { left: 78%; top: 17%; opacity: 0; }
+        13%, 22% { left: 78%; top: 17%; opacity: 1; }
+        29%, 38% { left: 52%; top: 72%; opacity: 1; }
+        47%, 58% { left: 76%; top: 84%; opacity: 1; }
+        66%, 100% { left: 76%; top: 84%; opacity: 0; }
+      }
+
+      @keyframes cancel-callout {
+        0%, 10% { top: 4%; left: 4%; opacity: 0; }
+        15%, 27% { top: 4%; left: 4%; opacity: 1; transform: translateY(0); }
+        36%, 50% { top: 43%; left: 4%; opacity: 1; transform: translateY(0); }
+        63%, 78% { top: 86%; left: 4%; opacity: 1; transform: translateY(0); }
+        88%, 100% { top: 86%; left: 4%; opacity: 0; }
+      }
+
+      @keyframes booking-select {
+        0%, 16% { border-color: var(--border-muted); background: var(--surface-raised); }
+        22%, 100% { border-color: var(--primary-amber); background: color-mix(in oklch, var(--primary-amber-soft), var(--surface-raised) 45%); }
+      }
+
+      @keyframes modal-show {
+        0%, 24% { opacity: 0; pointer-events: none; transform: scale(1.02); }
+        32%, 76% { opacity: 1; pointer-events: auto; transform: scale(1); }
+        84%, 100% { opacity: 0; pointer-events: none; transform: scale(0.99); }
+      }
+
+      @keyframes type-cancel {
+        0%, 39% { content: ""; }
+        43% { content: "C"; }
+        47% { content: "CA"; }
+        51% { content: "CAN"; }
+        55% { content: "CANC"; }
+        59% { content: "CANCE"; }
+        63%, 100% { content: "CANCEL"; }
+      }
+
+      @keyframes confirm-enable {
+        0%, 60% { opacity: 0.45; background: color-mix(in oklch, var(--danger-red), var(--surface-raised) 54%); transform: none; }
+        67%, 78% { opacity: 1; background: var(--danger-red); transform: translateY(1px); }
+        85%, 100% { opacity: 1; background: var(--success-green); transform: none; }
+      }
+
+      @keyframes log-rise-cancel {
+        0%, 68% { opacity: 0.35; transform: translateY(8px); }
+        78%, 100% { opacity: 1; transform: translateY(0); }
+      }
+
+      @keyframes cancelled-state {
+        0%, 76% { opacity: 0; transform: translateY(8px); }
+        84%, 100% { opacity: 1; transform: translateY(0); }
+      }
+
+      @keyframes progress-fill {
+        0% { width: 0; }
+        85%, 100% { width: 100%; }
+      }
+
+      @media (max-width: 860px) {
+        .demo-grid,
+        .record-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .topbar {
+          align-items: start;
+          flex-direction: column;
+        }
+
+        .viewport {
+          min-height: 560px;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          animation-duration: 1ms !important;
+          animation-iteration-count: 1 !important;
+          scroll-behavior: auto !important;
+          transition-duration: 1ms !important;
+        }
+      }
+    </style>
+  </head>
+  <body class="playing-direct playing-cancel">
+    <main class="page">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Daydayup Guide</p>
+          <h1>Direct-book 与退订操作动画记录</h1>
+        </div>
+        <div class="demo-actions">
+          <button class="button" type="button" data-action="restart">重新播放</button>
+          <button class="button primary" type="button" data-action="toggle">暂停</button>
+        </div>
+      </header>
+
+      <section class="status-band" aria-label="版本说明">
+        <span class="chip success">独立 HTML</span>
+        <span class="chip warning">无需后端</span>
+        <span class="chip">面向 initial 分支更新说明</span>
+      </section>
+
+      <section class="demo-grid" aria-label="交互动画">
+        <article class="stage direct">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Direct-book</p>
+              <h2>从空余场地直接提交预约</h2>
+            </div>
+            <span class="chip success">可约分布</span>
+          </div>
+          <div class="progress" aria-hidden="true">
+            <div class="progress-item"><span></span></div>
+            <div class="progress-item"><span></span></div>
+            <div class="progress-item"><span></span></div>
+            <div class="progress-item"><span></span></div>
+          </div>
+          <div class="viewport">
+            <div class="demo-screen">
+              <section class="panel">
+                <div class="section-head">
+                  <div>
+                    <p class="eyebrow">Availability</p>
+                    <h3>可约分布</h3>
+                  </div>
+                  <button class="button" type="button">查询 5 天分布</button>
+                </div>
+                <div class="availability-list">
+                  <div class="availability-day">
+                    <div class="availability-head">
+                      <strong>周六 2026-05-23</strong>
+                      <span class="chip success">6 个可约时段</span>
+                    </div>
+                    <div class="availability-hours">
+                      <div class="availability-hour">
+                        <span class="availability-time">18:00-19:00</span>
+                        <span class="availability-count">3 场</span>
+                        <span class="availability-courts">
+                          <span class="court-chip select-a"><span class="court-check"></span><span>7 号场</span><span class="court-price">实扣 45</span></span>
+                          <span class="court-chip"><span class="court-check"></span><span>8 号场</span><span class="court-price">实扣 45</span></span>
+                        </span>
+                      </div>
+                      <div class="availability-hour">
+                        <span class="availability-time">19:00-20:00</span>
+                        <span class="availability-count">2 场</span>
+                        <span class="availability-courts">
+                          <span class="court-chip select-b"><span class="court-check"></span><span>7 号场</span><span class="court-price">实扣 45</span></span>
+                          <span class="court-chip"><span class="court-check"></span><span>9 号场</span><span class="court-price">实扣 45</span></span>
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <section class="selection-box">
+                <div class="tool-head">
+                  <strong>已选场地</strong>
+                  <span class="chip">合计 90.00</span>
+                </div>
+                <div class="slot-row">
+                  <span><strong>18:00-19:00</strong><br><span class="booking-meta">2026-05-23 · 7 号场</span></span>
+                  <span class="numeric">实扣 45.00</span>
+                </div>
+                <div class="slot-row">
+                  <span><strong>19:00-20:00</strong><br><span class="booking-meta">2026-05-23 · 7 号场</span></span>
+                  <span class="numeric">实扣 45.00</span>
+                </div>
+                <div class="tool-head">
+                  <span class="chip success">余额 286.00</span>
+                  <button class="button primary submit-button" type="button">提交预约</button>
+                </div>
+              </section>
+
+              <div class="log-stream">
+                <div class="log-line">[14:18:02] 可约分布查询完成</div>
+                <div class="log-line strong log-direct">[14:18:05] 精确预约成功: 成功 2，失败 0</div>
+              </div>
+            </div>
+            <div class="cursor"></div>
+            <div class="callout">选择 1 到 2 个时间段，合计金额同步更新。</div>
+          </div>
+        </article>
+
+        <article class="stage cancel">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Cancel</p>
+              <h2>退订前确认退款预览</h2>
+            </div>
+            <span class="chip danger">二次确认</span>
+          </div>
+          <div class="progress" aria-hidden="true">
+            <div class="progress-item"><span></span></div>
+            <div class="progress-item"><span></span></div>
+            <div class="progress-item"><span></span></div>
+            <div class="progress-item"><span></span></div>
+          </div>
+          <div class="viewport">
+            <div class="demo-screen">
+              <section class="panel">
+                <div class="section-head">
+                  <div>
+                    <p class="eyebrow">Active</p>
+                    <h3>活跃预约</h3>
+                  </div>
+                  <button class="button" type="button">刷新活跃</button>
+                </div>
+                <div class="booking-list">
+                  <div class="booking-row">
+                    <span class="booking-main">
+                      <span><strong>2026-05-23 18:00-20:00</strong> · 7 号场</span>
+                      <span class="booking-meta">bill B2605231807 · 学生球类卡 · 14:12</span>
+                    </span>
+                    <span class="chip warning">可退 100%</span>
+                  </div>
+                  <div class="booking-row cancelled-state">
+                    <span class="booking-main">
+                      <span><strong>2026-05-23 18:00-20:00</strong> · 7 号场</span>
+                      <span class="booking-meta">bill B2605231807 · 状态已刷新</span>
+                    </span>
+                    <span class="chip success">已取消</span>
+                  </div>
+                </div>
+              </section>
+
+              <section class="detail-pane">
+                <div>
+                  <p class="eyebrow">Selected</p>
+                  <h3>2026-05-23 18:00-20:00</h3>
+                  <p class="muted">7 号场 · bill <span class="numeric">B2605231807</span></p>
+                </div>
+                <div class="detail-grid">
+                  <div class="data-row"><span>状态</span><strong>可退 100%</strong></div>
+                  <div class="data-row"><span>金额</span><strong>90.00</strong></div>
+                  <div class="data-row"><span>支付</span><strong>会员卡</strong></div>
+                </div>
+              </section>
+
+              <div class="log-stream">
+                <div class="log-line">[14:21:08] 读取退款预览 B2605231807</div>
+                <div class="log-line strong log-cancel">[14:21:15] 取消已确认，余额已刷新</div>
+              </div>
+            </div>
+
+            <div class="modal-backdrop">
+              <div class="modal-panel">
+                <div class="dialog-head">
+                  <div>
+                    <p class="eyebrow">Warning</p>
+                    <h3>确认退订场地</h3>
+                  </div>
+                  <button class="modal-close" type="button" aria-label="关闭">×</button>
+                </div>
+                <div class="dialog-body">
+                  <div class="warning-box">
+                    <strong>退订会立即提交到预约系统</strong>
+                    <p>2026-05-23 18:00-20:00 · 7 号场</p>
+                    <p>bill <span class="numeric">B2605231807</span></p>
+                  </div>
+                  <div class="refund-box">
+                    <strong>退款预览</strong>
+                    <div class="refund-grid">
+                      <div class="data-row"><span>支付金额</span><strong>90.00</strong></div>
+                      <div class="data-row"><span>预计退款</span><strong>90.00</strong></div>
+                      <div class="data-row"><span>退款比例</span><strong>100%</strong></div>
+                    </div>
+                  </div>
+                  <label class="confirm-zone">
+                    <strong>输入 CANCEL 确认退订</strong>
+                    <span class="confirm-input typed-value" aria-hidden="true"></span>
+                  </label>
+                </div>
+                <div class="dialog-actions">
+                  <button class="button" type="button">返回</button>
+                  <button class="button danger confirm-button" type="button">确认退订</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="cursor"></div>
+            <div class="callout">先核对目标预约与退款金额，再输入确认文本。</div>
+          </div>
+        </article>
+      </section>
+
+      <section class="record-grid" aria-label="记录说明">
+        <article class="record-card">
+          <h2>Direct-book 记录点</h2>
+          <ul>
+            <li>查询可约分布后，空余场地以绿色可选标签展示。</li>
+            <li>选择同一天 1 到 2 个时间段后，已选场地与合计金额立即更新。</li>
+            <li>余额足够时提交预约，完成后刷新活跃预约、余额和历史记录。</li>
+          </ul>
+        </article>
+        <article class="record-card">
+          <h2>退订记录点</h2>
+          <ul>
+            <li>活跃预约行显示可退状态，点击后打开退订确认层。</li>
+            <li>确认层展示目标预约、bill 编号、预计退款和退款比例。</li>
+            <li>输入 CANCEL 后才能提交，成功后刷新活跃预约和余额。</li>
+          </ul>
+        </article>
+      </section>
+    </main>
+
+    <script>
+      const root = document.body;
+      const restartButton = document.querySelector('[data-action="restart"]');
+      const toggleButton = document.querySelector('[data-action="toggle"]');
+
+      function restartAnimations() {
+        root.classList.remove("playing-direct", "playing-cancel");
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            root.classList.add("playing-direct", "playing-cancel");
+          });
+        });
+      }
+
+      restartButton.addEventListener("click", restartAnimations);
+      toggleButton.addEventListener("click", () => {
+        const paused = root.classList.toggle("paused");
+        document.querySelectorAll("*").forEach((element) => {
+          element.style.animationPlayState = paused ? "paused" : "";
+        });
+        toggleButton.textContent = paused ? "继续" : "暂停";
+      });
+    </script>
+  </body>
+</html>

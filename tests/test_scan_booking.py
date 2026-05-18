@@ -149,6 +149,29 @@ class ScanBookingTest(unittest.TestCase):
         self.assertEqual(len(web_console.scan_candidates_for_target(flexible, flexible["targets"][0], places)), 1)
         self.assertEqual(len(web_console.scan_candidates_for_target(strict, strict["targets"][0], places)), 0)
 
+    def test_single_hour_target_generates_single_slot_candidates(self):
+        scan_target = target(start_time="18:00", end_time="19:00")
+        places = make_places({2: [("18:00", "19:00")], 3: [("18:00", "19:00")]})
+        candidates = web_console.scan_candidates_for_target(task_for([scan_target]), scan_target, places)
+
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(len(candidates[0]["slots"]), 1)
+        self.assertEqual(candidates[0]["slots"][0]["start_time"], "18:00")
+
+    def test_single_hour_target_books_one_slot(self):
+        app = FakeScanApp(make_places({2: [("18:00", "19:00")]}))
+        manager = web_console.ScanTaskManager.__new__(web_console.ScanTaskManager)
+        manager.app = app
+        manager.events = web_console.ScanEventStore(Path(tempfile.mkstemp()[1]))
+        manager.record_event = lambda *args, **kwargs: None
+        scan_task = task_for([target(start_time="18:00", end_time="19:00")])
+
+        manager.process_task(scan_task, datetime(2026, 5, 17, 13, 0))
+
+        self.assertEqual(scan_task["targets"][0]["status"], "booked")
+        self.assertEqual([item["start_time"] for item in scan_task["targets"][0]["booked_slots"]], ["18:00"])
+        self.assertEqual(len(app.booked_payloads[0]["slots"]), 1)
+
     def test_success_modes_and_completion_readiness(self):
         first = target(status="booked")
         second = target(date_value="2026-05-23")

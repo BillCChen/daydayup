@@ -14,9 +14,15 @@ const state = {
   scanEvents: [],
   scanTargetCounter: 0,
   scanTaskLoading: false,
+  cancelDialogBill: "",
+  cancelDialogPreview: null,
+  cancelDialogError: "",
+  cancelDialogLoading: false,
+  cards: [],
   startHour: 17,
   endHour: 21,
   priorityCourts: [7, 8, 9, 6],
+  viewMode: "default",
   users: [],
   selectedUserKey: "",
   userManagementUnlocked: false,
@@ -43,6 +49,8 @@ const els = {
   exchangeToken: document.querySelector("#exchangeToken"),
   tokenHelperMessage: document.querySelector("#tokenHelperMessage"),
   refreshAll: document.querySelector("#refreshAll"),
+  viewSwitcher: document.querySelector("#viewSwitcher"),
+  viewModeDetails: document.querySelector("#viewModeDetails"),
   refreshCards: document.querySelector("#refreshCards"),
   tokenState: document.querySelector("#tokenState"),
   sessionState: document.querySelector("#sessionState"),
@@ -85,6 +93,11 @@ const els = {
   logStream: document.querySelector("#logStream"),
   detailEmpty: document.querySelector("#detailEmpty"),
   detailContent: document.querySelector("#detailContent"),
+  cancelDialog: document.querySelector("#cancelDialog"),
+  cancelDialogBody: document.querySelector("#cancelDialogBody"),
+  closeCancelDialog: document.querySelector("#closeCancelDialog"),
+  cancelDialogBack: document.querySelector("#cancelDialogBack"),
+  cancelDialogSubmit: document.querySelector("#cancelDialogSubmit"),
 };
 
 function fmtTime(ts = Date.now()) {
@@ -183,6 +196,7 @@ function addUiLog(text, strong = false) {
   while (els.logStream.children.length > 180) {
     els.logStream.lastElementChild.remove();
   }
+  renderViewModeDetails();
 }
 
 async function loadUsers() {
@@ -240,6 +254,7 @@ async function loadCards() {
 }
 
 function renderCards(cards, primaryCard) {
+  state.cards = cards || [];
   state.primaryCard = primaryCard || null;
   if (!primaryCard) {
     els.primaryCard.innerHTML = `<div class="empty-state">未查询到会员卡</div>`;
@@ -270,6 +285,7 @@ async function loadBookings() {
   const data = await api(userScopedPath("/api/bookings?success=1&all=0"));
   state.bookings = data.bookings;
   renderBookings(data.bookings);
+  renderViewModeDetails();
   els.lastRefresh.textContent = `活跃 ${fmtTime()}`;
   els.lastRefresh.className = "status-pill ok";
   return data;
@@ -285,19 +301,41 @@ function renderBookings(bookings) {
     const selected = booking.bill_num === state.selectedBill ? " selected" : "";
     const refundState = bookingRefundState(booking);
     return `
-      <button class="booking-row${selected}" type="button" data-bill="${escapeAttr(booking.bill_num)}">
+      <div class="booking-row${selected}" role="button" tabindex="0" data-bill="${escapeAttr(booking.bill_num)}">
         <span class="booking-main">
           <span><span class="booking-time">${escapeHtml(booking.date)} ${escapeHtml(booking.time_range)}</span> · ${escapeHtml(booking.court || "场地")}</span>
           <span class="booking-meta">bill ${escapeHtml(booking.bill_num)} · ${escapeHtml(booking.pay_type || "-")} · ${escapeHtml(booking.created_at || "-")}</span>
         </span>
-        <span class="chip ${refundState.tone}">${escapeHtml(refundState.label)}</span>
-      </button>
+        ${renderRefundAction(booking, refundState)}
+      </div>
     `;
   }).join("");
 
   els.bookingList.querySelectorAll(".booking-row").forEach((row) => {
     row.addEventListener("click", () => selectBooking(row.dataset.bill));
+    row.addEventListener("keydown", (event) => {
+      if (event.target.closest("[data-cancel-bill]")) {
+        return;
+      }
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectBooking(row.dataset.bill);
+      }
+    });
   });
+  els.bookingList.querySelectorAll("[data-cancel-bill]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openCancelDialog(button.dataset.cancelBill);
+    });
+  });
+}
+
+function renderRefundAction(booking, refundState) {
+  if (!booking.cancelled && !refundState.expired) {
+    return `<button class="chip chip-button ${refundState.tone}" type="button" data-cancel-bill="${escapeAttr(booking.bill_num)}">${escapeHtml(refundState.label)}</button>`;
+  }
+  return `<span class="chip ${refundState.tone}">${escapeHtml(refundState.label)}</span>`;
 }
 
 function selectBooking(billNum) {
@@ -305,6 +343,7 @@ function selectBooking(billNum) {
   renderBookings(state.bookings);
   const booking = state.bookings.find((item) => item.bill_num === billNum);
   renderDetail(booking);
+  renderViewModeDetails();
   document.querySelector("#detailPane").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -389,8 +428,96 @@ async function loadCancelPreview(billNum) {
   }
 }
 
-async function cancelBooking(billNum) {
-  const confirmation = document.querySelector("#confirmText")?.value.trim() || "";
+async function openCancelDialog(billNum) {
+  const booking = state.bookings.find((item) => item.bill_num === billNum);
+  if (!booking) {
+    addUiLog(`退订失败: 未找到 bill ${billNum}`, true);
+    return;
+  }
+  state.selectedBill = billNum;
+  state.cancelDialogBill = billNum;
+  state.cancelDialogPreview = null;
+  state.cancelDialogError = "";
+  state.cancelDialogLoading = true;
+  renderBookings(state.bookings);
+  renderDetail(booking);
+  showCancelDialog();
+  renderCancelDialog();
+  try {
+    addUiLog(`读取退款预览 ${billNum}`);
+    state.cancelDialogPreview = await api("/api/cancel/preview", {
+      method: "POST",
+      body: JSON.stringify({ bill_num: billNum, user_key: state.selectedUserKey }),
+    });
+  } catch (error) {
+    state.cancelDialogError = error.message;
+    addUiLog(`退款预览失败: ${error.message}`, true);
+  } finally {
+    state.cancelDialogLoading = false;
+    renderCancelDialog();
+  }
+}
+
+function showCancelDialog() {
+  els.cancelDialog.classList.remove("hidden");
+  document.body.classList.add("modal-open");
+}
+
+function closeCancelDialog() {
+  els.cancelDialog.classList.add("hidden");
+  document.body.classList.remove("modal-open");
+  state.cancelDialogBill = "";
+  state.cancelDialogPreview = null;
+  state.cancelDialogError = "";
+  state.cancelDialogLoading = false;
+}
+
+function renderCancelDialog() {
+  const billNum = state.cancelDialogBill;
+  const booking = state.bookings.find((item) => item.bill_num === billNum);
+  const preview = state.cancelDialogPreview || {};
+  const refund = preview.refund || {};
+  const rule = preview.rule || {};
+  const loadingMarkup = state.cancelDialogLoading ? `<div class="refund-box">正在读取退款预览...</div>` : "";
+  const errorMarkup = state.cancelDialogError ? `<div class="refund-box danger"><strong>退款预览不可用</strong><p>${escapeHtml(state.cancelDialogError)}</p></div>` : "";
+  const previewMarkup = preview.refund
+    ? `
+      <div class="refund-box">
+        <strong>退款预览</strong>
+        <div class="refund-grid">
+          ${dataRow("支付金额", refund.pay_money || "-")}
+          ${dataRow("场地金额", refund.place_money || "-")}
+          ${dataRow("预计退款", refund.refund_money || "-")}
+          ${dataRow("退款比例", rule.refund_percentage === undefined ? "-" : `${rule.refund_percentage}%`)}
+        </div>
+      </div>
+    `
+    : "";
+
+  els.cancelDialogBody.innerHTML = `
+    <div class="warning-box">
+      <strong>退订会立即提交到预约系统</strong>
+      <p>${booking ? `${escapeHtml(booking.date)} ${escapeHtml(booking.time_range)} · ${escapeHtml(booking.court || "场地")}` : "未找到预约详情"}</p>
+      <p>bill <span class="numeric">${escapeHtml(billNum)}</span></p>
+    </div>
+    ${loadingMarkup}
+    ${errorMarkup}
+    ${previewMarkup}
+    <label class="confirm-field">
+      <span>输入 CANCEL 确认退订</span>
+      <input class="confirm-input" id="cancelDialogText" type="text" autocomplete="off" inputmode="latin" placeholder="CANCEL" />
+    </label>
+  `;
+  const input = document.querySelector("#cancelDialogText");
+  const updateSubmit = () => {
+    els.cancelDialogSubmit.disabled = input.value.trim() !== "CANCEL" || state.cancelDialogLoading;
+  };
+  input.addEventListener("input", updateSubmit);
+  updateSubmit();
+}
+
+async function cancelBooking(billNum, confirmationValue = null) {
+  const confirmation = confirmationValue === null ? document.querySelector("#confirmText")?.value.trim() || "" : confirmationValue;
   if (confirmation !== "CANCEL") {
     addUiLog("取消被阻止: 二次确认文本不匹配", true);
     return;
@@ -407,6 +534,9 @@ async function cancelBooking(billNum) {
     await loadBookings();
     const latest = state.bookings.find((item) => item.bill_num === billNum) || result.booking;
     renderDetail(latest || null);
+    if (state.cancelDialogBill === billNum) {
+      closeCancelDialog();
+    }
   } catch (error) {
     addUiLog(`取消失败: ${error.message}`, true);
   }
@@ -422,6 +552,7 @@ async function startBooking(event) {
     duration: form.get("duration"),
     priority: form.get("priority"),
     backup: form.get("backup"),
+    booking_mode: form.get("booking_mode"),
     window_seconds: form.get("window_seconds"),
     poll_interval: form.get("poll_interval"),
     force: form.get("force") === "on",
@@ -437,6 +568,7 @@ async function startBooking(event) {
     });
     state.lastJobLineCount = 0;
     setChip(els.jobState, "运行中", "warning");
+    renderViewModeDetails();
     addUiLog(`预约任务启动: ${result.job.command_label}`, true);
     await loadBookingHistory();
     startJobPolling();
@@ -630,6 +762,7 @@ function toggleAvailabilitySlot(button) {
 function renderAvailabilityTools() {
   renderAvailabilityCombos();
   renderExactSelection();
+  renderViewModeDetails();
 }
 
 function renderAvailabilityCombos() {
@@ -898,6 +1031,7 @@ async function loadScanTasks() {
   state.scanEvents = data.events || [];
   renderScanTasks();
   renderScanEvents();
+  renderViewModeDetails();
   return data;
 }
 
@@ -1051,13 +1185,17 @@ function addScanTargetRow(values = {}) {
     <button class="button secondary compact" type="button" aria-label="删除目标" data-remove-target="${escapeAttr(id)}">删除</button>
   `;
   els.scanTargetList.append(row);
+  row.addEventListener("input", renderViewModeDetails);
+  row.addEventListener("change", renderViewModeDetails);
   row.querySelector("[data-remove-target]").addEventListener("click", () => {
     if (els.scanTargetList.querySelectorAll("[data-scan-target-row]").length <= 1) {
       addUiLog("至少保留一个扫描目标", true);
       return;
     }
     row.remove();
+    renderViewModeDetails();
   });
+  renderViewModeDetails();
 }
 
 function scanTargetsFromForm() {
@@ -1100,6 +1238,7 @@ async function createScanTask(event) {
     addUiLog(`扫描任务发布失败: ${error.message}`, true);
   } finally {
     state.scanTaskLoading = false;
+    renderViewModeDetails();
   }
 }
 
@@ -1289,6 +1428,7 @@ async function loadJob() {
     const snapshot = await api("/api/booking/job");
     if (!snapshot.job) {
       setChip(els.jobState, "空闲");
+      renderViewModeDetails();
       return;
     }
     const job = snapshot.job;
@@ -1307,6 +1447,7 @@ async function loadJob() {
       await loadCards();
       await loadBookingHistory();
     }
+    renderViewModeDetails();
   } catch (error) {
     addUiLog(`日志读取失败: ${error.message}`, true);
   }
@@ -1343,9 +1484,165 @@ async function refreshAll() {
     await loadUsers();
     await Promise.all([loadStatus(), loadCards(), loadBookings(), loadBookingHistory(), loadScanTasks(), loadJob()]);
     addUiLog("刷新完成");
+    renderViewModeDetails();
   } catch (error) {
     addUiLog(`刷新失败: ${error.message}`, true);
   }
+}
+
+function setViewMode(mode) {
+  const normalized = ["default", "numbers", "behavior"].includes(mode) ? mode : "default";
+  state.viewMode = normalized;
+  document.body.dataset.viewMode = normalized;
+  els.viewSwitcher?.querySelectorAll("[data-view-mode]").forEach((button) => {
+    button.setAttribute("aria-pressed", button.dataset.viewMode === normalized ? "true" : "false");
+  });
+  renderViewModeDetails();
+}
+
+function setupViewModeControl() {
+  if (!els.viewSwitcher) {
+    return;
+  }
+  els.viewSwitcher.querySelectorAll("[data-view-mode]").forEach((button) => {
+    button.addEventListener("click", () => setViewMode(button.dataset.viewMode));
+  });
+  setViewMode("default");
+}
+
+function renderViewModeDetails() {
+  if (!els.viewModeDetails) {
+    return;
+  }
+  if (state.viewMode === "default") {
+    els.viewModeDetails.hidden = true;
+    els.viewModeDetails.innerHTML = "";
+    return;
+  }
+
+  els.viewModeDetails.hidden = false;
+  const groups = buildViewModeDetailGroups();
+  els.viewModeDetails.innerHTML = `
+    <div class="view-detail-grid">
+      ${groups.map((group) => viewDetailGroup(group.title, group.rows, group.behavior)).join("")}
+    </div>
+  `;
+}
+
+function buildViewModeDetailGroups() {
+  const primaryCard = state.primaryCard || {};
+  const cards = state.cards || [];
+  const bookings = state.bookings || [];
+  const refundableCount = bookings.filter((booking) => !booking.cancelled && !bookingRefundState(booking).expired).length;
+  const bookingForm = els.bookingForm;
+  const scanForm = els.scanTaskForm;
+  const scanTargets = scanTargetsFromForm();
+  const successSelect = scanForm.elements.success_mode;
+  const modeValue = formValue(bookingForm, "booking_mode", "balanced");
+  const windowSeconds = formValue(bookingForm, "window_seconds", "60");
+  const pollInterval = formValue(bookingForm, "poll_interval", "0.08");
+  const priority = formValue(bookingForm, "priority", "").trim();
+  const backup = formValue(bookingForm, "backup", "").trim();
+  const courtPool = [priority, backup].filter(Boolean).join(" + ") || "-";
+  const logCount = els.logStream.children.length;
+
+  return [
+    {
+      title: "余额",
+      rows: [
+        ["卡数量", `${cards.length}`],
+        ["主卡余额", primaryCard.cash_balance || "-"],
+        ["主卡有效期", primaryCard.end_date || "-"],
+      ],
+      behavior: "选卡优先读取接口返回的主卡；后续精确预约和余额展示都以主卡余额作为提交前校验基准。",
+    },
+    {
+      title: "活跃预约",
+      rows: [
+        ["活跃数", `${bookings.length}`],
+        ["可退数", `${refundableCount}`],
+        ["选中 bill", state.selectedBill || "-"],
+      ],
+      behavior: "点击活跃预约会打开右侧详情；未过期且未取消的记录才显示退订入口，退订仍需要二次确认文本。",
+    },
+    {
+      title: "可约分布",
+      rows: [
+        ["查询范围", "5 天"],
+        ["精确预约", `${state.selectedAvailabilitySlots.length}/2 个时间段`],
+        ["提交校验", "提交前重新查询"],
+      ],
+      behavior: "分布查询覆盖今天到 4 天后；精确预约提交前会重新查询并按最新可约数据确认目标仍可提交。",
+    },
+    {
+      title: "扫描预约",
+      rows: [
+        ["间隔范围", "5-1440 分钟"],
+        ["当前间隔", `${formValue(scanForm, "scan_interval_minutes", "30")} 分钟`],
+        ["默认间隔", "30 分钟"],
+        ["目标数量", `${scanTargets.length}`],
+        ["达成条件", successSelect.selectedOptions[0]?.textContent || "-"],
+      ],
+      behavior: "扫描任务按目标约束生成候选并排序；允许迭代优化时，发现更优目标后会走取消和重约流程。",
+    },
+    {
+      title: "提交预约",
+      rows: [
+        ["booking_mode", modeValue],
+        ["window_seconds", `${windowSeconds}s`],
+        ["poll_interval", secondsToMsText(pollInterval)],
+        ["step_sleep", "30ms"],
+        ["guide_interval", "500ms"],
+        ["guide_max_inflight", "4"],
+        ["场地池", courtPool],
+      ],
+      behavior: "balanced 先查询再排序下单；direct-fast 跳过 get_places 连续直抢；guided-fast 用直抢 worker 和 collector 探测共同更新排序。",
+    },
+    {
+      title: "日志",
+      rows: [
+        ["保留上限", "180 行"],
+        ["当前行数", `${logCount}`],
+        ["任务状态", els.jobState.textContent || "空闲"],
+      ],
+      behavior: "任务输出被轮询读取后会压缩成页面日志；页面只保留最新 180 行，任务状态芯片来自当前 job 快照。",
+    },
+  ];
+}
+
+function viewDetailGroup(title, rows, behavior) {
+  const behaviorMarkup = state.viewMode === "behavior" ? `<p class="behavior-detail">${escapeHtml(behavior)}</p>` : "";
+  return `
+    <section class="view-detail-group">
+      <h3>${escapeHtml(title)}</h3>
+      <div class="view-detail-values">
+        ${rows.map(([label, value]) => viewDetailRow(label, value)).join("")}
+      </div>
+      ${behaviorMarkup}
+    </section>
+  `;
+}
+
+function viewDetailRow(label, value) {
+  return `
+    <div class="view-detail-item">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+    </div>
+  `;
+}
+
+function formValue(form, name, fallback = "-") {
+  const value = form?.elements?.[name]?.value;
+  return value === undefined || value === "" ? fallback : String(value);
+}
+
+function secondsToMsText(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) {
+    return "-";
+  }
+  return `${Math.round(seconds * 1000)}ms`;
 }
 
 function setupBookingDate() {
@@ -1358,7 +1655,7 @@ function setupTouchControls() {
   setupTimeControl();
   setupSegmentedControl(els.durationPicker, 'input[name="duration"]', "2");
   setupSegmentedControl(els.windowPicker, 'input[name="window_seconds"]', "60");
-  setupSegmentedControl(els.pollPicker, 'input[name="poll_interval"]', "0.08");
+  setupPollControl();
   setupCourtPicker();
 }
 
@@ -1398,6 +1695,7 @@ function renderTimeControl() {
   els.bookingForm.querySelectorAll(".time-control [data-action]").forEach((button) => {
     button.disabled = Boolean(disabled[button.dataset.action]);
   });
+  renderViewModeDetails();
 }
 
 function setupSegmentedControl(container, inputSelector, initialValue) {
@@ -1407,11 +1705,31 @@ function setupSegmentedControl(container, inputSelector, initialValue) {
     container.querySelectorAll("button[data-value]").forEach((button) => {
       button.setAttribute("aria-pressed", button.dataset.value === value ? "true" : "false");
     });
+    renderViewModeDetails();
   };
   container.querySelectorAll("button[data-value]").forEach((button) => {
     button.addEventListener("click", () => selectValue(button.dataset.value));
   });
   selectValue(initialValue);
+}
+
+function setupPollControl() {
+  const pollInput = els.bookingForm.querySelector('input[name="poll_interval"]');
+  const modeInput = els.bookingForm.querySelector('input[name="booking_mode"]');
+  const selectButton = (selectedButton) => {
+    pollInput.value = selectedButton.dataset.value;
+    modeInput.value = selectedButton.dataset.mode || "balanced";
+    els.pollPicker.querySelectorAll("button[data-value]").forEach((button) => {
+      button.setAttribute("aria-pressed", button === selectedButton ? "true" : "false");
+    });
+    renderViewModeDetails();
+  };
+  els.pollPicker.querySelectorAll("button[data-value]").forEach((button) => {
+    button.addEventListener("click", () => selectButton(button));
+    if (button.getAttribute("aria-pressed") === "true") {
+      selectButton(button);
+    }
+  });
 }
 
 function setupCourtPicker() {
@@ -1465,6 +1783,7 @@ function updateCourtInputs() {
   els.bookingForm.elements.priority.value = priority.join(" ");
   els.bookingForm.elements.backup.value = backup.join(" ");
   els.priorityValue.textContent = priority.length ? priority.join(" ") : "默认";
+  renderViewModeDetails();
 }
 
 function setupSessionHelp() {
@@ -1532,12 +1851,31 @@ els.exactSubmit.addEventListener("click", () => submitExactBooking());
 els.refreshScanTasks.addEventListener("click", () => loadScanTasks().catch((error) => addUiLog(`扫描任务刷新失败: ${error.message}`, true)));
 els.addScanTarget.addEventListener("click", () => addScanTargetRow());
 els.scanTaskForm.addEventListener("submit", createScanTask);
+els.scanTaskForm.addEventListener("input", renderViewModeDetails);
+els.scanTaskForm.addEventListener("change", renderViewModeDetails);
 els.refreshBookingHistory.addEventListener("click", () => loadBookingHistory().catch((error) => addUiLog(`历史预约刷新失败: ${error.message}`, true)));
 els.bookingForm.addEventListener("submit", startBooking);
+els.bookingForm.addEventListener("input", renderViewModeDetails);
+els.bookingForm.addEventListener("change", renderViewModeDetails);
 els.stopJob.addEventListener("click", stopJob);
+els.closeCancelDialog.addEventListener("click", closeCancelDialog);
+els.cancelDialogBack.addEventListener("click", closeCancelDialog);
+els.cancelDialog.addEventListener("click", (event) => {
+  if (event.target === els.cancelDialog) {
+    closeCancelDialog();
+  }
+});
+els.cancelDialogSubmit.addEventListener("click", () => {
+  const confirmation = document.querySelector("#cancelDialogText")?.value.trim() || "";
+  if (!state.cancelDialogBill) {
+    return;
+  }
+  cancelBooking(state.cancelDialogBill, confirmation);
+});
 
 setupBookingDate();
 setupSessionHelp();
+setupViewModeControl();
 setupTouchControls();
 addScanTargetRow();
 if (localStorage.getItem("daydayupAccessKey")) {

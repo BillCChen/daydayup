@@ -66,6 +66,7 @@ DEFAULT_OAUTH_REDIRECT_URL = "https://www.147soft.cn/easyserp/index.html"
 PROJECT_TYPE = "3"
 BOOKING_ITEM_TYPE = "羽毛球"
 BOOKING_CALL_DELAY_SECONDS = 0.03
+BOOKING_MODES = {"balanced", "direct-fast", "guided-fast"}
 SCAN_MIN_INTERVAL_MINUTES = 5
 SCAN_MAX_INTERVAL_MINUTES = 1440
 SCAN_DEFAULT_INTERVAL_MINUTES = 30
@@ -690,15 +691,16 @@ class ScanTaskManager:
             return
         best = candidates[0]
         current_slots = [slot for slot in target.get("booked_slots", []) if isinstance(slot, dict)]
+        required_slots = scan_target_required_slots(target)
         if current_slots and not task.get("iterative_optimization"):
-            if len(current_slots) >= 2:
+            if len(current_slots) >= required_slots:
                 target["status"] = "booked"
                 target["last_scan_at"] = format_datetime(now)
                 return
             current_candidate = scan_candidate_with_current_slots(candidates, current_slots)
             if current_candidate:
                 missing = scan_missing_slots(current_candidate["slots"], current_slots)
-                if missing and len(current_slots) + len(missing) <= 2:
+                if missing and len(current_slots) + len(missing) <= required_slots:
                     self.book_candidate(
                         task,
                         target,
@@ -737,7 +739,7 @@ class ScanTaskManager:
         if successes:
             success_slots = [success.get("slot") for success in successes if isinstance(success.get("slot"), dict)]
             target["booked_slots"] = merge_scan_slots(existing_slots or [], success_slots)
-            target["status"] = "booked" if len(target["booked_slots"]) == 2 and not failures else "partial"
+            target["status"] = "booked" if len(target["booked_slots"]) >= scan_target_required_slots(target) and not failures else "partial"
             target["last_decision_at"] = format_datetime(now)
             self.record_event(
                 task,
@@ -808,7 +810,7 @@ class ScanTaskManager:
             )
         else:
             target["booked_slots"] = preserved
-        target["status"] = "booked" if len(target.get("booked_slots") or []) == 2 else "partial"
+        target["status"] = "booked" if len(target.get("booked_slots") or []) >= scan_target_required_slots(target) else "partial"
 
     def record_event(
         self,
@@ -873,6 +875,12 @@ def build_booking_command(payload: dict[str, Any]) -> tuple[list[str], str]:
     command.extend(["-t", time_range, "--duration", duration])
     labels.extend([f"time={time_range}", f"duration={duration}"])
 
+    booking_mode = clean_string(payload.get("booking_mode")) or "balanced"
+    if booking_mode not in BOOKING_MODES:
+        raise EasySerpError("invalid booking mode")
+    command.extend(["--booking-mode", booking_mode])
+    labels.append(f"mode={booking_mode}")
+
     for flag, key in (("-p", "priority"), ("--backup", "backup")):
         values = parse_int_list(payload.get(key))
         if values:
@@ -896,6 +904,8 @@ def build_booking_command(payload: dict[str, Any]) -> tuple[list[str], str]:
     for cli_name, payload_key, default_value in (
         ("--window-seconds", "window_seconds", "60"),
         ("--poll-interval", "poll_interval", "0.08"),
+        ("--guide-interval", "guide_interval", "0.5"),
+        ("--guide-max-inflight", "guide_max_inflight", "4"),
         ("--error-backoff", "error_backoff", "0.25"),
     ):
         value = clean_string(payload.get(payload_key)) or default_value
@@ -1057,8 +1067,8 @@ def normalize_scan_targets(value: Any) -> list[dict[str, Any]]:
         end_time = normalize_slot_time(item.get("end_time"))
         if end_time <= start_time:
             raise EasySerpError("scan target end time must be after start time")
-        if hour_from_time(end_time) - hour_from_time(start_time) < 2:
-            raise EasySerpError("scan target must include at least two hours")
+        if hour_from_time(end_time) - hour_from_time(start_time) < 1:
+            raise EasySerpError("scan target must include at least one hour")
         result.append(
             {
                 "id": f"target_{index}",
@@ -1185,6 +1195,15 @@ def scan_candidates_for_target(
     hours.sort(key=lambda item: clean_string(item.get("start_time")))
     pool = scan_court_pool(task)
     candidates: list[dict[str, Any]] = []
+    if scan_target_required_slots(target) == 1:
+        for hour in hours:
+            for court in hour.get("courts", []):
+                if court.get("number") not in pool:
+                    continue
+                slots = [scan_slot_from_parts(day, hour, court)]
+                candidates.append({"slots": slots, "score": scan_candidate_score(slots)})
+        candidates.sort(key=lambda item: item["score"], reverse=True)
+        return candidates
     for left, right in zip(hours, hours[1:]):
         if left.get("end_time") != right.get("start_time"):
             continue
@@ -1199,6 +1218,11 @@ def scan_candidates_for_target(
             candidates.append({"slots": slots, "score": scan_candidate_score(slots)})
     candidates.sort(key=lambda item: item["score"], reverse=True)
     return candidates
+
+
+def scan_target_required_slots(target: dict[str, Any]) -> int:
+    duration_hours = hour_from_time(clean_string(target.get("end_time"))) - hour_from_time(clean_string(target.get("start_time")))
+    return 1 if duration_hours <= 1 else 2
 
 
 def scan_slot_from_parts(day: dict[str, Any], hour: dict[str, Any], court: dict[str, Any]) -> dict[str, Any]:

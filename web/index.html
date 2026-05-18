@@ -42,6 +42,11 @@
             <h1>预约操作台</h1>
           </div>
           <div class="topbar-actions">
+            <div class="view-switcher" id="viewSwitcher" aria-label="显示风格">
+              <button type="button" data-view-mode="default" aria-pressed="true">默认</button>
+              <button type="button" data-view-mode="numbers" aria-pressed="false">关键参数</button>
+              <button type="button" data-view-mode="behavior" aria-pressed="false">参数行为</button>
+            </div>
             <label class="user-select">
               <span>用户</span>
               <select id="userSelect"></select>
@@ -62,6 +67,8 @@
           </div>
           <div class="status-pill" id="lastRefresh">尚未刷新</div>
         </section>
+
+        <section class="panel view-mode-details" id="viewModeDetails" aria-label="参数详情" hidden></section>
 
         <section class="panel wallet-panel" id="wallet" aria-labelledby="walletTitle">
           <div class="section-head">
@@ -172,7 +179,7 @@
               <div class="option-card">
                 <label class="checkline">
                   <input name="same_court_required" type="checkbox" />
-                  <span>连续两小时必须同一场地</span>
+                  <span>多小时目标必须同一场地</span>
                 </label>
               </div>
               <div class="option-card">
@@ -180,7 +187,7 @@
                   <input name="iterative_optimization" type="checkbox" />
                   <span>允许自动迭代优化</span>
                 </label>
-                <small>发现更晚的连续两小时后，会自动取消旧预约并重约。</small>
+                <small>发现更优目标后，会自动取消旧预约并重约。</small>
               </div>
             </div>
 
@@ -267,11 +274,13 @@
                 <span>轮询间隔</span>
               </div>
               <div class="segmented-control" id="pollPicker" aria-label="轮询间隔">
-                <button type="button" data-value="0.05">快速</button>
+                <button type="button" data-value="0.05" data-mode="direct-fast">快速直抢</button>
+                <button type="button" data-value="0.05" data-mode="guided-fast">快速引导</button>
                 <button type="button" data-value="0.08" aria-pressed="true">均衡</button>
                 <button type="button" data-value="0.12">稳妥</button>
                 <button type="button" data-value="0.2">保守</button>
               </div>
+              <input name="booking_mode" type="hidden" value="balanced" />
               <input name="poll_interval" type="hidden" value="0.08" />
             </div>
 
@@ -409,10 +418,27 @@
         <div class="detail-empty" id="detailEmpty">
           <p class="eyebrow">Detail</p>
           <h2 id="detailTitle">选择活跃预约</h2>
-          <p>点击一条活跃预约后查看退款预览和取消确认。</p>
+          <p>点击活跃预约查看详情，或点击可退状态进行退订。</p>
         </div>
         <div class="detail-content hidden" id="detailContent"></div>
       </aside>
+    </div>
+
+    <div class="modal-backdrop hidden" id="cancelDialog" role="dialog" aria-modal="true" aria-labelledby="cancelDialogTitle">
+      <div class="modal-panel">
+        <div class="modal-head">
+          <div>
+            <p class="eyebrow">Warning</p>
+            <h2 id="cancelDialogTitle">确认退订场地</h2>
+          </div>
+          <button class="icon-button" id="closeCancelDialog" type="button" aria-label="关闭退订确认">×</button>
+        </div>
+        <div class="modal-body" id="cancelDialogBody"></div>
+        <div class="modal-actions">
+          <button class="button secondary" id="cancelDialogBack" type="button">返回</button>
+          <button class="button danger" id="cancelDialogSubmit" type="button" disabled>确认退订</button>
+        </div>
+      </div>
     </div>
 
     <script src="/app.js" defer></script>
