@@ -12,12 +12,14 @@ import csv
 import json
 import os
 import re
+import smtplib
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
+from email.mime.text import MIMEText
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -49,8 +51,13 @@ WEB_DIR = ROOT / "web"
 BOOKING_SCRIPT = ROOT / "enhanced_book_smart_v2.py"
 HISTORY_PATH = ROOT / "logs" / "booking_history.json"
 USERS_PATH = ROOT / "local" / "users.csv"
+SCAN_TASKS_PATH = ROOT / "local" / "scan_tasks.json"
+SCAN_EVENTS_PATH = ROOT / "local" / "scan_events.json"
+MAIL_CONFIG_PATH = ROOT / "local" / "cloudflared_mail.env"
 DEFAULT_WEB_PORT = int(os.getenv("DAYDAYUP_WEB_PORT", "8788"))
 WALL_COURTS = {1, 5, 12}
+SAFE_COURTS = [2, 3, 4, 6, 7, 8, 9, 10, 11]
+ALL_COURTS = list(range(1, 13))
 USER_FIELDS = ("type", "key", "label", "password", "token", "jsessionid", "card_name", "enabled")
 DEFAULT_CARD_NAME = "学生球类卡"
 DEFAULT_USER_KEY = "chen_qixuan"
@@ -59,6 +66,12 @@ DEFAULT_OAUTH_REDIRECT_URL = "https://www.147soft.cn/easyserp/index.html"
 PROJECT_TYPE = "3"
 BOOKING_ITEM_TYPE = "羽毛球"
 BOOKING_CALL_DELAY_SECONDS = 0.03
+SCAN_MIN_INTERVAL_MINUTES = 5
+SCAN_MAX_INTERVAL_MINUTES = 1440
+SCAN_DEFAULT_INTERVAL_MINUTES = 30
+SCAN_SILENT_START = datetime_time(11, 30)
+SCAN_SILENT_END = datetime_time(12, 30)
+SCAN_SUMMARY_TIME = datetime_time(22, 0)
 
 
 @dataclass
@@ -427,6 +440,418 @@ class JobManager:
             job.history_finalized = True
 
 
+class JsonStore:
+    def __init__(self, path: Path, default: Any):
+        self.path = path
+        self.default = default
+        self.lock = threading.Lock()
+
+    def read(self) -> Any:
+        with self.lock:
+            return self._read_unlocked()
+
+    def write(self, value: Any) -> None:
+        with self.lock:
+            self._write_unlocked(value)
+
+    def _read_unlocked(self) -> Any:
+        if not self.path.exists():
+            return json.loads(json.dumps(self.default))
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return json.loads(json.dumps(self.default))
+
+    def _write_unlocked(self, value: Any) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(self.path)
+
+
+class ScanTaskStore(JsonStore):
+    def __init__(self, path: Path):
+        super().__init__(path, {"tasks": []})
+
+    def list(self) -> list[dict[str, Any]]:
+        data = self.read()
+        tasks = data.get("tasks", []) if isinstance(data, dict) else []
+        return [task for task in tasks if isinstance(task, dict)]
+
+    def save_all(self, tasks: list[dict[str, Any]]) -> None:
+        self.write({"tasks": tasks[-200:]})
+
+
+class ScanEventStore(JsonStore):
+    def __init__(self, path: Path):
+        super().__init__(path, {"events": []})
+
+    def list(self, limit: int = 80) -> list[dict[str, Any]]:
+        data = self.read()
+        events = data.get("events", []) if isinstance(data, dict) else []
+        valid = [event for event in events if isinstance(event, dict)]
+        valid.sort(key=lambda item: item.get("created_ts", 0), reverse=True)
+        return valid[:limit]
+
+    def append(self, event: dict[str, Any]) -> None:
+        with self.lock:
+            data = self._read_unlocked()
+            events = data.get("events", []) if isinstance(data, dict) else []
+            events = [item for item in events if isinstance(item, dict)]
+            events.append(event)
+            self._write_unlocked({"events": events[-500:]})
+
+    def recent_important(self, since_ts: float) -> list[dict[str, Any]]:
+        events = self.list(limit=500)
+        return [
+            event
+            for event in events
+            if event.get("important") and event.get("created_ts", 0) >= since_ts and event.get("type") != "daily_summary"
+        ]
+
+    def has_summary_for(self, day_value: str) -> bool:
+        return any(
+            event.get("type") in {"daily_summary", "daily_summary_failed"} and event.get("summary_date") == day_value
+            for event in self.list(limit=120)
+        )
+
+
+class ScanTaskManager:
+    def __init__(self, app: "WebConsole"):
+        self.app = app
+        self.tasks = ScanTaskStore(SCAN_TASKS_PATH)
+        self.events = ScanEventStore(SCAN_EVENTS_PATH)
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=2)
+
+    def snapshot(self, user_key: str = "") -> dict[str, Any]:
+        tasks = self.tasks.list()
+        if user_key:
+            tasks = [task for task in tasks if clean_string(task.get("user_key")) == user_key]
+        events = self.events.list(limit=80)
+        if user_key:
+            events = [
+                event
+                for event in events
+                if not clean_string(event.get("user_key")) or clean_string(event.get("user_key")) == user_key
+            ]
+        return {
+            "tasks": tasks,
+            "events": events,
+            "updated_at": time.time(),
+        }
+
+    def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        user = self.app.users.get_user(clean_string(payload.get("user_key")))
+        task = normalize_scan_task(payload, user)
+        now = datetime.now()
+        task["created_at"] = format_datetime(now)
+        task["updated_at"] = task["created_at"]
+        task["next_scan_at"] = format_datetime(next_scan_time_for_task(task, now))
+        with self.lock:
+            tasks = self.tasks.list()
+            tasks.append(task)
+            self.tasks.save_all(tasks)
+        self.record_event(
+            task,
+            "task_created",
+            "扫描任务已创建",
+            scan_task_summary(task),
+            important=False,
+            send_mail=False,
+        )
+        return {"task": task, "tasks": self.snapshot(user.key)["tasks"]}
+
+    def update(self, payload: dict[str, Any]) -> dict[str, Any]:
+        task_id = clean_string(payload.get("id"))
+        action = clean_string(payload.get("action"))
+        if action not in {"pause", "resume", "stop"}:
+            raise EasySerpError("invalid scan task action")
+        with self.lock:
+            tasks = self.tasks.list()
+            task = next((item for item in tasks if item.get("id") == task_id), None)
+            if not task:
+                raise EasySerpError("scan task was not found")
+            if action == "pause":
+                if task.get("status") != "active":
+                    raise EasySerpError("only active scan tasks can be paused")
+                task["status"] = "paused"
+            elif action == "resume":
+                if task.get("status") != "paused":
+                    raise EasySerpError("only paused scan tasks can be resumed")
+                task["status"] = "active"
+                task["next_scan_at"] = format_datetime(next_scan_time_for_task(task, datetime.now()))
+            elif action == "stop":
+                if task.get("status") not in {"active", "paused"}:
+                    raise EasySerpError("only active or paused scan tasks can be stopped")
+                task["status"] = "stopped"
+            task["updated_at"] = format_datetime(datetime.now())
+            self.tasks.save_all(tasks)
+        self.record_event(
+            task,
+            f"task_{action}",
+            scan_action_label(action),
+            scan_task_summary(task),
+            important=False,
+            send_mail=False,
+        )
+        return {"task": task, "tasks": self.snapshot(clean_string(task.get("user_key")))["tasks"]}
+
+    def _loop(self) -> None:
+        while not self.stop_event.wait(30):
+            try:
+                self.scan_due_tasks()
+                self.send_daily_summary_if_due()
+            except Exception as exc:
+                self.events.append(make_scan_event(None, "scan_loop_error", "扫描循环异常", redact_sensitive_text(exc), important=True))
+
+    def scan_due_tasks(self, now: datetime | None = None) -> None:
+        now = now or datetime.now()
+        with self.lock:
+            tasks = self.tasks.list()
+            changed = False
+            for task in tasks:
+                if task.get("status") != "active":
+                    continue
+                due_at = parse_datetime(clean_string(task.get("next_scan_at"))) or now
+                if due_at > now:
+                    continue
+                self.process_task(task, now)
+                changed = True
+            if changed:
+                self.tasks.save_all(tasks)
+
+    def process_task(self, task: dict[str, Any], now: datetime) -> None:
+        if quiet_window_active(now):
+            task["next_scan_at"] = format_datetime(next_after_quiet_window(now))
+            task["updated_at"] = format_datetime(now)
+            return
+
+        if task_completion_ready(task, now):
+            task["status"] = "completed"
+            task["completed_at"] = format_datetime(now)
+            task["updated_at"] = format_datetime(now)
+            self.record_event(task, "task_completed", "扫描任务已完成", scan_task_summary(task))
+            return
+
+        unfinished = [target for target in task.get("targets", []) if target.get("status") not in {"booked", "expired"}]
+        if not task_satisfied(task) and unfinished and all(target_in_lockout(target, now) for target in unfinished):
+            for target in unfinished:
+                target["status"] = "expired"
+                target["updated_at"] = format_datetime(now)
+            task["status"] = "expired"
+            task["updated_at"] = format_datetime(now)
+            self.record_event(task, "task_expired", "扫描任务已退出", "所有未完成目标已进入 24 小时禁止区。")
+            return
+
+        actionable = [
+            target
+            for target in task.get("targets", [])
+            if scan_target_actionable(target, now, allow_booked=bool(task.get("iterative_optimization")))
+        ]
+        if task.get("success_mode") == "any" and task_satisfied(task):
+            actionable = [target for target in actionable if target.get("status") == "booked"]
+        if not actionable:
+            task["next_scan_at"] = format_datetime(next_scan_time_for_task(task, now))
+            task["updated_at"] = format_datetime(now)
+            return
+
+        user = self.app.users.get_user(clean_string(task.get("user_key")))
+        client = self.app.client(user)
+        for target in actionable:
+            self.process_target(task, target, user, client, now)
+            if task_completion_ready(task, now):
+                task["status"] = "completed"
+                task["completed_at"] = format_datetime(now)
+                self.record_event(task, "task_completed", "扫描任务已完成", scan_task_summary(task))
+                break
+        if task.get("status") == "active":
+            task["next_scan_at"] = format_datetime(next_scan_time_for_task(task, now))
+        task["updated_at"] = format_datetime(now)
+
+    def process_target(
+        self,
+        task: dict[str, Any],
+        target: dict[str, Any],
+        user: UserAccount,
+        client: EasySerpClient,
+        now: datetime,
+    ) -> None:
+        places = self.app._fetch_places(client, user, target["date"])
+        candidates = scan_candidates_for_target(task, target, places)
+        if not candidates:
+            target["last_scan_at"] = format_datetime(now)
+            return
+        best = candidates[0]
+        current_slots = [slot for slot in target.get("booked_slots", []) if isinstance(slot, dict)]
+        if current_slots and not task.get("iterative_optimization"):
+            if len(current_slots) >= 2:
+                target["status"] = "booked"
+                target["last_scan_at"] = format_datetime(now)
+                return
+            current_candidate = scan_candidate_with_current_slots(candidates, current_slots)
+            if current_candidate:
+                missing = scan_missing_slots(current_candidate["slots"], current_slots)
+                if missing and len(current_slots) + len(missing) <= 2:
+                    self.book_candidate(
+                        task,
+                        target,
+                        {"slots": missing},
+                        user,
+                        now,
+                        event_type="scan_booking_success",
+                        existing_slots=current_slots,
+                    )
+                    return
+            target["last_scan_at"] = format_datetime(now)
+            return
+        if current_slots and task.get("iterative_optimization"):
+            if not scan_candidate_better(best, current_slots):
+                target["last_scan_at"] = format_datetime(now)
+                return
+            self.optimize_target(task, target, best, user, now)
+            return
+        self.book_candidate(task, target, best, user, now, event_type="scan_booking_success")
+
+    def book_candidate(
+        self,
+        task: dict[str, Any],
+        target: dict[str, Any],
+        candidate: dict[str, Any],
+        user: UserAccount,
+        now: datetime,
+        event_type: str,
+        existing_slots: list[dict[str, Any]] | None = None,
+    ) -> None:
+        payload = {"user_key": user.key, "slots": candidate["slots"]}
+        result = self.app.book_exact(payload)
+        successes = result.get("successes") or []
+        failures = result.get("failures") or []
+        is_rebook = event_type == "scan_rebook_success"
+        if successes:
+            success_slots = [success.get("slot") for success in successes if isinstance(success.get("slot"), dict)]
+            target["booked_slots"] = merge_scan_slots(existing_slots or [], success_slots)
+            target["status"] = "booked" if len(target["booked_slots"]) == 2 and not failures else "partial"
+            target["last_decision_at"] = format_datetime(now)
+            self.record_event(
+                task,
+                event_type,
+                ("扫描重约成功" if is_rebook else "扫描预约成功")
+                if not failures
+                else ("扫描重约部分成功" if is_rebook else "扫描预约部分成功"),
+                scan_booking_message(target, successes, failures),
+            )
+        if failures and not successes:
+            target["status"] = "failed"
+            target["last_decision_at"] = format_datetime(now)
+            self.record_event(
+                task,
+                "scan_rebook_failed" if is_rebook else "scan_booking_failed",
+                "扫描重约失败" if is_rebook else "扫描预约失败",
+                scan_booking_message(target, successes, failures),
+            )
+
+    def optimize_target(
+        self,
+        task: dict[str, Any],
+        target: dict[str, Any],
+        candidate: dict[str, Any],
+        user: UserAccount,
+        now: datetime,
+    ) -> None:
+        old_slots = [slot for slot in target.get("booked_slots", []) if isinstance(slot, dict)]
+        new_slots = candidate["slots"]
+        old_by_key = {scan_slot_identity(slot): slot for slot in old_slots}
+        new_by_key = {scan_slot_identity(slot): slot for slot in new_slots}
+        to_cancel = [slot for key, slot in old_by_key.items() if key not in new_by_key]
+        to_book = [slot for key, slot in new_by_key.items() if key not in old_by_key]
+
+        for slot in to_cancel:
+            bill_num = clean_string(slot.get("bill_num"))
+            if not bill_num:
+                self.record_event(task, "scan_rebook_failed", "扫描重约失败", "缺少可取消的 bill 编号。")
+                return
+            try:
+                cancel_result = self.app.cancel(
+                    {
+                        "user_key": user.key,
+                        "bill_num": bill_num,
+                        "confirmation": "CANCEL",
+                        "reason": "scan optimization",
+                        "require_confirmed": True,
+                    }
+                )
+                if not cancel_result.get("confirmed"):
+                    raise EasySerpError("cancel was not confirmed")
+                self.record_event(task, "scan_cancel_success", "扫描取消成功", f"{slot_label(slot)} bill={bill_num}")
+            except EasySerpError as exc:
+                self.record_event(task, "scan_cancel_failed", "扫描取消失败", redact_sensitive_text(exc))
+                return
+
+        preserved = [slot for key, slot in old_by_key.items() if key in new_by_key]
+        target["booked_slots"] = preserved
+        if to_book:
+            self.book_candidate(
+                task,
+                target,
+                {"slots": to_book},
+                user,
+                now,
+                event_type="scan_rebook_success",
+                existing_slots=preserved,
+            )
+        else:
+            target["booked_slots"] = preserved
+        target["status"] = "booked" if len(target.get("booked_slots") or []) == 2 else "partial"
+
+    def record_event(
+        self,
+        task: dict[str, Any] | None,
+        event_type: str,
+        title: str,
+        message: str,
+        *,
+        important: bool = True,
+        send_mail: bool = True,
+    ) -> None:
+        event = make_scan_event(task, event_type, title, message, important=important)
+        self.events.append(event)
+        if important and send_mail:
+            try:
+                send_scan_email(title, message)
+            except Exception as exc:
+                failed = make_scan_event(task, "scan_mail_failed", "扫描邮件发送失败", redact_sensitive_text(exc), important=False)
+                self.events.append(failed)
+
+    def send_daily_summary_if_due(self, now: datetime | None = None) -> None:
+        now = now or datetime.now()
+        if now.time() < SCAN_SUMMARY_TIME:
+            return
+        day_value = now.strftime("%Y-%m-%d")
+        if self.events.has_summary_for(day_value):
+            return
+        important = self.events.recent_important((now - timedelta(hours=24)).timestamp())
+        if not important:
+            return
+        body = "\n".join(format_scan_event_line(event) for event in reversed(important))
+        try:
+            send_scan_email("Daydayup 扫描任务每日摘要", body)
+        except Exception as exc:
+            event = make_scan_event(None, "daily_summary_failed", "扫描任务每日摘要发送失败", redact_sensitive_text(exc), important=False)
+            event["summary_date"] = day_value
+            self.events.append(event)
+            return
+        event = make_scan_event(None, "daily_summary", "扫描任务每日摘要已发送", body, important=False)
+        event["summary_date"] = day_value
+        self.events.append(event)
+
+
 def build_booking_command(payload: dict[str, Any]) -> tuple[list[str], str]:
     command = [sys.executable, str(BOOKING_SCRIPT)]
     labels: list[str] = []
@@ -582,12 +1007,364 @@ def summarize_job_history(job: BookingJob) -> dict[str, Any]:
     }
 
 
+def normalize_scan_task(payload: dict[str, Any], user: UserAccount) -> dict[str, Any]:
+    targets = normalize_scan_targets(payload.get("targets"))
+    interval = int_or_default(payload.get("scan_interval_minutes"), SCAN_DEFAULT_INTERVAL_MINUTES)
+    interval = max(SCAN_MIN_INTERVAL_MINUTES, min(SCAN_MAX_INTERVAL_MINUTES, interval))
+    success_mode = clean_string(payload.get("success_mode")) or "any"
+    if success_mode not in {"any", "all"}:
+        raise EasySerpError("invalid success mode")
+    court_mode = clean_string(payload.get("court_mode")) or "selected"
+    if court_mode not in {"selected", "all"}:
+        raise EasySerpError("invalid court mode")
+    selected_courts = parse_int_list(payload.get("selected_courts"))
+    if not selected_courts:
+        selected_courts = SAFE_COURTS[:]
+    selected_courts = [court for court in selected_courts if court in ALL_COURTS]
+    if court_mode == "selected" and not selected_courts:
+        raise EasySerpError("selected courts are required")
+    now_ms = int(time.time() * 1000)
+    name = clean_string(payload.get("name")) or f"扫描任务 {now_ms}"
+    return {
+        "id": f"scan_{now_ms}",
+        "name": name,
+        "user_key": user.key,
+        "user_label": user.label,
+        "status": "active",
+        "targets": targets,
+        "success_mode": success_mode,
+        "scan_interval_minutes": interval,
+        "court_mode": court_mode,
+        "selected_courts": selected_courts,
+        "same_court_required": bool(payload.get("same_court_required", False)),
+        "iterative_optimization": bool(payload.get("iterative_optimization", False)),
+    }
+
+
+def normalize_scan_targets(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        raise EasySerpError("scan targets are required")
+    result: list[dict[str, Any]] = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            raise EasySerpError("scan target must be an object")
+        date_value = clean_string(item.get("date"))
+        try:
+            date.fromisoformat(date_value)
+        except ValueError as exc:
+            raise EasySerpError("invalid scan target date") from exc
+        start_time = normalize_slot_time(item.get("start_time"))
+        end_time = normalize_slot_time(item.get("end_time"))
+        if end_time <= start_time:
+            raise EasySerpError("scan target end time must be after start time")
+        if hour_from_time(end_time) - hour_from_time(start_time) < 2:
+            raise EasySerpError("scan target must include at least two hours")
+        result.append(
+            {
+                "id": f"target_{index}",
+                "date": date_value,
+                "start_time": start_time,
+                "end_time": end_time,
+                "status": "pending",
+                "booked_slots": [],
+            }
+        )
+    return result
+
+
+def int_or_default(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def format_datetime(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def target_start_datetime(target: dict[str, Any]) -> datetime:
+    return datetime.strptime(f"{target['date']} {target['start_time']}", "%Y-%m-%d %H:%M")
+
+
+def target_release_datetime(target: dict[str, Any]) -> datetime:
+    target_day = date.fromisoformat(target["date"])
+    release_day = target_day - timedelta(days=5)
+    return datetime.combine(release_day, SCAN_SILENT_END)
+
+
+def target_in_lockout(target: dict[str, Any], now: datetime) -> bool:
+    return target_start_datetime(target) - now <= timedelta(hours=24)
+
+
+def quiet_window_active(now: datetime) -> bool:
+    current = now.time()
+    return SCAN_SILENT_START <= current < SCAN_SILENT_END
+
+
+def next_after_quiet_window(now: datetime) -> datetime:
+    return datetime.combine(now.date(), SCAN_SILENT_END) + timedelta(seconds=1)
+
+
+def scan_target_actionable(target: dict[str, Any], now: datetime, *, allow_booked: bool = False) -> bool:
+    if target.get("status") in {"expired"}:
+        return False
+    if target.get("status") == "booked" and not allow_booked:
+        return False
+    if target_start_datetime(target) - now <= timedelta(hours=24):
+        return False
+    return now >= target_release_datetime(target)
+
+
+def next_scan_time_for_task(task: dict[str, Any], now: datetime) -> datetime:
+    if quiet_window_active(now):
+        return next_after_quiet_window(now)
+    interval = int_or_default(task.get("scan_interval_minutes"), SCAN_DEFAULT_INTERVAL_MINUTES)
+    interval = max(SCAN_MIN_INTERVAL_MINUTES, min(SCAN_MAX_INTERVAL_MINUTES, interval))
+    candidates = []
+    for target in task.get("targets", []):
+        if not isinstance(target, dict) or target.get("status") == "expired":
+            continue
+        if target.get("status") == "booked" and not task.get("iterative_optimization"):
+            continue
+        if target_in_lockout(target, now):
+            continue
+        candidates.append(max(now + timedelta(minutes=interval), target_release_datetime(target)))
+    if not candidates:
+        return now + timedelta(minutes=interval)
+    candidate = min(candidates)
+    if quiet_window_active(candidate):
+        return next_after_quiet_window(candidate)
+    return candidate
+
+
+def task_satisfied(task: dict[str, Any]) -> bool:
+    targets = [target for target in task.get("targets", []) if isinstance(target, dict)]
+    booked = [target for target in targets if target.get("status") == "booked"]
+    if task.get("success_mode") == "all":
+        return bool(targets) and len(booked) == len(targets)
+    return bool(booked)
+
+
+def task_completion_ready(task: dict[str, Any], now: datetime) -> bool:
+    if not task_satisfied(task):
+        return False
+    if not task.get("iterative_optimization"):
+        return True
+    booked = [target for target in task.get("targets", []) if isinstance(target, dict) and target.get("status") == "booked"]
+    return bool(booked) and all(target_in_lockout(target, now) for target in booked)
+
+
+def scan_court_pool(task: dict[str, Any]) -> set[int]:
+    if task.get("court_mode") == "all":
+        return set(ALL_COURTS)
+    values = parse_int_list(task.get("selected_courts")) or SAFE_COURTS
+    return {court for court in values if court in ALL_COURTS}
+
+
+def scan_candidates_for_target(
+    task: dict[str, Any],
+    target: dict[str, Any],
+    places: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    day = serialize_availability_day(target["date"], places)
+    hours = [
+        hour
+        for hour in day.get("hours", [])
+        if clean_string(hour.get("start_time")) >= target["start_time"] and clean_string(hour.get("end_time")) <= target["end_time"]
+    ]
+    hours.sort(key=lambda item: clean_string(item.get("start_time")))
+    pool = scan_court_pool(task)
+    candidates: list[dict[str, Any]] = []
+    for left, right in zip(hours, hours[1:]):
+        if left.get("end_time") != right.get("start_time"):
+            continue
+        left_courts = [court for court in left.get("courts", []) if court.get("number") in pool]
+        right_courts = [court for court in right.get("courts", []) if court.get("number") in pool]
+        if task.get("same_court_required"):
+            pairs = [(a, b) for a in left_courts for b in right_courts if a.get("id") == b.get("id")]
+        else:
+            pairs = [(a, b) for a in left_courts for b in right_courts]
+        for first, second in pairs:
+            slots = [scan_slot_from_parts(day, left, first), scan_slot_from_parts(day, right, second)]
+            candidates.append({"slots": slots, "score": scan_candidate_score(slots)})
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    return candidates
+
+
+def scan_slot_from_parts(day: dict[str, Any], hour: dict[str, Any], court: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date": day["date"],
+        "time": hour["time"],
+        "start_time": court.get("start_time") or hour.get("start_time"),
+        "end_time": court.get("end_time") or hour.get("end_time"),
+        "id": court["id"],
+        "name": court["name"],
+        "number": court.get("number"),
+        "wall": bool(court.get("wall")),
+        "price_value": float_or_zero(court.get("price_value")),
+        "pay_value": float_or_zero(court.get("pay_value")),
+    }
+
+
+def scan_candidate_score(slots: list[dict[str, Any]]) -> tuple[int, int, int]:
+    start_hours = [hour_from_time(slot["start_time"]) for slot in slots]
+    same_court = 1 if len({slot.get("id") for slot in slots}) == 1 else 0
+    court_penalty = sum(scan_court_rank(slot.get("number")) for slot in slots)
+    return (max(start_hours), same_court, -court_penalty)
+
+
+def scan_court_rank(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 999
+    if number in SAFE_COURTS:
+        return SAFE_COURTS.index(number)
+    if number in ALL_COURTS:
+        return 100 + ALL_COURTS.index(number)
+    return 999
+
+
+def scan_candidate_better(candidate: dict[str, Any], current_slots: list[dict[str, Any]]) -> bool:
+    return candidate.get("score", scan_candidate_score(candidate.get("slots", []))) > scan_candidate_score(current_slots)
+
+
+def scan_candidate_with_current_slots(candidates: list[dict[str, Any]], current_slots: list[dict[str, Any]]) -> dict[str, Any] | None:
+    current_keys = {scan_slot_identity(slot) for slot in current_slots}
+    for candidate in candidates:
+        candidate_keys = {scan_slot_identity(slot) for slot in candidate.get("slots", [])}
+        if current_keys & candidate_keys:
+            return candidate
+    return None
+
+
+def scan_missing_slots(candidate_slots: list[dict[str, Any]], current_slots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    current_keys = {scan_slot_identity(slot) for slot in current_slots}
+    return [slot for slot in candidate_slots if scan_slot_identity(slot) not in current_keys]
+
+
+def merge_scan_slots(existing_slots: list[dict[str, Any]], new_slots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for slot in existing_slots + new_slots:
+        merged[scan_slot_identity(slot)] = slot
+    return sorted(merged.values(), key=lambda item: (clean_string(item.get("date")), clean_string(item.get("start_time"))))
+
+
+def scan_slot_identity(slot: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            clean_string(slot.get("date")),
+            clean_string(slot.get("start_time")),
+            clean_string(slot.get("end_time")),
+            clean_string(slot.get("id")),
+        ]
+    )
+
+
+def scan_task_summary(task: dict[str, Any]) -> str:
+    targets = task.get("targets", [])
+    done = sum(1 for target in targets if isinstance(target, dict) and target.get("status") == "booked")
+    return f"{clean_string(task.get('name'))}：{done}/{len(targets)} 个目标完成"
+
+
+def scan_booking_message(target: dict[str, Any], successes: list[dict[str, Any]], failures: list[dict[str, Any]]) -> str:
+    lines = [f"目标 {target['date']} {target['start_time']}-{target['end_time']}"]
+    for item in successes:
+        slot = item.get("slot") or {}
+        bill_num = clean_string(slot.get("bill_num"))
+        suffix = f" bill={bill_num}" if bill_num else ""
+        lines.append(f"成功：{slot_label(slot)}{suffix}")
+    for item in failures:
+        lines.append(f"失败：{clean_string(item.get('error'))}")
+    return "\n".join(lines)
+
+
+def scan_action_label(action: str) -> str:
+    return {"pause": "扫描任务已暂停", "resume": "扫描任务已恢复", "stop": "扫描任务已停止"}.get(action, "扫描任务已更新")
+
+
+def make_scan_event(
+    task: dict[str, Any] | None,
+    event_type: str,
+    title: str,
+    message: Any,
+    *,
+    important: bool,
+) -> dict[str, Any]:
+    now = datetime.now()
+    return {
+        "id": f"event_{int(time.time() * 1000)}",
+        "type": event_type,
+        "title": title,
+        "message": clean_string(message),
+        "important": important,
+        "task_id": clean_string(task.get("id")) if task else "",
+        "task_name": clean_string(task.get("name")) if task else "",
+        "user_key": clean_string(task.get("user_key")) if task else "",
+        "created_at": format_datetime(now),
+        "created_ts": now.timestamp(),
+    }
+
+
+def format_scan_event_line(event: dict[str, Any]) -> str:
+    task_name = clean_string(event.get("task_name"))
+    prefix = f"[{event.get('created_at')}]"
+    if task_name:
+        prefix = f"{prefix} {task_name}"
+    return f"{prefix} {event.get('title')}: {event.get('message')}"
+
+
+def load_key_value_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+def send_scan_email(subject: str, body: str) -> None:
+    config = load_key_value_env(MAIL_CONFIG_PATH)
+    host = config.get("SMTP_HOST", "smtp.qq.com")
+    port = int(config.get("SMTP_PORT", "465"))
+    username = config.get("SMTP_USER", "")
+    password = config.get("SMTP_PASSWORD", "")
+    recipient = config.get("MAIL_TO", "")
+    if not username or not password or not recipient:
+        raise EasySerpError(f"mail config is incomplete: {MAIL_CONFIG_PATH}")
+    message = MIMEText(body, "plain", "utf-8")
+    message["Subject"] = subject
+    message["From"] = username
+    message["To"] = recipient
+    with smtplib.SMTP_SSL(host, port, timeout=20) as server:
+        server.login(username, password)
+        server.sendmail(username, [recipient], message.as_string())
+
+
 class WebConsole:
     def __init__(self, config: ServerConfig, users: UserStore):
         self.config = config
         self.users = users
         self.history = BookingHistoryStore(HISTORY_PATH)
         self.jobs = JobManager(config, self.history)
+        self.scans = ScanTaskManager(self)
+
+    def close(self) -> None:
+        self.scans.close()
 
     def client(self, user: UserAccount) -> EasySerpClient:
         return EasySerpClient(
@@ -835,13 +1612,16 @@ class WebConsole:
                 "affiliateCard": clean_string(payload.get("affiliate_card")),
             },
         )
+        response_data = require_success(response, "canclePlaceAppointment")
         time.sleep(0.8)
         bookings = self.bookings(user.key, include_cancelled=True)
         cards = self.cards(user.key)
         order = next((item for item in bookings["bookings"] if item["bill_num"] == bill_num), None)
         confirmed = order is None or "取消" in (order.get("status") or "")
+        if payload.get("require_confirmed") and not confirmed:
+            raise EasySerpError("cancel was not confirmed")
         return {
-            "response": {"msg": response.get("msg"), "data": response.get("data")},
+            "response": {"msg": response.get("msg"), "data": response_data},
             "confirmed": confirmed,
             "booking": order,
             "bookings": bookings["bookings"],
@@ -890,7 +1670,15 @@ class WebConsole:
                 continue
             try:
                 self._reserve_exact_slot(client, user, card["card_index_raw"], current)
-                successes.append({"slot": public_exact_slot(current)})
+                success_slot = public_exact_slot(current)
+                try:
+                    booking = self._find_recent_booking_for_slot(user, success_slot)
+                    if booking:
+                        success_slot["bill_num"] = booking.get("bill_num", "")
+                        success_slot["booking"] = booking
+                except EasySerpError as exc:
+                    success_slot["booking_match_error"] = redact_sensitive_text(exc)
+                successes.append({"slot": success_slot})
             except EasySerpError as exc:
                 failures.append({"slot": public_exact_slot(current), "error": redact_sensitive_text(exc)})
 
@@ -922,6 +1710,15 @@ class WebConsole:
                 if item.get("user_key") == user_key or (not item.get("user_key") and user_key == default_key)
             ]
         return {"history": history, "updated_at": time.time()}
+
+    def scan_tasks(self, user_key: str = "") -> dict[str, Any]:
+        return self.scans.snapshot(clean_string(user_key))
+
+    def create_scan_task(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.scans.create(payload)
+
+    def update_scan_task(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.scans.update(payload)
 
     def resolve_booking_card(self, user: UserAccount) -> dict[str, Any]:
         data = require_success(
@@ -1055,6 +1852,22 @@ class WebConsole:
             max_pages=5,
         )
         return find_order(orders, bill_num)
+
+    def _find_recent_booking_for_slot(self, user: UserAccount, slot: dict[str, Any]) -> dict[str, Any] | None:
+        time.sleep(0.8)
+        bookings = self.bookings(user.key, include_cancelled=False, success_only=True).get("bookings", [])
+        slot_number = court_number_from_text(slot.get("id")) or court_number_from_text(slot.get("name"))
+        for booking in bookings:
+            if booking.get("date") != slot.get("date"):
+                continue
+            if booking.get("time_range") != slot.get("time"):
+                continue
+            booking_number = court_number_from_text(booking.get("court"))
+            if slot_number is not None and booking_number == slot_number:
+                return booking
+            if clean_string(slot.get("name")) and clean_string(slot.get("name")) == clean_string(booking.get("court")):
+                return booking
+        return None
 
 
 def credential_state(value: str) -> dict[str, Any]:
@@ -1466,6 +2279,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return
             self.write_json(app.jobs.snapshot())
+        elif parsed.path == "/api/scan/tasks":
+            if not self.authorized():
+                return
+            self.write_json(app.scan_tasks(single_query(query, "user_key")))
         elif parsed.path == "/":
             self.serve_static(WEB_DIR / "index.html", "text/html; charset=utf-8")
         elif parsed.path in ("/app.js", "/styles.css"):
@@ -1503,6 +2320,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.write_json(app.book_exact(payload))
         elif self.path == "/api/booking/stop":
             self.write_json(app.jobs.stop())
+        elif self.path == "/api/scan/tasks":
+            self.write_json(app.create_scan_task(payload))
+        elif self.path == "/api/scan/tasks/update":
+            self.write_json(app.update_scan_task(payload))
         else:
             self.write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -1586,6 +2407,7 @@ def main() -> int:
         print("\nStopped")
         return 130
     finally:
+        httpd.console.close()  # type: ignore[attr-defined]
         httpd.server_close()
     return 0
 

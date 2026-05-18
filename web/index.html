@@ -27,6 +27,7 @@
           <a href="#wallet">余额</a>
           <a href="#bookings">活跃</a>
           <a href="#availability">分布</a>
+          <a href="#scanTasks">扫描</a>
           <a href="#submit">提交</a>
           <a href="#bookingHistory">历史</a>
           <a href="#logs">日志</a>
@@ -116,6 +117,82 @@
               <span class="chip success" id="exactSelectionBalance">余额 0.00</span>
               <button class="button primary" id="exactSubmit" type="button" disabled>提交预约</button>
             </div>
+          </div>
+        </section>
+
+        <section class="panel" id="scanTasks" aria-labelledby="scanTasksTitle">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Scan</p>
+              <h2 id="scanTasksTitle">扫描预约</h2>
+            </div>
+            <button class="button secondary compact" id="refreshScanTasks" type="button">刷新扫描</button>
+          </div>
+
+          <form class="scan-form" id="scanTaskForm">
+            <label>
+              <span>任务名称</span>
+              <input name="name" type="text" autocomplete="off" placeholder="晚场捡漏" />
+            </label>
+
+            <div class="touch-field">
+              <div class="field-head">
+                <span>小目标</span>
+                <button class="button secondary compact" id="addScanTarget" type="button">添加目标</button>
+              </div>
+              <div class="scan-target-list" id="scanTargetList"></div>
+            </div>
+
+            <div class="scan-grid">
+              <label>
+                <span>扫描间隔</span>
+                <input name="scan_interval_minutes" type="number" min="5" max="1440" value="30" />
+              </label>
+              <label>
+                <span>达成条件</span>
+                <select name="success_mode">
+                  <option value="any">任一目标成功</option>
+                  <option value="all">全部目标成功</option>
+                </select>
+              </label>
+              <label>
+                <span>场地范围</span>
+                <select name="court_mode">
+                  <option value="selected">部分场地</option>
+                  <option value="all">全部场地</option>
+                </select>
+              </label>
+              <label>
+                <span>部分场地</span>
+                <input name="selected_courts" type="text" autocomplete="off" value="2 3 4 6 7 8 9 10 11" />
+              </label>
+            </div>
+
+            <div class="option-grid">
+              <div class="option-card">
+                <label class="checkline">
+                  <input name="same_court_required" type="checkbox" />
+                  <span>连续两小时必须同一场地</span>
+                </label>
+              </div>
+              <div class="option-card">
+                <label class="checkline">
+                  <input name="iterative_optimization" type="checkbox" />
+                  <span>允许自动迭代优化</span>
+                </label>
+                <small>发现更晚的连续两小时后，会自动取消旧预约并重约。</small>
+              </div>
+            </div>
+
+            <button class="button primary" type="submit">发布扫描任务</button>
+          </form>
+
+          <div class="scan-task-list" id="scanTaskList">
+            <div class="empty-state">还没有扫描任务。</div>
+          </div>
+
+          <div class="scan-event-list" id="scanEventList">
+            <div class="empty-state compact">暂无重要决策。</div>
           </div>
         </section>
 
