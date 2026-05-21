@@ -30,7 +30,7 @@ const state = {
 };
 
 const SAFE_COURTS = [2, 3, 4, 6, 7, 8, 9, 10, 11];
-const WALL_COURTS = [1, 5, 12];
+const WALL_COURTS = [4, 5, 12];
 const ALL_COURTS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 const MIN_HOUR = 8;
 const MAX_HOUR = 23;

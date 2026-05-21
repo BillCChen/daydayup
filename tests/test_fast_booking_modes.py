@@ -66,11 +66,40 @@ class FastBookingModeTest(unittest.TestCase):
         first_courts = [item["court_id"] for item in candidates[:4]]
         all_courts = {item["court_id"] for item in candidates}
 
-        self.assertEqual(first_courts, ["ymq7", "ymq7", "ymq7", "ymq7"])
-        self.assertNotIn("ymq1", all_courts)
+        self.assertEqual(first_courts, ["ymq7", "ymq7", "ymq8", "ymq8"])
+        self.assertNotIn("ymq4", all_courts)
         self.assertNotIn("ymq5", all_courts)
         self.assertNotIn("ymq12", all_courts)
-        self.assertEqual([item["hour"] for item in candidates[:4]], [17, 18, 19, 20])
+        self.assertEqual([item["hour"] for item in candidates[:4]], [18, 19, 18, 19])
+
+    def test_balanced_first_candidates_prefer_middle_hour_in_wide_window(self):
+        bot = smart.SmartBookingBotV2(make_args(time="18-21", priority=[7], backup=[7]))
+        hour_table = {
+            "ymq7": {
+                "fullname": "羽毛球7",
+                "slots": {
+                    18: {"state": 1, "starttime": "18:00", "endtime": "19:00"},
+                    19: {"state": 1, "starttime": "19:00", "endtime": "20:00"},
+                    20: {"state": 1, "starttime": "20:00", "endtime": "21:00"},
+                },
+                "states": {18: 1, 19: 1, 20: 1},
+            }
+        }
+        candidates = bot.generate_first_candidates(hour_table)
+
+        self.assertEqual([item["hour"] for item in candidates], [19, 18, 20])
+
+    def test_guided_sort_keeps_middle_first_when_snapshot_states_match(self):
+        bot = smart.SmartBookingBotV2(make_args(time="18-21", priority=[7], backup=[7]))
+        state = smart.GuidedBookingState(bot.court_rank)
+        candidates = bot.generate_direct_first_candidates()
+        state.update_snapshot(
+            {"ymq7": {"states": {18: 1, 19: 1, 20: 1}}},
+            [18, 19, 20],
+            ["ymq7"],
+        )
+
+        self.assertEqual([item["hour"] for item in state.sort_candidates(candidates)], [19, 18, 20])
 
     def test_direct_second_candidates_only_use_adjacent_hours(self):
         bot = smart.SmartBookingBotV2(make_args())

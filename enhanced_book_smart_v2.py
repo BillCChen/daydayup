@@ -116,6 +116,7 @@ class GuidedBookingState:
             )
             return (
                 -(state_score - failure_penalty),
+                item.get("first_hour_priority", 0),
                 self.court_rank.get(item["court_id"], 999),
                 item["hour"],
             )
@@ -312,7 +313,7 @@ class SmartBookingBotV2:
         self.target_duration = args.duration
         self._validate_args()
 
-        excluded_courts = set() if args.all_court else {"ymq1", "ymq5", "ymq12"}
+        excluded_courts = set() if args.all_court else {"ymq4", "ymq5", "ymq12"}
         self.priority_list = [
             court_id for court_id in [f"ymq{i}" for i in (args.priority or [7, 8, 9, 1, 6])]
             if court_id not in excluded_courts
@@ -762,6 +763,12 @@ class SmartBookingBotV2:
                 count += 1
         return count
 
+    def first_hour_priority(self, hour):
+        if self.target_duration != 2 or self.range_end_h - self.range_start_h <= 2:
+            return 0
+        center_twice = self.range_start_h + self.range_end_h - 1
+        return abs(hour * 2 - center_twice)
+
     def generate_first_candidates(self, hour_table):
         candidates = []
         for hour in range(self.range_start_h, self.range_end_h):
@@ -786,11 +793,13 @@ class SmartBookingBotV2:
                             "right_count": right_count,
                             "adjacency_count": adjacency_count,
                             "adjacency_max": adjacency_max,
+                            "first_hour_priority": self.first_hour_priority(hour),
                         }
                     )
 
         candidates.sort(
             key=lambda item: (
+                item["first_hour_priority"],
                 -item["adjacency_count"] if self.target_duration == 2 else 0,
                 -item["adjacency_max"] if self.target_duration == 2 else 0,
                 self.court_rank.get(item["court_id"], 999),
@@ -843,7 +852,22 @@ class SmartBookingBotV2:
             for hour in range(self.range_start_h, self.range_end_h):
                 if self.target_duration == 2 and not self.generate_second_target_hours(hour):
                     continue
-                candidates.append(self._synthetic_candidate(hour, court_id, left_count=0, right_count=0))
+                candidates.append(
+                    self._synthetic_candidate(
+                        hour,
+                        court_id,
+                        left_count=0,
+                        right_count=0,
+                        first_hour_priority=self.first_hour_priority(hour),
+                    )
+                )
+        candidates.sort(
+            key=lambda item: (
+                item["first_hour_priority"],
+                self.court_rank.get(item["court_id"], 999),
+                item["hour"],
+            )
+        )
         return candidates
 
     def generate_direct_second_candidates(self, booked_hour):
@@ -1547,7 +1571,7 @@ Examples:
         "--all_court",
         dest="all_court",
         action="store_true",
-        help="包含默认排除的靠墙场地 1/5/12",
+        help="包含默认排除的靠墙场地 4/5/12",
     )
     parser.add_argument("--force", action="store_true", help="立即执行，不等待12:00")
     parser.add_argument("--rounds", type=int, default=100, help="第一阶段轮数下限，默认100")
