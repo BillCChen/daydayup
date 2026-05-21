@@ -7,32 +7,16 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main class="auth-screen" id="setupScreen">
-      <form class="auth-card token-setup-card" id="setupForm">
+    <main class="auth-screen" id="authScreen">
+      <form class="auth-card" id="authForm">
         <p class="eyebrow">Daydayup</p>
-        <h1>初始化 Token</h1>
-        <p class="form-note">复制授权链接到电脑微信打开，把跳转后的地址粘回这里，输入账号密码完成本地初始化。</p>
+        <h1>预约操作台</h1>
         <label>
-          <span>账号</span>
-          <input name="username" type="text" autocomplete="username" required />
-        </label>
-        <label>
-          <span>密码</span>
+          <span>访问密码</span>
           <input name="password" type="password" autocomplete="current-password" required />
         </label>
-        <label>
-          <span>微信跳转地址</span>
-          <input name="redirect_url" type="url" autocomplete="off" placeholder="https://www.147soft.cn/easyserp/index.html?code=..." required />
-        </label>
-        <label>
-          <span>卡名称</span>
-          <input name="card_name" type="text" autocomplete="off" placeholder="学生球类卡" required />
-        </label>
-        <div class="action-row">
-          <button class="button secondary" id="setupCopyAuthUrl" type="button">复制授权链接</button>
-          <button class="button primary" type="submit">保存并进入</button>
-        </div>
-        <p class="form-note" id="setupMessage">账号密码只用于本次兑换，不写入本地配置。</p>
+        <button class="button primary" type="submit">进入</button>
+        <p class="form-note" id="authMessage">本地访问密码默认 abc123。</p>
       </form>
     </main>
 
@@ -40,13 +24,14 @@
       <aside class="rail" aria-label="桌面导航">
         <div class="rail-mark">D</div>
         <nav>
-          <a href="#tokenSetup">配置</a>
           <a href="#wallet">余额</a>
           <a href="#bookings">活跃</a>
           <a href="#availability">分布</a>
+          <a href="#scanTasks">扫描</a>
           <a href="#submit">提交</a>
           <a href="#bookingHistory">历史</a>
           <a href="#logs">日志</a>
+          <a href="#users">用户</a>
         </nav>
       </aside>
 
@@ -56,7 +41,18 @@
             <p class="eyebrow">Daydayup</p>
             <h1>预约操作台</h1>
           </div>
-          <button class="button secondary compact" id="refreshAll" type="button">刷新</button>
+          <div class="topbar-actions">
+            <div class="view-switcher" id="viewSwitcher" aria-label="显示风格">
+              <button type="button" data-view-mode="default" aria-pressed="true">默认</button>
+              <button type="button" data-view-mode="numbers" aria-pressed="false">关键参数</button>
+              <button type="button" data-view-mode="behavior" aria-pressed="false">参数行为</button>
+            </div>
+            <label class="user-select">
+              <span>用户</span>
+              <select id="userSelect"></select>
+            </label>
+            <button class="button secondary compact" id="refreshAll" type="button">刷新</button>
+          </div>
         </header>
 
         <section class="status-band" aria-label="连接状态">
@@ -65,49 +61,14 @@
             <div class="status-pill" id="sessionState">Session 检查中</div>
             <button class="help-dot" id="sessionHelpTrigger" type="button" aria-label="查看 Session 指引" aria-expanded="false" aria-describedby="sessionHelp">?</button>
             <div class="status-popover" id="sessionHelp" role="tooltip">
-              <strong>Session 可选</strong>
-              <p>余额、活跃预约和预约链路主要依赖 Token。Session 可手动补充，但初始化版本不会内置个人 Cookie。</p>
+              <strong>为什么会显示 Session 未传</strong>
+              <p>当前服务没有收到 `DAYDAYUP_JSESSIONID` 或 `-j` 参数，所以请求不会携带登录 Cookie。查询余额和活跃预约通常只需要 Token；正式预约前建议手动登录微信页面，用 Reqable 抓取 Cookie 里的 JSESSIONID，再重启本地服务。</p>
             </div>
           </div>
           <div class="status-pill" id="lastRefresh">尚未刷新</div>
         </section>
 
-        <section class="panel" id="tokenSetup" aria-labelledby="tokenSetupTitle">
-          <div class="section-head">
-            <div>
-              <p class="eyebrow">Config</p>
-              <h2 id="tokenSetupTitle">Token 配置</h2>
-            </div>
-            <button class="button secondary compact" id="copyTokenAuthUrl" type="button">复制授权链接</button>
-          </div>
-          <form class="token-config-form" id="tokenConfigForm">
-            <label>
-              <span>账号</span>
-              <input name="username" type="text" autocomplete="username" />
-            </label>
-            <label>
-              <span>密码</span>
-              <input name="password" type="password" autocomplete="current-password" />
-            </label>
-            <label class="wide-field">
-              <span>微信跳转地址</span>
-              <input name="redirect_url" type="url" autocomplete="off" placeholder="https://www.147soft.cn/easyserp/index.html?code=..." />
-            </label>
-            <label>
-              <span>卡名称</span>
-              <input name="card_name" type="text" autocomplete="off" placeholder="学生球类卡" />
-            </label>
-            <label>
-              <span>Session</span>
-              <input name="jsessionid" type="password" autocomplete="off" placeholder="可选" />
-            </label>
-            <div class="action-row wide-field">
-              <button class="button primary" type="submit">兑换并保存 Token</button>
-              <button class="button secondary" id="saveManualConfig" type="button">保存手动配置</button>
-            </div>
-            <p class="form-note wide-field" id="tokenConfigMessage">可随时重新走流程覆盖当前 Token。</p>
-          </form>
-        </section>
+        <section class="panel view-mode-details" id="viewModeDetails" aria-label="参数详情" hidden></section>
 
         <section class="panel wallet-panel" id="wallet" aria-labelledby="walletTitle">
           <div class="section-head">
@@ -149,6 +110,97 @@
           <div class="availability-list" id="availabilityList">
             <div class="empty-state">点击按钮后查询今天到 4 天后的全部可约场地。</div>
           </div>
+          <div class="availability-warning" id="availabilityWarning" role="status" aria-live="polite" hidden></div>
+          <div class="availability-combos" id="availabilityCombos"></div>
+          <div class="availability-selection" id="availabilitySelection">
+            <div class="availability-tool-head">
+              <strong>已选场地</strong>
+              <span class="chip" id="exactSelectionTotal">合计 0.00</span>
+            </div>
+            <div class="exact-selection-list" id="exactSelectionList">
+              <div class="empty-state compact">从可约分布里选择 1 到 2 个时间段。</div>
+            </div>
+            <div class="exact-selection-actions">
+              <span class="chip success" id="exactSelectionBalance">余额 0.00</span>
+              <button class="button primary" id="exactSubmit" type="button" disabled>提交预约</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel" id="scanTasks" aria-labelledby="scanTasksTitle">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Scan</p>
+              <h2 id="scanTasksTitle">扫描预约</h2>
+            </div>
+            <button class="button secondary compact" id="refreshScanTasks" type="button">刷新扫描</button>
+          </div>
+
+          <form class="scan-form" id="scanTaskForm">
+            <label>
+              <span>任务名称</span>
+              <input name="name" type="text" autocomplete="off" placeholder="晚场捡漏" />
+            </label>
+
+            <div class="touch-field">
+              <div class="field-head">
+                <span>小目标</span>
+                <button class="button secondary compact" id="addScanTarget" type="button">添加目标</button>
+              </div>
+              <div class="scan-target-list" id="scanTargetList"></div>
+            </div>
+
+            <div class="scan-grid">
+              <label>
+                <span>扫描间隔</span>
+                <input name="scan_interval_minutes" type="number" min="5" max="1440" value="30" />
+              </label>
+              <label>
+                <span>达成条件</span>
+                <select name="success_mode">
+                  <option value="any">任一目标成功</option>
+                  <option value="all">全部目标成功</option>
+                </select>
+              </label>
+              <label>
+                <span>场地范围</span>
+                <select name="court_mode">
+                  <option value="selected">部分场地</option>
+                  <option value="all">全部场地</option>
+                </select>
+              </label>
+              <label>
+                <span>部分场地</span>
+                <input name="selected_courts" type="text" autocomplete="off" value="2 3 4 6 7 8 9 10 11" />
+              </label>
+            </div>
+
+            <div class="option-grid">
+              <div class="option-card">
+                <label class="checkline">
+                  <input name="same_court_required" type="checkbox" />
+                  <span>多小时目标必须同一场地</span>
+                </label>
+              </div>
+              <div class="option-card">
+                <label class="checkline">
+                  <input name="iterative_optimization" type="checkbox" />
+                  <span>允许自动迭代优化</span>
+                </label>
+                <small>发现更优目标后，会自动取消旧预约并重约。</small>
+              </div>
+            </div>
+
+            <button class="button primary" type="submit">发布扫描任务</button>
+          </form>
+
+          <div class="scan-task-list" id="scanTaskList">
+            <div class="empty-state">还没有扫描任务。</div>
+          </div>
+
+          <div class="scan-event-list" id="scanEventList">
+            <div class="empty-state compact">暂无重要决策。</div>
+          </div>
         </section>
 
         <section class="panel" id="submit" aria-labelledby="submitTitle">
@@ -157,7 +209,7 @@
               <p class="eyebrow">Submit</p>
               <h2 id="submitTitle">提交预约</h2>
             </div>
-            <span class="chip warning">默认排除 1, 5, 12</span>
+            <span class="chip warning">默认排除 4, 5, 12</span>
           </div>
 
           <form class="booking-form" id="bookingForm">
@@ -222,18 +274,20 @@
                 <span>轮询间隔</span>
               </div>
               <div class="segmented-control" id="pollPicker" aria-label="轮询间隔">
-                <button type="button" data-value="0.05">快速</button>
+                <button type="button" data-value="0.05" data-mode="direct-fast">快速直抢</button>
+                <button type="button" data-value="0.05" data-mode="guided-fast">快速引导</button>
                 <button type="button" data-value="0.08" aria-pressed="true">均衡</button>
                 <button type="button" data-value="0.12">稳妥</button>
                 <button type="button" data-value="0.2">保守</button>
               </div>
+              <input name="booking_mode" type="hidden" value="balanced" />
               <input name="poll_interval" type="hidden" value="0.08" />
             </div>
 
             <div class="option-grid">
               <div class="option-card">
                 <label class="checkline">
-                  <input name="force" type="checkbox" checked />
+                  <input name="force" type="checkbox" />
                   <span>立即执行</span>
                 </label>
                 <small>勾选后现在开始轮询；关闭后等待 12:00 窗口再执行。</small>
@@ -250,7 +304,7 @@
                   <input name="all_court" type="checkbox" />
                   <span>包含靠墙场地</span>
                 </label>
-                <small>默认不约 1、5、12；勾选后才纳入候选。</small>
+                <small>默认不约 4、5、12；勾选后才纳入候选。</small>
               </div>
             </div>
 
@@ -284,16 +338,107 @@
           </div>
           <div class="log-stream" id="logStream" aria-live="polite"></div>
         </section>
+
+        <section class="panel user-panel" id="users" aria-labelledby="usersTitle">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Users</p>
+              <h2 id="usersTitle">用户管理</h2>
+            </div>
+            <div class="user-panel-actions">
+              <span class="chip" id="activeUserLabel">未选择</span>
+              <button class="button secondary compact hidden" id="lockUserPanel" type="button">锁定</button>
+            </div>
+          </div>
+          <form class="user-unlock" id="userUnlockForm">
+            <label>
+              <span>管理密码</span>
+              <input name="admin_password" type="password" autocomplete="current-password" required />
+            </label>
+            <button class="button secondary" type="submit">进入管理</button>
+          </form>
+          <form class="user-form hidden" id="userForm">
+            <label>
+              <span>用户标识</span>
+              <input name="key" type="text" autocomplete="off" placeholder="friend_1" required />
+            </label>
+            <label>
+              <span>用户名称</span>
+              <input name="label" type="text" autocomplete="off" required />
+            </label>
+            <div class="token-helper">
+              <div class="token-helper-head">
+                <div>
+                  <strong>获取个人 Token</strong>
+                  <p>复制授权链接到电脑微信打开，把跳转后的地址粘回这里。</p>
+                </div>
+                <button class="button secondary compact" id="copyTokenAuthUrl" type="button">复制链接</button>
+              </div>
+              <div class="token-helper-grid">
+                <label>
+                  <span>账号</span>
+                  <input name="token_username" type="text" autocomplete="username" />
+                </label>
+                <label>
+                  <span>密码</span>
+                  <input name="token_password" type="password" autocomplete="current-password" />
+                </label>
+              </div>
+              <label>
+                <span>微信跳转地址</span>
+                <input name="token_redirect_url" type="url" autocomplete="off" placeholder="https://www.147soft.cn/easyserp/index.html?code=..." />
+              </label>
+              <div class="token-helper-actions">
+                <button class="button primary" id="exchangeToken" type="button">兑换并填入 Token</button>
+                <span class="form-note" id="tokenHelperMessage">不会保存账号密码。</span>
+              </div>
+            </div>
+            <label>
+              <span>Token</span>
+              <input name="token" type="password" autocomplete="off" required />
+            </label>
+            <label>
+              <span>Session</span>
+              <input name="jsessionid" type="password" autocomplete="off" />
+            </label>
+            <label>
+              <span>卡名称</span>
+              <input name="card_name" type="text" autocomplete="off" placeholder="学生球类卡" required />
+            </label>
+            <label class="checkline">
+              <input name="enabled" type="checkbox" checked />
+              <span>启用</span>
+            </label>
+            <button class="button secondary" type="submit">保存用户</button>
+          </form>
+        </section>
       </main>
 
       <aside class="detail-pane" id="detailPane" aria-labelledby="detailTitle">
         <div class="detail-empty" id="detailEmpty">
           <p class="eyebrow">Detail</p>
           <h2 id="detailTitle">选择活跃预约</h2>
-          <p>点击一条活跃预约后查看退款预览和取消确认。</p>
+          <p>点击活跃预约查看详情，或点击可退状态进行退订。</p>
         </div>
         <div class="detail-content hidden" id="detailContent"></div>
       </aside>
+    </div>
+
+    <div class="modal-backdrop hidden" id="cancelDialog" role="dialog" aria-modal="true" aria-labelledby="cancelDialogTitle">
+      <div class="modal-panel">
+        <div class="modal-head">
+          <div>
+            <p class="eyebrow">Warning</p>
+            <h2 id="cancelDialogTitle">确认退订场地</h2>
+          </div>
+          <button class="icon-button" id="closeCancelDialog" type="button" aria-label="关闭退订确认">×</button>
+        </div>
+        <div class="modal-body" id="cancelDialogBody"></div>
+        <div class="modal-actions">
+          <button class="button secondary" id="cancelDialogBack" type="button">返回</button>
+          <button class="button danger" id="cancelDialogSubmit" type="button" disabled>确认退订</button>
+        </div>
+      </div>
     </div>
 
     <script src="/app.js" defer></script>

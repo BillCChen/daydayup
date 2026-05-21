@@ -14,6 +14,7 @@ import math
 import os
 import ssl
 import sys
+import threading
 import time
 import traceback
 import urllib.parse
@@ -30,6 +31,10 @@ DEFAULT_CARD_INDEX = os.getenv("DAYDAYUP_CARD_INDEX", "")
 SHOP_NUM = "1001"
 SHORT_NAME = "ymq"
 PROJECT_TYPE = "3"
+BOOKING_MODE_BALANCED = "balanced"
+BOOKING_MODE_DIRECT_FAST = "direct-fast"
+BOOKING_MODE_GUIDED_FAST = "guided-fast"
+BOOKING_MODES = (BOOKING_MODE_BALANCED, BOOKING_MODE_DIRECT_FAST, BOOKING_MODE_GUIDED_FAST)
 PREWARM_SECONDS = 3.0
 BUSY_RETRY_TEXT = "当前排队人数较多"
 FAST_RETRY_TEXT = "操作过快"
@@ -51,6 +56,72 @@ class HttpResult:
     elapsed: float
     json_data: dict | None = None
     json_error: bool = False
+
+
+class GuidedBookingState:
+    def __init__(self, court_rank):
+        self.court_rank = dict(court_rank)
+        self.lock = threading.Lock()
+        self.slot_states = {}
+        self.failure_counts = Counter()
+        self.snapshot_count = 0
+        self.last_snapshot_at = 0.0
+
+    @staticmethod
+    def _key(candidate):
+        return candidate["court_id"], candidate["hour"]
+
+    def update_snapshot(self, hour_table, hours, court_pool):
+        states = {}
+        now = time.monotonic()
+        for court_id in court_pool:
+            info = hour_table.get(court_id)
+            for hour in hours:
+                if not info:
+                    states[(court_id, hour)] = ("missing", now)
+                    continue
+                states[(court_id, hour)] = (info["states"].get(hour, "missing"), now)
+        with self.lock:
+            self.slot_states.update(states)
+            self.snapshot_count += 1
+            self.last_snapshot_at = now
+
+    def record_attempt_result(self, candidate, result):
+        if result in ("success", "dry_run"):
+            return
+        key = self._key(candidate)
+        with self.lock:
+            self.failure_counts[(key[0], key[1], result)] += 1
+
+    def sort_candidates(self, candidates):
+        with self.lock:
+            states = dict(self.slot_states)
+            failures = Counter(self.failure_counts)
+
+        def score(item):
+            state, _updated_at = states.get(self._key(item), (None, 0.0))
+            state_score = 0
+            if state == 1:
+                state_score = 1000
+            elif state == "missing":
+                state_score = -200
+            elif state is not None:
+                state_score = -1000
+
+            failure_penalty = (
+                failures[(item["court_id"], item["hour"], "candidate_taken")] * 80
+                + failures[(item["court_id"], item["hour"], "business_fail")] * 120
+                + failures[(item["court_id"], item["hour"], "retry_delay")] * 40
+                + failures[(item["court_id"], item["hour"], "server_retry")] * 20
+            )
+            return (
+                -(state_score - failure_penalty),
+                item.get("first_hour_priority", 0),
+                self.court_rank.get(item["court_id"], 999),
+                item["hour"],
+            )
+
+        return sorted(candidates, key=score)
 
 
 class KeepAliveClient:
@@ -242,7 +313,7 @@ class SmartBookingBotV2:
         self.target_duration = args.duration
         self._validate_args()
 
-        excluded_courts = set() if args.all_court else {"ymq1", "ymq5", "ymq12"}
+        excluded_courts = set() if args.all_court else {"ymq4", "ymq5", "ymq12"}
         self.priority_list = [
             court_id for court_id in [f"ymq{i}" for i in (args.priority or [7, 8, 9, 1, 6])]
             if court_id not in excluded_courts
@@ -297,6 +368,8 @@ class SmartBookingBotV2:
         file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(formatter)
 
+        for handler in self.logger.handlers:
+            handler.close()
         self.logger.handlers.clear()
         self.logger.addHandler(console_handler)
         self.logger.addHandler(file_handler)
@@ -319,7 +392,7 @@ class SmartBookingBotV2:
 
     def _log_config(self):
         self.logger.info("=" * 110)
-        self.logger.info("羽毛球场地预约脚本启动（v2 均衡模式）")
+        self.logger.info(f"羽毛球场地预约脚本启动（v2 mode={self.args.booking_mode}）")
         self.logger.info(
             f"[配置] 日期={self.target_date} ({self._weekday_name()}) | "
             f"目标范围={self.range_start_h}:00-{self.range_end_h}:00 | "
@@ -333,6 +406,11 @@ class SmartBookingBotV2:
             f"[配置] rounds={self.args.rounds} | second_rounds={self.args.second_rounds} | "
             f"step_sleep={self.args.step_sleep}s"
         )
+        if self.args.booking_mode == BOOKING_MODE_GUIDED_FAST:
+            self.logger.info(
+                f"[配置] guide_interval={self.args.guide_interval}s | "
+                f"guide_max_inflight={self.args.guide_max_inflight}"
+            )
         self.logger.info(f"[配置] 场地池={self.court_pool}")
         if self.excluded_courts:
             self.logger.info(f"[配置] 默认排除靠墙场地={self.excluded_courts}；使用 --all-court 可包含")
@@ -483,6 +561,10 @@ class SmartBookingBotV2:
             raise ValueError("--poll-interval 必须大于0")
         if self.args.error_backoff <= 0:
             raise ValueError("--error-backoff 必须大于0")
+        if self.args.guide_interval <= 0:
+            raise ValueError("--guide-interval 必须大于0")
+        if self.args.guide_max_inflight <= 0:
+            raise ValueError("--guide-max-inflight 必须大于0")
 
     def _weekday_name(self):
         return ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][self.weekday]
@@ -681,6 +763,12 @@ class SmartBookingBotV2:
                 count += 1
         return count
 
+    def first_hour_priority(self, hour):
+        if self.target_duration != 2 or self.range_end_h - self.range_start_h <= 2:
+            return 0
+        center_twice = self.range_start_h + self.range_end_h - 1
+        return abs(hour * 2 - center_twice)
+
     def generate_first_candidates(self, hour_table):
         candidates = []
         for hour in range(self.range_start_h, self.range_end_h):
@@ -705,11 +793,13 @@ class SmartBookingBotV2:
                             "right_count": right_count,
                             "adjacency_count": adjacency_count,
                             "adjacency_max": adjacency_max,
+                            "first_hour_priority": self.first_hour_priority(hour),
                         }
                     )
 
         candidates.sort(
             key=lambda item: (
+                item["first_hour_priority"],
                 -item["adjacency_count"] if self.target_duration == 2 else 0,
                 -item["adjacency_max"] if self.target_duration == 2 else 0,
                 self.court_rank.get(item["court_id"], 999),
@@ -755,6 +845,67 @@ class SmartBookingBotV2:
             )
         )
         return candidates
+
+    def generate_direct_first_candidates(self):
+        candidates = []
+        for court_id in self.court_pool:
+            for hour in range(self.range_start_h, self.range_end_h):
+                if self.target_duration == 2 and not self.generate_second_target_hours(hour):
+                    continue
+                candidates.append(
+                    self._synthetic_candidate(
+                        hour,
+                        court_id,
+                        left_count=0,
+                        right_count=0,
+                        first_hour_priority=self.first_hour_priority(hour),
+                    )
+                )
+        candidates.sort(
+            key=lambda item: (
+                item["first_hour_priority"],
+                self.court_rank.get(item["court_id"], 999),
+                item["hour"],
+            )
+        )
+        return candidates
+
+    def generate_direct_second_candidates(self, booked_hour):
+        candidates = []
+        for court_id in self.court_pool:
+            for hour in self.generate_second_target_hours(booked_hour):
+                candidates.append(
+                    self._synthetic_candidate(
+                        hour,
+                        court_id,
+                        bookable_count_same_hour=0,
+                    )
+                )
+        return candidates
+
+    def _synthetic_candidate(self, hour, court_id, **extra):
+        left_count = extra.pop("left_count", 0)
+        right_count = extra.pop("right_count", 0)
+        candidate = {
+            "hour": hour,
+            "court_id": court_id,
+            "court_name": self._court_name(court_id),
+            "slot": {
+                "starttime": f"{hour:02d}:00",
+                "endtime": f"{hour + 1:02d}:00",
+            },
+            "left_count": left_count,
+            "right_count": right_count,
+            "adjacency_count": left_count + right_count,
+            "adjacency_max": max(left_count, right_count),
+        }
+        candidate.update(extra)
+        return candidate
+
+    @staticmethod
+    def _court_name(court_id):
+        number = str(court_id).replace("ymq", "")
+        return f"羽毛球{number}" if number else str(court_id)
 
     def log_first_candidates(self, candidates):
         if not candidates:
@@ -1055,6 +1206,217 @@ class SmartBookingBotV2:
 
         return "failed"
 
+    def run_direct_first_stage(self, guide_state=None):
+        self.logger.info("-" * 110)
+        self.logger.info("[直抢第一阶段] 跳过 get_places，按目标范围和场地池直接生成候选")
+        deadline = time.monotonic() + self.args.window_seconds
+        round_index = 0
+        max_rounds = self._max_rounds(self.args.rounds)
+
+        while time.monotonic() < deadline and round_index < max_rounds:
+            round_index += 1
+            candidates = self.generate_direct_first_candidates()
+            if guide_state:
+                candidates = guide_state.sort_candidates(candidates)
+            self.logger.info("-" * 110)
+            self.logger.info(f"[直抢第一阶段] 开始第 {round_index}/{max_rounds} 轮 | 候选总数={len(candidates)}")
+            self.log_first_candidates(candidates)
+
+            if self.args.dry_run:
+                if candidates:
+                    self.attempt_single_hour_booking(candidates[0], "direct_first", round_index, 1, len(candidates))
+                else:
+                    self.logger.info("[dry-run] 直抢模式未生成候选")
+                return "dry_run"
+
+            for idx, candidate in enumerate(candidates, start=1):
+                result = self.attempt_single_hour_booking(candidate, "direct_first", round_index, idx, len(candidates))
+                if guide_state:
+                    guide_state.record_attempt_result(candidate, result)
+                if result == "success":
+                    self.first_booking = candidate
+                    return "success"
+                if result in ("candidate_taken", "business_fail"):
+                    continue
+                if result in ("retry_delay", "server_retry"):
+                    break
+
+            self._sleep_until_next_poll(deadline)
+
+        return "failed"
+
+    def run_direct_second_stage(self, guide_state=None):
+        if self.target_duration != 2:
+            return "skipped"
+        if not self.first_booking:
+            return "failed"
+
+        booked_hour = self.first_booking["hour"]
+        target_hours = self.generate_second_target_hours(booked_hour)
+        self.logger.info("-" * 110)
+        self.logger.info(
+            f"[直抢第二阶段] 第一单已成功：{booked_hour}:00-{booked_hour + 1}:00 "
+            f"{self.first_booking['court_name']}({self.first_booking['court_id']})"
+        )
+        self.logger.info(f"[直抢第二阶段] 跳过 get_places，只抢相邻小时={target_hours}")
+
+        if not target_hours:
+            self.logger.warning("[直抢第二阶段] 第一单位于边界，范围内不存在相邻小时")
+            return "failed"
+
+        deadline = time.monotonic() + self.args.window_seconds
+        round_index = 0
+        max_rounds = self._max_rounds(self.args.second_rounds)
+
+        while time.monotonic() < deadline and round_index < max_rounds:
+            round_index += 1
+            candidates = self.generate_direct_second_candidates(booked_hour)
+            if guide_state:
+                candidates = guide_state.sort_candidates(candidates)
+            self.logger.info("-" * 110)
+            self.logger.info(
+                f"[直抢第二阶段] 开始第 {round_index}/{max_rounds} 轮 | "
+                f"目标小时={target_hours} | 候选总数={len(candidates)}"
+            )
+            self.log_second_candidates(candidates, booked_hour)
+
+            for idx, candidate in enumerate(candidates, start=1):
+                result = self.attempt_single_hour_booking(candidate, "direct_second", round_index, idx, len(candidates))
+                if guide_state:
+                    guide_state.record_attempt_result(candidate, result)
+                if result == "success":
+                    self.second_booking = candidate
+                    return "success"
+                if result in ("candidate_taken", "business_fail"):
+                    continue
+                if result in ("retry_delay", "server_retry"):
+                    break
+
+            self._sleep_until_next_poll(deadline)
+
+        return "failed"
+
+    def run_direct_mode(self, guide_state=None):
+        first_status = self.run_direct_first_stage(guide_state)
+        if first_status == "dry_run":
+            return "dry_run"
+        if first_status != "success":
+            self.logger.warning("[结束] 直抢第一阶段未抢到任何一个小时")
+            return "failed"
+        if self.target_duration == 1:
+            self.logger.info("[完成] 直抢单小时目标已达成")
+            return "success"
+
+        second_status = self.run_direct_second_stage(guide_state)
+        if second_status != "success":
+            self.logger.warning("[结束] 直抢第一阶段成功，但第二阶段未抢到相邻小时")
+            return "failed"
+        self.logger.info("[完成] 直抢两阶段均成功")
+        return "success"
+
+    def run_guided_mode(self):
+        guide_state = GuidedBookingState(self.court_rank)
+        guide_deadline = time.monotonic() + self.args.window_seconds * (2 if self.target_duration == 2 else 1)
+        stop_event, collector_thread = self.start_guided_collector(guide_state, guide_deadline)
+        try:
+            return self.run_direct_mode(guide_state)
+        finally:
+            stop_event.set()
+            collector_thread.join(timeout=1.0)
+
+    def start_guided_collector(self, guide_state, deadline):
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._guided_collector_loop,
+            args=(guide_state, deadline, stop_event),
+            daemon=True,
+        )
+        thread.start()
+        return stop_event, thread
+
+    def _guided_collector_loop(self, guide_state, deadline, stop_event):
+        inflight = set()
+        probe_index = 0
+        next_tick = time.monotonic()
+        self.logger.info(
+            f"[引导采集] 启动 | interval={self.args.guide_interval}s | "
+            f"max_inflight={self.args.guide_max_inflight}"
+        )
+        while not stop_event.is_set() and time.monotonic() < deadline:
+            inflight = {thread for thread in inflight if thread.is_alive()}
+            if len(inflight) < self.args.guide_max_inflight:
+                probe_index += 1
+                thread = threading.Thread(
+                    target=self._guided_probe_worker,
+                    args=(guide_state, probe_index),
+                    daemon=True,
+                )
+                thread.start()
+                inflight.add(thread)
+                self.logger.info(f"[引导采集] tick={probe_index} 已启动探测 | inflight={len(inflight)}")
+            else:
+                self.fail_stats["guided_probe_skipped_inflight"] += 1
+                self.logger.warning(
+                    f"[引导采集] inflight={len(inflight)} 达到上限，跳过本次探测"
+                )
+            next_tick += self.args.guide_interval
+            self._sleep_until_guided_tick(next_tick, deadline, stop_event)
+        alive = sum(1 for thread in inflight if thread.is_alive())
+        self.logger.info(f"[引导采集] 停止 | alive_probes={alive}")
+
+    def _guided_probe_worker(self, guide_state, probe_index):
+        local_stats = Counter()
+        client = KeepAliveClient(
+            self.base_url,
+            self._headers(),
+            timeout=self.args.timeout,
+            logger=self.logger,
+            fail_stats=local_stats,
+        )
+        try:
+            result = client.request(
+                "GET",
+                "/datediscount/getPlaceInfoByShortNameDiscount",
+                params={
+                    "shopNum": SHOP_NUM,
+                    "dateymd": self.target_date,
+                    "shortName": SHORT_NAME,
+                    "token": self.args.token,
+                },
+                label=f"guided_get_places_{probe_index}",
+            )
+            places = self._places_from_guided_result(result, probe_index)
+            if not places:
+                return
+            hour_table = self.build_hour_slot_table(places)
+            guide_state.update_snapshot(hour_table, range(self.range_start_h, self.range_end_h), self.court_pool)
+            self.logger.info(f"[引导采集] tick={probe_index} 快照已更新")
+        finally:
+            client.close()
+            self.fail_stats.update(local_stats)
+
+    def _places_from_guided_result(self, result, probe_index):
+        if result.status >= 500 or result.status == 0:
+            self.fail_stats["guided_get_places_server_error"] += 1
+            self.logger.warning(f"[引导采集] tick={probe_index} 服务错误 status={result.status}")
+            return None
+        if result.json_error or not result.json_data:
+            self.fail_stats["guided_get_places_json_error"] += 1
+            self.logger.warning(f"[引导采集] tick={probe_index} 返回不是有效 JSON")
+            return None
+        if result.json_data.get("msg") != "success":
+            message = str(result.json_data.get("data", ""))
+            key = "busy" if BUSY_RETRY_TEXT in message else "business"
+            self.fail_stats[f"guided_get_places_{key}"] += 1
+            self.logger.warning(f"[引导采集] tick={probe_index} msg={result.json_data.get('msg')} data={message}")
+            return None
+        places = result.json_data.get("data", {}).get("placeArray", [])
+        if not isinstance(places, list):
+            self.fail_stats["guided_get_places_invalid_places"] += 1
+            self.logger.warning(f"[引导采集] tick={probe_index} placeArray 不是列表")
+            return None
+        return places
+
     def _max_rounds(self, configured_rounds):
         window_rounds = math.ceil(self.args.window_seconds / self.args.poll_interval)
         return max(configured_rounds, window_rounds)
@@ -1078,6 +1440,14 @@ class SmartBookingBotV2:
         if remaining <= 0:
             return
         time.sleep(min(seconds, remaining))
+
+    @staticmethod
+    def _sleep_until_guided_tick(next_tick, deadline, stop_event):
+        while not stop_event.is_set():
+            remaining = min(next_tick, deadline) - time.monotonic()
+            if remaining <= 0:
+                return
+            stop_event.wait(min(remaining, 0.05))
 
     def print_summary(self):
         self.logger.info("=" * 110)
@@ -1138,8 +1508,17 @@ class SmartBookingBotV2:
             self.wait_for_start()
             self.logger.info(
                 f"[开始] 启动预约流程：目标范围 {self.range_start_h}:00-{self.range_end_h}:00 | "
-                f"目标时长={self.target_duration}小时"
+                f"目标时长={self.target_duration}小时 | mode={self.args.booking_mode}"
             )
+
+            if self.args.booking_mode == BOOKING_MODE_DIRECT_FAST:
+                self.run_direct_mode()
+                self.print_summary()
+                return
+            if self.args.booking_mode == BOOKING_MODE_GUIDED_FAST:
+                self.run_guided_mode()
+                self.print_summary()
+                return
 
             first_status = self.run_first_stage()
             if first_status == "dry_run":
@@ -1192,7 +1571,7 @@ Examples:
         "--all_court",
         dest="all_court",
         action="store_true",
-        help="包含默认排除的靠墙场地 1/5/12",
+        help="包含默认排除的靠墙场地 4/5/12",
     )
     parser.add_argument("--force", action="store_true", help="立即执行，不等待12:00")
     parser.add_argument("--rounds", type=int, default=100, help="第一阶段轮数下限，默认100")
@@ -1201,6 +1580,14 @@ Examples:
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="easyserpClient base URL")
     parser.add_argument("--window-seconds", type=float, default=60.0, help="每个阶段的运行窗口，默认60秒")
     parser.add_argument("--poll-interval", type=float, default=0.08, help="普通轮询间隔，默认0.08秒")
+    parser.add_argument(
+        "--booking-mode",
+        choices=BOOKING_MODES,
+        default=BOOKING_MODE_BALANCED,
+        help="预约策略：balanced 查询后下单，direct-fast 跳过查询直抢，guided-fast 多线程引导直抢",
+    )
+    parser.add_argument("--guide-interval", type=float, default=0.5, help="guided-fast 探测调度间隔，默认0.5秒")
+    parser.add_argument("--guide-max-inflight", type=int, default=4, help="guided-fast 最大未完成探测数，默认4")
     parser.add_argument("--error-backoff", type=float, default=0.25, help="服务错误初始退避，默认0.25秒")
     parser.add_argument("--dry-run", action="store_true", help="只查询和生成候选，不调用下单接口")
     parser.add_argument("--check-session", action="store_true", help="只检测 JSESSIONID 是否可用，不等待也不下单")

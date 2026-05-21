@@ -1,0 +1,729 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>12:00 Booking Timeline</title>
+  <style>
+    :root {
+      --surface-page: oklch(0.985 0.008 82);
+      --surface-panel: oklch(0.964 0.014 82);
+      --surface-raised: oklch(0.996 0.006 82);
+      --text-primary: oklch(0.235 0.018 72);
+      --text-secondary: oklch(0.435 0.026 72);
+      --border-muted: oklch(0.865 0.024 82);
+      --primary-amber: oklch(0.735 0.145 72);
+      --primary-amber-soft: oklch(0.925 0.055 78);
+      --action-blue: oklch(0.56 0.13 238);
+      --success-green: oklch(0.64 0.12 148);
+      --success-green-soft: oklch(0.93 0.055 148);
+      --danger-red: oklch(0.58 0.16 28);
+      --ink-soft: oklch(0.56 0.035 72);
+      --slot-query: oklch(0.80 0.085 238);
+      --slot-cpu: oklch(0.82 0.07 148);
+      --slot-book: oklch(0.82 0.09 72);
+      --slot-wait: oklch(0.90 0.025 82);
+      --slot-risk: oklch(0.85 0.08 28);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      color: var(--text-primary);
+      background: var(--surface-page);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      font-size: 15px;
+      line-height: 1.5;
+      letter-spacing: 0;
+    }
+
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 24px 16px 40px;
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 720px;
+      font-size: 2rem;
+      line-height: 1.12;
+      font-weight: 720;
+    }
+
+    .subcopy {
+      margin: 8px 0 0;
+      max-width: 72ch;
+      color: var(--text-secondary);
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .top-controls {
+      display: grid;
+      gap: 12px;
+      align-content: start;
+    }
+
+    .style-switcher {
+      display: grid;
+      gap: 8px;
+      padding: 10px;
+      border: 1px solid var(--border-muted);
+      border-radius: 8px;
+      background: var(--surface-panel);
+    }
+
+    .style-switcher span {
+      color: var(--text-secondary);
+      font-size: 0.8rem;
+      font-weight: 650;
+    }
+
+    .style-buttons {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px;
+    }
+
+    .style-buttons button {
+      min-height: 44px;
+      padding: 8px 10px;
+      border: 1px solid var(--border-muted);
+      border-radius: 8px;
+      background: var(--surface-raised);
+      color: var(--text-primary);
+      font: inherit;
+      font-size: 0.88rem;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    .style-buttons button[aria-pressed="true"] {
+      border-color: color-mix(in oklch, var(--action-blue), var(--border-muted) 45%);
+      background: color-mix(in oklch, var(--action-blue), var(--surface-raised) 84%);
+      color: var(--surface-raised);
+    }
+
+    .mode-detail {
+      display: none;
+    }
+
+    body[data-view-mode="numbers"] .mode-detail,
+    body[data-view-mode="behavior"] .mode-detail {
+      display: block;
+    }
+
+    .behavior-only {
+      display: none;
+    }
+
+    body[data-view-mode="behavior"] .behavior-only {
+      display: block;
+    }
+
+    .parameter-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+
+    .parameter-item {
+      padding: 12px;
+      border: 1px solid var(--border-muted);
+      border-radius: 8px;
+      background: var(--surface-raised);
+    }
+
+    .parameter-item span {
+      display: block;
+      color: var(--text-secondary);
+      font-size: 0.78rem;
+      font-weight: 650;
+      overflow-wrap: anywhere;
+    }
+
+    .parameter-item strong {
+      display: block;
+      margin-top: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 1rem;
+      line-height: 1.2;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .parameter-item p {
+      margin: 8px 0 0;
+      color: var(--text-secondary);
+      font-size: 0.84rem;
+      line-height: 1.45;
+    }
+
+    .metric {
+      min-height: 84px;
+      padding: 12px;
+      border: 1px solid var(--border-muted);
+      border-radius: 8px;
+      background: var(--surface-raised);
+    }
+
+    .metric span {
+      display: block;
+      color: var(--text-secondary);
+      font-size: 0.8rem;
+    }
+
+    .metric strong {
+      display: block;
+      margin-top: 4px;
+      font-variant-numeric: tabular-nums;
+      font-size: 1.05rem;
+      line-height: 1.2;
+    }
+
+    .panel {
+      margin-top: 14px;
+      padding: 14px;
+      border: 1px solid var(--border-muted);
+      border-radius: 8px;
+      background: var(--surface-panel);
+    }
+
+    .panel-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 1.1rem;
+      line-height: 1.2;
+      font-weight: 680;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 4px 9px;
+      border: 1px solid var(--border-muted);
+      border-radius: 6px;
+      background: var(--surface-raised);
+      color: var(--text-secondary);
+      font-size: 0.82rem;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .timeline-wrap {
+      overflow-x: auto;
+      padding-bottom: 6px;
+    }
+
+    .timeline {
+      min-width: 920px;
+      display: grid;
+      grid-template-columns: 120px 1fr;
+      gap: 0;
+      border: 1px solid var(--border-muted);
+      border-radius: 8px;
+      background: var(--surface-raised);
+    }
+
+    .axis-label {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border-muted);
+      color: var(--text-secondary);
+      font-size: 0.8rem;
+    }
+
+    .axis {
+      position: relative;
+      height: 42px;
+      border-bottom: 1px solid var(--border-muted);
+      background:
+        repeating-linear-gradient(
+          to right,
+          color-mix(in oklch, var(--border-muted), transparent 30%) 0,
+          color-mix(in oklch, var(--border-muted), transparent 30%) 1px,
+          transparent 1px,
+          transparent 10%
+        );
+    }
+
+    .tick {
+      position: absolute;
+      top: 8px;
+      transform: translateX(-50%);
+      color: var(--text-secondary);
+      font-size: 0.76rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .lane-name {
+      display: flex;
+      align-items: center;
+      padding: 12px;
+      min-height: 58px;
+      border-bottom: 1px solid var(--border-muted);
+      color: var(--text-secondary);
+      font-size: 0.86rem;
+    }
+
+    .lane {
+      position: relative;
+      min-height: 58px;
+      border-bottom: 1px solid var(--border-muted);
+      background:
+        repeating-linear-gradient(
+          to right,
+          transparent 0,
+          transparent calc(10% - 1px),
+          color-mix(in oklch, var(--border-muted), transparent 52%) calc(10% - 1px),
+          color-mix(in oklch, var(--border-muted), transparent 52%) 10%
+        );
+    }
+
+    .lane-name:last-of-type,
+    .lane:last-of-type {
+      border-bottom: 0;
+    }
+
+    .event {
+      position: absolute;
+      top: 12px;
+      height: 34px;
+      display: flex;
+      align-items: center;
+      min-width: 4px;
+      padding: 0 8px;
+      border: 1px solid color-mix(in oklch, var(--text-primary), transparent 72%);
+      border-radius: 6px;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      font-size: 0.76rem;
+      font-weight: 650;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .query {
+      background: var(--slot-query);
+    }
+
+    .cpu {
+      background: var(--slot-cpu);
+    }
+
+    .booking {
+      background: var(--slot-book);
+    }
+
+    .wait {
+      background: var(--slot-wait);
+      color: var(--ink-soft);
+    }
+
+    .risk {
+      background: var(--slot-risk);
+    }
+
+    .marker {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      width: 2px;
+      background: var(--danger-red);
+    }
+
+    .marker span {
+      position: absolute;
+      top: 4px;
+      left: 5px;
+      padding: 2px 5px;
+      border-radius: 4px;
+      background: var(--danger-red-soft);
+      color: var(--text-primary);
+      font-size: 0.72rem;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-secondary);
+      font-size: 0.82rem;
+    }
+
+    .swatch {
+      width: 18px;
+      height: 12px;
+      border: 1px solid var(--border-muted);
+      border-radius: 3px;
+    }
+
+    .details-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border: 1px solid var(--border-muted);
+      border-radius: 8px;
+      background: var(--surface-raised);
+      font-size: 0.9rem;
+    }
+
+    th,
+    td {
+      padding: 10px;
+      border-bottom: 1px solid var(--border-muted);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--text-secondary);
+      font-size: 0.78rem;
+      font-weight: 650;
+    }
+
+    td:first-child,
+    td:nth-child(2) {
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .rule-list {
+      display: grid;
+      gap: 8px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .rule-list li {
+      padding: 10px;
+      border: 1px solid var(--border-muted);
+      border-radius: 8px;
+      background: var(--surface-raised);
+    }
+
+    .rule-list strong {
+      display: block;
+      margin-bottom: 2px;
+      font-size: 0.94rem;
+    }
+
+    .note {
+      margin: 0;
+      color: var(--text-secondary);
+    }
+
+    @media (min-width: 780px) {
+      main {
+        padding: 30px 24px 52px;
+      }
+
+      .topbar {
+        grid-template-columns: minmax(0, 1.5fr) minmax(360px, 0.9fr);
+        align-items: start;
+      }
+
+      .details-grid {
+        grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
+      }
+
+      .parameter-grid {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+    }
+  </style>
+</head>
+<body data-view-mode="default">
+  <main>
+    <section class="topbar">
+      <div>
+        <h1>12:00:00.001 到 12:00:00.100 预约策略可视化</h1>
+        <p class="subcopy">模型来自默认定时策略：12:00:00.001 触发，先查询场地分布，再生成第一单候选，命中候选后按下单链路提交。毫秒数是可解释预算，真实网络耗时以日志为准。</p>
+      </div>
+      <div class="top-controls">
+        <div class="style-switcher">
+          <span>展示风格</span>
+          <div class="style-buttons" aria-label="展示风格">
+            <button type="button" data-mode="default" aria-pressed="true">默认</button>
+            <button type="button" data-mode="numbers" aria-pressed="false">关键参数</button>
+            <button type="button" data-mode="behavior" aria-pressed="false">参数行为</button>
+          </div>
+        </div>
+        <div class="summary-grid" aria-label="默认策略摘要">
+          <div class="metric"><span>触发点</span><strong>12:00:00.001</strong></div>
+          <div class="metric"><span>观察窗口</span><strong>1-100 ms</strong></div>
+          <div class="metric"><span>默认轮询</span><strong>80 ms</strong></div>
+          <div class="metric"><span>下单间隔</span><strong>30 ms</strong></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel mode-detail" aria-label="关键参数详情">
+      <div class="panel-heading">
+        <h2>关键参数</h2>
+        <span class="badge">current defaults</span>
+      </div>
+      <div class="parameter-grid">
+        <div class="parameter-item">
+          <span>window_seconds</span>
+          <strong>60s</strong>
+          <p class="behavior-only">每个阶段最多运行 60 秒；两小时目标会先给第一小时 60 秒，再给相邻小时 60 秒。</p>
+        </div>
+        <div class="parameter-item">
+          <span>poll_interval</span>
+          <strong>80ms</strong>
+          <p class="behavior-only">普通模式每轮失败或未命中后等待 80ms；服务繁忙时等待不超过 100ms。</p>
+        </div>
+        <div class="parameter-item">
+          <span>step_sleep</span>
+          <strong>30ms</strong>
+          <p class="behavior-only">下单链路每个接口之间固定等待 30ms，串联 canBook、getOfferInfo、getUseCardInfo、reservationPlace。</p>
+        </div>
+        <div class="parameter-item">
+          <span>timeout</span>
+          <strong>5s</strong>
+          <p class="behavior-only">单次 HTTP 请求最多等待 5 秒；超时会计入失败统计，并进入对应重试或跳过路径。</p>
+        </div>
+        <div class="parameter-item">
+          <span>rounds</span>
+          <strong>&gt;=750</strong>
+          <p class="behavior-only">轮次数取配置下限和窗口换算值的较大者；60s / 80ms 得到 750 轮。</p>
+        </div>
+        <div class="parameter-item">
+          <span>guide_interval</span>
+          <strong>500ms</strong>
+          <p class="behavior-only">引导模式的 collector scheduler 每 500ms 尝试启动一次独立 get_places 探测。</p>
+        </div>
+        <div class="parameter-item">
+          <span>guide_max_inflight</span>
+          <strong>4</strong>
+          <p class="behavior-only">最多允许 4 个未完成探测；慢请求不阻塞下一 tick，达到上限时跳过本次探测。</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>毫秒时间轴</h2>
+        <span class="badge">normal path, first candidate available</span>
+      </div>
+      <div class="timeline-wrap" aria-label="12:00 后 100 毫秒时间轴">
+        <div class="timeline">
+          <div class="axis-label">lane</div>
+          <div class="axis">
+            <span class="tick" style="left: 0%;">1</span>
+            <span class="tick" style="left: 10%;">10</span>
+            <span class="tick" style="left: 20%;">20</span>
+            <span class="tick" style="left: 30%;">30</span>
+            <span class="tick" style="left: 40%;">40</span>
+            <span class="tick" style="left: 50%;">50</span>
+            <span class="tick" style="left: 60%;">60</span>
+            <span class="tick" style="left: 70%;">70</span>
+            <span class="tick" style="left: 80%;">80</span>
+            <span class="tick" style="left: 90%;">90</span>
+            <span class="tick" style="left: 100%;">100</span>
+          </div>
+
+          <div class="lane-name">scheduler</div>
+          <div class="lane">
+            <span class="marker" style="left: 0%;"><span>trigger</span></span>
+            <div class="event cpu" style="left: 0%; width: 2.02%;">wake</div>
+            <div class="event cpu" style="left: 2.02%; width: 1.01%;">log</div>
+          </div>
+
+          <div class="lane-name">availability</div>
+          <div class="lane">
+            <div class="event query" style="left: 3.03%; width: 37.37%;">GET places</div>
+            <div class="event cpu" style="left: 40.4%; width: 5.05%;">parse</div>
+            <div class="event cpu" style="left: 45.45%; width: 3.03%;">rank</div>
+          </div>
+
+          <div class="lane-name">candidate order</div>
+          <div class="lane">
+            <div class="event cpu" style="left: 48.48%; width: 4.04%;">pick #1</div>
+            <div class="event wait" style="left: 52.52%; width: 4.04%;">payload</div>
+          </div>
+
+          <div class="lane-name">booking api</div>
+          <div class="lane">
+            <div class="event booking" style="left: 56.57%; width: 20.2%;">POST canBook</div>
+            <div class="event wait" style="left: 76.77%; width: 23.23%;">30 ms sleep before offer</div>
+          </div>
+
+          <div class="lane-name">risk branch</div>
+          <div class="lane">
+            <div class="event risk" style="left: 76.77%; width: 8.08%;">taken?</div>
+            <div class="event query" style="left: 84.85%; width: 15.15%;">next candidate possible</div>
+          </div>
+        </div>
+      </div>
+      <div class="legend">
+        <span class="legend-item"><span class="swatch query"></span>network request</span>
+        <span class="legend-item"><span class="swatch cpu"></span>local CPU and logging</span>
+        <span class="legend-item"><span class="swatch booking"></span>booking submission</span>
+        <span class="legend-item"><span class="swatch wait"></span>configured wait</span>
+        <span class="legend-item"><span class="swatch risk"></span>branch decision</span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>1-100 ms 事件预算</h2>
+        <span class="badge">unit: ms after 12:00:00.000</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>start</th>
+            <th>cost</th>
+            <th>event</th>
+            <th>source</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <td>0-2</td>
+            <td>定时等待结束，进入预约流程，记录启动日志。</td>
+            <td><code>wait_for_start</code>, <code>run</code></td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td>25-55</td>
+            <td>请求当天场地分布；这是 100 ms 内最大的变量。</td>
+            <td><code>get_places</code></td>
+          </tr>
+          <tr>
+            <td>28-58</td>
+            <td>2-6</td>
+            <td>构建小时表，过滤默认场地池，记录场地快照和可约小时。</td>
+            <td><code>build_hour_slot_table</code>, <code>log_bookable_hours</code></td>
+          </tr>
+          <tr>
+            <td>30-64</td>
+            <td>1-3</td>
+            <td>生成第一单候选并排序：相邻可约数量优先，其次场地顺序，再按小时。</td>
+            <td><code>generate_first_candidates</code></td>
+          </tr>
+          <tr>
+            <td>32-67</td>
+            <td>1-4</td>
+            <td>取第一个候选，生成 <code>canBook</code> 和正式预约字段。</td>
+            <td><code>attempt_single_hour_booking</code></td>
+          </tr>
+          <tr>
+            <td>35-71</td>
+            <td>12-35</td>
+            <td>提交 <code>canBook</code>。成功则进入固定 30 ms 间隔；被抢走则尝试下一个候选。</td>
+            <td><code>POST /place/canBook</code></td>
+          </tr>
+          <tr>
+            <td>47-100</td>
+            <td>30</td>
+            <td><code>canBook</code> 成功后的固定等待，最早在 77 ms 左右发起 <code>getOfferInfo</code>。</td>
+            <td><code>_sleep_between_booking_calls</code></td>
+          </tr>
+          <tr>
+            <td>80-100</td>
+            <td>0-20</td>
+            <td>如果 <code>canBook</code> 失败且原因是已被抢，窗口内可能继续尝试第二个候选。</td>
+            <td><code>candidate_taken</code> branch</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="details-grid">
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>平行场地顺序</h2>
+          <span class="badge">default pool</span>
+        </div>
+        <ul class="rule-list">
+          <li><strong>默认场地池</strong><span>排除靠墙 4/5/12 后，顺序为 7, 8, 9, 6, 2, 3, 10, 11, 1。</span></li>
+          <li><strong>第一单排序</strong><span>两小时目标下，先比较相邻小时可约总数，再比较单侧最大可约数，再比较场地池顺序，最后比较小时。</span></li>
+          <li><strong>100 ms 内影响</strong><span>如果多个场地同一毫秒级都可约，实际提交顺序仍由候选排序决定，不由 API 返回数组顺序直接决定。</span></li>
+        </ul>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>边界结论</h2>
+          <span class="badge">first 100 ms</span>
+        </div>
+        <ul class="rule-list">
+          <li><strong>快路径</strong><span>100 ms 内通常完成查询、排序、第一候选 <code>canBook</code>，并进入 30 ms 固定等待。</span></li>
+          <li><strong>慢路径</strong><span>如果 <code>get_places</code> 超过 70 ms，100 ms 内大概率还没进入正式下单链路。</span></li>
+          <li><strong>失败分支</strong><span>如果第一候选返回已被占用，100 ms 内可能切换到第二候选；如果返回操作过快，会睡眠 800 ms，直接越过本窗口。</span></li>
+        </ul>
+      </section>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>耗时假设</h2>
+        <span class="badge">editable model</span>
+      </div>
+      <p class="note">当前图按普通网络路径绘制：<code>get_places</code> 约 37 ms，解析排序约 8 ms，<code>canBook</code> 约 20 ms，接口间固定等待 30 ms。要校准真实耗时，取最新 <code>logs/booking_smart_v2_*.log</code> 中每条 <code>[HTTP]</code> 的 <code>elapsed</code> 替换对应区块。</p>
+    </section>
+  </main>
+  <script>
+    const styleButtons = document.querySelectorAll("[data-mode]");
+
+    function setViewMode(mode) {
+      document.body.dataset.viewMode = mode;
+      styleButtons.forEach((button) => {
+        button.setAttribute("aria-pressed", button.dataset.mode === mode ? "true" : "false");
+      });
+    }
+
+    styleButtons.forEach((button) => {
+      button.addEventListener("click", () => setViewMode(button.dataset.mode));
+    });
+
+    setViewMode("default");
+  </script>
+</body>
+</html>
