@@ -1076,7 +1076,7 @@ function renderScanEvents() {
   if (!els.scanEventList) {
     return;
   }
-  const events = (state.scanEvents || []).filter((event) => event.important).slice(0, 8);
+  const events = compactScanEvents((state.scanEvents || []).filter((event) => event.important)).slice(0, 8);
   if (!events.length) {
     els.scanEventList.innerHTML = `<div class="empty-state compact">暂无重要决策。</div>`;
     return;
@@ -1088,6 +1088,7 @@ function renderScanEvents() {
     </div>
     ${events.map((event) => `
       <div class="scan-event-row">
+        ${event.folded_count ? `<span class="scan-event-badge">+${escapeHtml(event.folded_count)}</span>` : ""}
         <span>
           <strong>${escapeHtml(event.title || event.type)}</strong>
           <span class="booking-meta">${escapeHtml(event.task_name || "系统")} · ${escapeHtml(event.created_at || "-")}</span>
@@ -1096,6 +1097,36 @@ function renderScanEvents() {
       </div>
     `).join("")}
   `;
+}
+
+function compactScanEvents(events) {
+  const groups = new Map();
+  events.forEach((event) => {
+    const key = scanEventGroupKey(event);
+    const group = groups.get(key);
+    if (group) {
+      group.folded_count += 1;
+      return;
+    }
+    groups.set(key, { ...event, folded_count: 0 });
+  });
+  return Array.from(groups.values());
+}
+
+function scanEventGroupKey(event) {
+  const type = event.type || "";
+  const title = event.title || "";
+  if (event.task_id) {
+    return `task:${event.task_id}:${type}:${title}`;
+  }
+  return `system:${type}:${title}:${normalizeScanEventMessage(event.message || "")}`;
+}
+
+function normalizeScanEventMessage(message) {
+  return String(message)
+    .replace(/0x[0-9a-f]+/gi, "0x")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function renderScanTargetSummary(target) {

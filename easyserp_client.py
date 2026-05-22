@@ -18,6 +18,11 @@ from urllib.parse import urlsplit
 
 import requests
 
+from network_alias import install_host_aliases_from_env
+
+
+install_host_aliases_from_env()
+
 
 DEFAULT_BASE_URL = "https://www.147soft.cn/easyserpClient"
 DEFAULT_TOKEN = os.getenv("DAYDAYUP_TOKEN", "")
