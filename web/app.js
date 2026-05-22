@@ -1064,6 +1064,9 @@ function renderScanTasks() {
       </div>
     `;
   }).join("");
+  els.scanTaskList.querySelectorAll("[data-scan-copy]").forEach((button) => {
+    button.addEventListener("click", () => copyScanTaskToForm(button.dataset.scanCopy));
+  });
   els.scanTaskList.querySelectorAll("[data-scan-action]").forEach((button) => {
     button.addEventListener("click", () => updateScanTask(button.dataset.scanId, button.dataset.scanAction));
   });
@@ -1107,19 +1110,22 @@ function renderScanTargetSummary(target) {
 }
 
 function renderScanTaskActions(task) {
+  const copyButton = `<button class="button secondary compact" type="button" data-scan-copy="${escapeAttr(task.id)}">复制</button>`;
   if (task.status === "active") {
     return `
+      ${copyButton}
       <button class="button secondary compact" type="button" data-scan-id="${escapeAttr(task.id)}" data-scan-action="pause">暂停</button>
       <button class="button secondary compact" type="button" data-scan-id="${escapeAttr(task.id)}" data-scan-action="stop">停止</button>
     `;
   }
   if (task.status === "paused") {
     return `
+      ${copyButton}
       <button class="button secondary compact" type="button" data-scan-id="${escapeAttr(task.id)}" data-scan-action="resume">恢复</button>
       <button class="button secondary compact" type="button" data-scan-id="${escapeAttr(task.id)}" data-scan-action="stop">停止</button>
     `;
   }
-  return "";
+  return copyButton;
 }
 
 function scanTaskOptionsLabel(task) {
@@ -1204,6 +1210,32 @@ function scanTargetsFromForm() {
     start_time: row.querySelector('input[name="target_start"]').value,
     end_time: row.querySelector('input[name="target_end"]').value,
   }));
+}
+
+function copyScanTaskToForm(id) {
+  const task = (state.scanTasks || []).find((item) => item.id === id);
+  if (!task) {
+    addUiLog("未找到扫描任务参数", true);
+    return;
+  }
+  const form = els.scanTaskForm;
+  form.elements.name.value = task.name || "";
+  form.elements.scan_interval_minutes.value = task.scan_interval_minutes || "30";
+  form.elements.success_mode.value = task.success_mode || "any";
+  form.elements.court_mode.value = task.court_mode || "selected";
+  form.elements.selected_courts.value = Array.isArray(task.selected_courts) ? task.selected_courts.join(" ") : "";
+  form.elements.same_court_required.checked = Boolean(task.same_court_required);
+  form.elements.iterative_optimization.checked = Boolean(task.iterative_optimization);
+  els.scanTargetList.innerHTML = "";
+  const targets = Array.isArray(task.targets) && task.targets.length ? task.targets : [{}];
+  targets.forEach((target) => addScanTargetRow({
+    date: target.date,
+    start_time: target.start_time,
+    end_time: target.end_time,
+  }));
+  renderViewModeDetails();
+  form.scrollIntoView({ behavior: "smooth", block: "start" });
+  addUiLog("扫描任务参数已复制到扫描预约", true);
 }
 
 async function createScanTask(event) {

@@ -838,6 +838,8 @@ select:focus-visible {
   display: flex;
   align-items: start;
   gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .scan-target-summary {
