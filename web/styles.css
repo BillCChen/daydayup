@@ -838,6 +838,8 @@ select:focus-visible {
   display: flex;
   align-items: start;
   gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .scan-target-summary {
@@ -858,12 +860,32 @@ select:focus-visible {
 }
 
 .scan-event-row {
+  position: relative;
   display: grid;
   gap: 6px;
   border: 1px solid var(--border-muted);
   border-radius: 8px;
   background: var(--surface-raised);
   padding: 10px 12px;
+}
+
+.scan-event-badge {
+  position: absolute;
+  top: -8px;
+  left: -8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 7px;
+  border: 2px solid var(--surface);
+  border-radius: 999px;
+  background: #d64545;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
 }
 
 .scan-event-row > span:first-child {

@@ -23,6 +23,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 
+from network_alias import install_host_aliases_from_env
+
+
+install_host_aliases_from_env()
+
 
 DEFAULT_BASE_URL = "https://www.147soft.cn/easyserpClient"
 DEFAULT_TOKEN = os.getenv("DAYDAYUP_TOKEN", "")

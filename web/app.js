@@ -1064,6 +1064,9 @@ function renderScanTasks() {
       </div>
     `;
   }).join("");
+  els.scanTaskList.querySelectorAll("[data-scan-copy]").forEach((button) => {
+    button.addEventListener("click", () => copyScanTaskToForm(button.dataset.scanCopy));
+  });
   els.scanTaskList.querySelectorAll("[data-scan-action]").forEach((button) => {
     button.addEventListener("click", () => updateScanTask(button.dataset.scanId, button.dataset.scanAction));
   });
@@ -1073,7 +1076,7 @@ function renderScanEvents() {
   if (!els.scanEventList) {
     return;
   }
-  const events = (state.scanEvents || []).filter((event) => event.important).slice(0, 8);
+  const events = compactScanEvents((state.scanEvents || []).filter((event) => event.important)).slice(0, 8);
   if (!events.length) {
     els.scanEventList.innerHTML = `<div class="empty-state compact">暂无重要决策。</div>`;
     return;
@@ -1085,6 +1088,7 @@ function renderScanEvents() {
     </div>
     ${events.map((event) => `
       <div class="scan-event-row">
+        ${event.folded_count ? `<span class="scan-event-badge">+${escapeHtml(event.folded_count)}</span>` : ""}
         <span>
           <strong>${escapeHtml(event.title || event.type)}</strong>
           <span class="booking-meta">${escapeHtml(event.task_name || "系统")} · ${escapeHtml(event.created_at || "-")}</span>
@@ -1093,6 +1097,36 @@ function renderScanEvents() {
       </div>
     `).join("")}
   `;
+}
+
+function compactScanEvents(events) {
+  const groups = new Map();
+  events.forEach((event) => {
+    const key = scanEventGroupKey(event);
+    const group = groups.get(key);
+    if (group) {
+      group.folded_count += 1;
+      return;
+    }
+    groups.set(key, { ...event, folded_count: 0 });
+  });
+  return Array.from(groups.values());
+}
+
+function scanEventGroupKey(event) {
+  const type = event.type || "";
+  const title = event.title || "";
+  if (event.task_id) {
+    return `task:${event.task_id}:${type}:${title}`;
+  }
+  return `system:${type}:${title}:${normalizeScanEventMessage(event.message || "")}`;
+}
+
+function normalizeScanEventMessage(message) {
+  return String(message)
+    .replace(/0x[0-9a-f]+/gi, "0x")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function renderScanTargetSummary(target) {
@@ -1107,19 +1141,22 @@ function renderScanTargetSummary(target) {
 }
 
 function renderScanTaskActions(task) {
+  const copyButton = `<button class="button secondary compact" type="button" data-scan-copy="${escapeAttr(task.id)}">复制</button>`;
   if (task.status === "active") {
     return `
+      ${copyButton}
       <button class="button secondary compact" type="button" data-scan-id="${escapeAttr(task.id)}" data-scan-action="pause">暂停</button>
       <button class="button secondary compact" type="button" data-scan-id="${escapeAttr(task.id)}" data-scan-action="stop">停止</button>
     `;
   }
   if (task.status === "paused") {
     return `
+      ${copyButton}
       <button class="button secondary compact" type="button" data-scan-id="${escapeAttr(task.id)}" data-scan-action="resume">恢复</button>
       <button class="button secondary compact" type="button" data-scan-id="${escapeAttr(task.id)}" data-scan-action="stop">停止</button>
     `;
   }
-  return "";
+  return copyButton;
 }
 
 function scanTaskOptionsLabel(task) {
@@ -1204,6 +1241,32 @@ function scanTargetsFromForm() {
     start_time: row.querySelector('input[name="target_start"]').value,
     end_time: row.querySelector('input[name="target_end"]').value,
   }));
+}
+
+function copyScanTaskToForm(id) {
+  const task = (state.scanTasks || []).find((item) => item.id === id);
+  if (!task) {
+    addUiLog("未找到扫描任务参数", true);
+    return;
+  }
+  const form = els.scanTaskForm;
+  form.elements.name.value = task.name || "";
+  form.elements.scan_interval_minutes.value = task.scan_interval_minutes || "30";
+  form.elements.success_mode.value = task.success_mode || "any";
+  form.elements.court_mode.value = task.court_mode || "selected";
+  form.elements.selected_courts.value = Array.isArray(task.selected_courts) ? task.selected_courts.join(" ") : "";
+  form.elements.same_court_required.checked = Boolean(task.same_court_required);
+  form.elements.iterative_optimization.checked = Boolean(task.iterative_optimization);
+  els.scanTargetList.innerHTML = "";
+  const targets = Array.isArray(task.targets) && task.targets.length ? task.targets : [{}];
+  targets.forEach((target) => addScanTargetRow({
+    date: target.date,
+    start_time: target.start_time,
+    end_time: target.end_time,
+  }));
+  renderViewModeDetails();
+  form.scrollIntoView({ behavior: "smooth", block: "start" });
+  addUiLog("扫描任务参数已复制到扫描预约", true);
 }
 
 async function createScanTask(event) {
