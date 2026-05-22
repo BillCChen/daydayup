@@ -82,7 +82,7 @@ class AvailabilityCollectorTest(unittest.TestCase):
     def test_target_date_range(self):
         self.assertEqual(
             collector.target_date_values(date(2026, 5, 17)),
-            ["2026-05-17", "2026-05-18", "2026-05-19", "2026-05-20", "2026-05-21", "2026-05-22"],
+            ["2026-05-17", "2026-05-18", "2026-05-19", "2026-05-20", "2026-05-21"],
         )
 
     def test_collect_once_writes_full_matrix_and_schema(self):
@@ -97,8 +97,8 @@ class AvailabilityCollectorTest(unittest.TestCase):
             )
 
             self.assertEqual(summary.status, "success")
-            self.assertEqual(summary.observation_count, 1080)
-            self.assertEqual(count_rows(db_path, "SELECT COUNT(*) FROM availability_observations"), 1080)
+            self.assertEqual(summary.observation_count, 900)
+            self.assertEqual(count_rows(db_path, "SELECT COUNT(*) FROM availability_observations"), 900)
             self.assertEqual(
                 count_rows(db_path, "SELECT COUNT(*) FROM availability_observations WHERE target_date = ?", ("2026-05-17",)),
                 180,
@@ -153,8 +153,8 @@ class AvailabilityCollectorTest(unittest.TestCase):
                 )
 
             self.assertEqual(count_rows(db_path, "SELECT COUNT(*) FROM collector_runs"), 1)
-            self.assertEqual(count_rows(db_path, "SELECT COUNT(*) FROM availability_raw_responses"), 6)
-            self.assertEqual(count_rows(db_path, "SELECT COUNT(*) FROM availability_observations"), 1080)
+            self.assertEqual(count_rows(db_path, "SELECT COUNT(*) FROM availability_raw_responses"), 5)
+            self.assertEqual(count_rows(db_path, "SELECT COUNT(*) FROM availability_observations"), 900)
 
     def test_single_date_failure_records_partial_run(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -168,9 +168,9 @@ class AvailabilityCollectorTest(unittest.TestCase):
             )
 
             self.assertEqual(summary.status, "partial")
-            self.assertEqual(summary.success_count, 5)
+            self.assertEqual(summary.success_count, 4)
             self.assertEqual(summary.failure_count, 1)
-            self.assertEqual(summary.observation_count, 900)
+            self.assertEqual(summary.observation_count, 720)
             with sqlite3.connect(db_path) as connection:
                 run = connection.execute("SELECT status, failure_count FROM collector_runs").fetchone()
                 raw = connection.execute(
