@@ -12,9 +12,10 @@ Daydayup 是一个本地 Web 预约操作台，负责查询羽毛球场地、发
 
 - Python package runner: `uv`
 - Main Web process: `web_console.py`
+- Scan worker process: `scan_worker.py`
 - Booking script: `enhanced_book_smart_v2.py`
 - Shared API client: `easyserp_client.py`
-- Default local URL: `http://127.0.0.1:8788`
+- Default local URL: `http://127.0.0.1:8789`
 - Default shop number: `1001`
 - Default EasySERP base URL: `https://www.147soft.cn/easyserpClient`
 - Local runtime files: `local/`
@@ -23,25 +24,31 @@ Daydayup 是一个本地 Web 预约操作台，负责查询羽毛球场地、发
 Start local service:
 
 ```bash
-uv run python web_console.py --host 127.0.0.1 --port 8788
+uv run python web_console.py --host 127.0.0.1 --port 8789
+```
+
+Start scan worker:
+
+```bash
+uv run python scan_worker.py
 ```
 
 Start LAN-accessible service:
 
 ```bash
-uv run python web_console.py --host 0.0.0.0 --port 8788
+uv run python web_console.py --host 0.0.0.0 --port 8789
 ```
 
 Stop port listener:
 
 ```bash
-lsof -tiTCP:8788 -sTCP:LISTEN | xargs -r kill
+lsof -tiTCP:8789 -sTCP:LISTEN | xargs -r kill
 ```
 
 Verify:
 
 ```bash
-curl -sS http://127.0.0.1:8788/ | rg "Daydayup|预约操作台"
+curl -sS http://127.0.0.1:8789/ | rg "Daydayup|预约操作台"
 uv run python -m py_compile web_console.py enhanced_book_smart_v2.py
 uv run python -m unittest discover -s tests
 ```
@@ -52,6 +59,7 @@ uv run python -m unittest discover -s tests
 - `local/booking_history.json`: Web-triggered booking records.
 - `local/scan_tasks.json`: persistent scan tasks and target states.
 - `local/scan_events.json`: important scan decisions and email event history.
+- `$HOME/Library/LaunchAgents/com.billchen.daydayup.scanworker.plist`: macOS background scan worker.
 - `local/cloudflared_mail.env`: SMTP and recipient settings used by tunnel monitor and scan event emails.
 - `local/cloudflared_url.txt`: latest known public tunnel URL.
 
@@ -200,7 +208,7 @@ Deployment prompt:
 
 ### Scan Booking Tasks
 
-Scan tasks run inside the Web service process and persist under `local/scan_tasks.json`. A task can contain multiple targets. Each target is a specific date and time window.
+Scan tasks are created by the Web service and executed by `scan_worker.py`. Task state persists under `local/scan_tasks.json`. A task can contain multiple targets. Each target is a specific date and time window.
 
 Relevant endpoints:
 
@@ -224,7 +232,8 @@ Scheduling rules:
 - Before release time, the task stays quiet.
 - Every day `11:30 <= now < 12:30` is a no-scan window.
 - Within 24 hours before target start, the task does not book, cancel, or rebook.
-- Service stop means scanning stops; service restart reloads task state from JSON.
+- Web service stop does not stop scanning if `scan_worker.py` is still running.
+- Scan worker stop means scanning stops; worker restart reloads task state from JSON.
 
 Candidate rules:
 

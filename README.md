@@ -17,7 +17,13 @@ Fill local values in `.env`; do not commit them.
 uv run python web_console.py
 ```
 
-Default URL: `http://127.0.0.1:8788`.
+Default URL: `http://127.0.0.1:8789`.
+
+The Web UI creates and edits scan tasks. Run the scan worker separately for background execution:
+
+```bash
+uv run python scan_worker.py
+```
 
 For LAN access, bind all interfaces and use the CSV access password:
 

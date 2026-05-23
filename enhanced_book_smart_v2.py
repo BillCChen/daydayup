@@ -888,6 +888,23 @@ class SmartBookingBotV2:
                 )
         return candidates
 
+    def generate_direct_speculative_center_candidates(self, candidates, center_hour, per_hour_limit=3):
+        return [candidate for candidate in candidates if candidate["hour"] == center_hour][:per_hour_limit]
+
+    def generate_direct_speculative_adjacent_candidates(self, center_hour, per_hour_limit=3):
+        candidates = []
+        for hour in self.generate_second_target_hours(center_hour):
+            for court_id in self.court_pool[:per_hour_limit]:
+                candidates.append(
+                    self._synthetic_candidate(
+                        hour,
+                        court_id,
+                        bookable_count_same_hour=0,
+                        speculative_anchor_hour=center_hour,
+                    )
+                )
+        return candidates
+
     def _synthetic_candidate(self, hour, court_id, **extra):
         left_count = extra.pop("left_count", 0)
         right_count = extra.pop("right_count", 0)
@@ -947,7 +964,44 @@ class SmartBookingBotV2:
         if len(candidates) > 30:
             self.logger.info(f"[第二阶段候选] 仅显示前30个，候选总数={len(candidates)}")
 
-    def attempt_single_hour_booking(self, candidate, label, round_index, candidate_index, candidate_total):
+    @staticmethod
+    def _booking_candidate_text(candidate):
+        return (
+            f"{candidate['hour']}:00-{candidate['hour'] + 1}:00 "
+            f"{candidate['court_name']}({candidate['court_id']})"
+        )
+
+    def log_direct_speculative_candidates(self, center_candidates, adjacent_candidates):
+        grouped_hours = {}
+        for candidate in center_candidates + adjacent_candidates:
+            grouped_hours.setdefault(candidate["hour"], []).append(candidate)
+
+        for candidate in center_candidates:
+            self.logger.info(
+                f"[直抢投机] 中间小时候选：{self._booking_candidate_text(candidate)}"
+            )
+        if not center_candidates and not adjacent_candidates:
+            self.logger.info("[直抢投机] 范围内没有可投机的相邻小时候选")
+            return
+
+        hours_text = ", ".join(
+            f"{hour}:00={len(candidates)}个场地" for hour, candidates in sorted(grouped_hours.items())
+        )
+        self.logger.info(f"[直抢投机] 初始投机候选：{hours_text}")
+        for candidate in adjacent_candidates:
+            self.logger.info(f"[直抢投机候选] {self._booking_candidate_text(candidate)}")
+
+    def attempt_single_hour_booking(
+        self,
+        candidate,
+        label,
+        round_index,
+        candidate_index,
+        candidate_total,
+        client=None,
+        failure_stats=None,
+    ):
+        request_client = client or self.client
         hour = candidate["hour"]
         court_id = candidate["court_id"]
         court_name = candidate["court_name"]
@@ -990,7 +1044,7 @@ class SmartBookingBotV2:
             self.logger.info("[dry-run] 已生成下单参数，未调用 canBook/getOfferInfo/getUseCardInfo/reservationPlace")
             return "dry_run"
 
-        r0 = self.client.request(
+        r0 = request_client.request(
             "POST",
             "/place/canBook",
             data={
@@ -1001,10 +1055,10 @@ class SmartBookingBotV2:
             label=f"{label}_canBook",
         )
         if not self._response_success(r0):
-            return self._classify_booking_failure(r0, f"{label}_canBook")
+            return self._classify_booking_failure(r0, f"{label}_canBook", failure_stats)
 
         self._sleep_between_booking_calls()
-        r1 = self.client.request(
+        r1 = request_client.request(
             "POST",
             "/common/getOfferInfo",
             data={
@@ -1017,10 +1071,10 @@ class SmartBookingBotV2:
             label=f"{label}_getOfferInfo",
         )
         if not self._response_success(r1):
-            return self._classify_booking_failure(r1, f"{label}_getOfferInfo")
+            return self._classify_booking_failure(r1, f"{label}_getOfferInfo", failure_stats)
 
         self._sleep_between_booking_calls()
-        r2 = self.client.request(
+        r2 = request_client.request(
             "POST",
             "/common/getUseCardInfo",
             data={
@@ -1032,36 +1086,58 @@ class SmartBookingBotV2:
             label=f"{label}_getUseCardInfo",
         )
         if not self._response_success(r2):
-            return self._classify_booking_failure(r2, f"{label}_getUseCardInfo")
+            return self._classify_booking_failure(r2, f"{label}_getUseCardInfo", failure_stats)
 
         self._sleep_between_booking_calls()
-        r3 = self.client.request(
-            "POST",
-            "/place/reservationPlace",
-            data={
-                "token": self.args.token,
-                "shopNum": SHOP_NUM,
-                "fieldinfo": json.dumps(field_info_full, ensure_ascii=False),
-                "oldTotal": f"{old_total:.2f}",
-                "cardPayType": "0",
-                "type": "羽毛球",
-                "offerId": self.args.card_index,
-                "offerType": PROJECT_TYPE,
-                "total": f"{actual_total:.2f}",
-                "premerother": "",
-                "cardIndex": self.args.card_index,
-                "masterCardNum": "",
-                "zengzhiMoney": "0",
-            },
-            label=f"{label}_reservationPlace",
-        )
-        if self._response_success(r3):
-            self.logger.info(
-                f"[成功] label={label} 预约成功 | 日期={self.target_date} | "
-                f"时段={start_time}-{end_time} | 场地={court_name}({court_id})"
+        reservation_data = {
+            "token": self.args.token,
+            "shopNum": SHOP_NUM,
+            "fieldinfo": json.dumps(field_info_full, ensure_ascii=False),
+            "oldTotal": f"{old_total:.2f}",
+            "cardPayType": "0",
+            "type": "羽毛球",
+            "offerId": self.args.card_index,
+            "offerType": PROJECT_TYPE,
+            "total": f"{actual_total:.2f}",
+            "premerother": "",
+            "cardIndex": self.args.card_index,
+            "masterCardNum": "",
+            "zengzhiMoney": "0",
+        }
+        reservation_label = f"{label}_reservationPlace"
+        max_reservation_attempts = 2
+        for reservation_attempt in range(1, max_reservation_attempts + 1):
+            r3 = request_client.request(
+                "POST",
+                "/place/reservationPlace",
+                data=reservation_data,
+                label=reservation_label,
             )
-            return "success"
-        return self._classify_booking_failure(r3, f"{label}_reservationPlace")
+            if self._response_success(r3):
+                self.logger.info(
+                    f"[成功] label={label} 预约成功 | 日期={self.target_date} | "
+                    f"时段={start_time}-{end_time} | 场地={court_name}({court_id})"
+                )
+                return "success"
+
+            if (
+                reservation_attempt < max_reservation_attempts
+                and self._failure_data(r3).find(FAST_RETRY_TEXT) >= 0
+            ):
+                self._record_booking_failure(r3, reservation_label, failure_stats)
+                self.logger.warning(
+                    f"[重试] label={reservation_label} 操作过快，等待后重试同一候选 | "
+                    f"attempt={reservation_attempt + 1}/{max_reservation_attempts}"
+                )
+                self._sleep_after_fast_retry()
+                continue
+
+            return self._classify_booking_failure(
+                r3,
+                reservation_label,
+                failure_stats,
+                sleep_on_fast_retry=False,
+            )
 
     def _price_for_slot(self, slot, hour):
         old_total = self._number_from_slot(slot, "oldMoney")
@@ -1091,20 +1167,33 @@ class SmartBookingBotV2:
     def _response_success(result):
         return bool(result and result.json_data and result.json_data.get("msg") == "success")
 
-    def _classify_booking_failure(self, result, label):
-        self.fail_stats[f"{label}_not_success"] += 1
-        data = ""
+    @staticmethod
+    def _failure_data(result):
         if result and result.json_data:
-            data = str(result.json_data.get("data", ""))
+            return str(result.json_data.get("data", ""))
+        return ""
+
+    def _record_booking_failure(self, result, label, failure_stats=None):
+        stats = failure_stats if failure_stats is not None else self.fail_stats
+        stats[f"{label}_not_success"] += 1
+        data = self._failure_data(result)
         self.logger.warning(f"[失败] label={label} data={data or 'empty'}")
+        return data
+
+    def _classify_booking_failure(self, result, label, failure_stats=None, sleep_on_fast_retry=True):
+        data = self._record_booking_failure(result, label, failure_stats)
         if TAKEN_RETRY_TEXT in data:
             return "candidate_taken"
         if FAST_RETRY_TEXT in data:
-            time.sleep(0.8)
+            if sleep_on_fast_retry:
+                self._sleep_after_fast_retry()
             return "retry_delay"
         if result and result.status >= 500:
             return "server_retry"
         return "business_fail"
+
+    def _sleep_after_fast_retry(self):
+        time.sleep(0.8)
 
     def _sleep_between_booking_calls(self):
         if self.args.step_sleep > 0:
@@ -1301,7 +1390,183 @@ class SmartBookingBotV2:
 
         return "failed"
 
+    def _direct_speculative_label(self, center_hour, candidate):
+        if candidate["hour"] < center_hour:
+            base_label = "direct_spec_left"
+        elif candidate["hour"] > center_hour:
+            base_label = "direct_spec_right"
+        else:
+            base_label = "direct_spec_center"
+        return f"{base_label}_{candidate['hour']}_{candidate['court_id']}"
+
+    def _direct_speculative_booking_worker(
+        self,
+        candidate,
+        label,
+        candidate_index,
+        candidate_total,
+        results,
+        result_lock,
+    ):
+        local_stats = Counter()
+        client = KeepAliveClient(
+            self.base_url,
+            self._headers(),
+            timeout=self.args.timeout,
+            logger=self.logger,
+            fail_stats=local_stats,
+        )
+        started_at = time.monotonic()
+        result = "exception"
+        try:
+            result = self.attempt_single_hour_booking(
+                candidate,
+                label,
+                1,
+                candidate_index,
+                candidate_total,
+                client=client,
+                failure_stats=local_stats,
+            )
+        except Exception as exc:
+            local_stats[f"{label}_exception"] += 1
+            self.logger.error(f"[直抢投机] worker exception label={label} error={repr(exc)}")
+            self.logger.error(traceback.format_exc())
+        finally:
+            elapsed = time.monotonic() - started_at
+            client.close()
+            with result_lock:
+                self.fail_stats.update(local_stats)
+                results.append(
+                    {
+                        "candidate": candidate,
+                        "label": label,
+                        "result": result,
+                        "elapsed": elapsed,
+                        "completed_at": time.monotonic(),
+                    }
+                )
+
+    def _select_direct_speculative_pair(self, successful_candidates, center_hour):
+        best = None
+        for left_idx, left_candidate in enumerate(successful_candidates):
+            for right_candidate in successful_candidates[left_idx + 1:]:
+                if abs(left_candidate["hour"] - right_candidate["hour"]) != 1:
+                    continue
+                pair = sorted([left_candidate, right_candidate], key=lambda item: item["hour"])
+                contains_center = any(item["hour"] == center_hour for item in pair)
+                combined_rank = sum(self.court_rank.get(item["court_id"], 999) for item in pair)
+                key = (0 if contains_center else 1, combined_rank, pair[0]["hour"])
+                if best is None or key < best[0]:
+                    best = (key, pair)
+        return best[1] if best else None
+
+    def _select_direct_speculative_anchor(self, successful_candidates, center_hour):
+        return min(
+            successful_candidates,
+            key=lambda item: (
+                0 if item["hour"] == center_hour else 1,
+                -len(self.generate_second_target_hours(item["hour"])),
+                self.court_rank.get(item["court_id"], 999),
+                item["hour"],
+            ),
+        )
+
+    def _log_direct_speculative_results(self, results, successful_candidates):
+        self.logger.info(
+            f"[直抢投机] 初始批次完成 | total={len(results)} | success={len(successful_candidates)} | "
+            f"failed={len(results) - len(successful_candidates)}"
+        )
+        for item in sorted(results, key=lambda result: result["completed_at"]):
+            self.logger.info(
+                f"[直抢投机结果] label={item['label']} | result={item['result']} | "
+                f"elapsed={item['elapsed']:.3f}s | {self._booking_candidate_text(item['candidate'])}"
+            )
+
+    def run_direct_speculative_mode(self):
+        self.logger.info("-" * 110)
+        self.logger.info("[直抢投机] 两小时 direct-fast 启用：中间小时与相邻候选并发下单")
+        candidates = self.generate_direct_first_candidates()
+        self.logger.info(f"[直抢投机] 直抢第一小时候选总数={len(candidates)}")
+        self.log_first_candidates(candidates)
+        if not candidates:
+            self.logger.warning("[结束] 直抢投机未生成中间小时候选")
+            return "failed"
+
+        center_candidate = candidates[0]
+        center_hour = center_candidate["hour"]
+        center_candidates = self.generate_direct_speculative_center_candidates(
+            candidates,
+            center_hour,
+            per_hour_limit=3,
+        )
+        adjacent_candidates = self.generate_direct_speculative_adjacent_candidates(center_hour, per_hour_limit=3)
+        self.log_direct_speculative_candidates(center_candidates, adjacent_candidates)
+
+        if self.args.dry_run:
+            self.attempt_single_hour_booking(center_candidate, "direct_spec_center", 1, 1, 1)
+            return "dry_run"
+
+        initial_candidates = center_candidates + adjacent_candidates
+        candidate_total = len(initial_candidates)
+        results = []
+        result_lock = threading.Lock()
+        threads = []
+
+        self.logger.info(
+            f"[直抢投机] 启动初始批次 | center={len(center_candidates)} | "
+            f"adjacent={len(adjacent_candidates)} | total={candidate_total}"
+        )
+        for idx, candidate in enumerate(initial_candidates, start=1):
+            label = self._direct_speculative_label(center_hour, candidate)
+            thread = threading.Thread(
+                target=self._direct_speculative_booking_worker,
+                args=(candidate, label, idx, candidate_total, results, result_lock),
+            )
+            thread.start()
+            threads.append(thread)
+            if idx == len(center_candidates) and len(adjacent_candidates) > 0:
+                self.logger.info("[直抢投机] 中间小时候选已启动，不等待结果，立即启动相邻候选")
+
+        for thread in threads:
+            thread.join()
+
+        successful_candidates = [item["candidate"] for item in results if item["result"] == "success"]
+        self._log_direct_speculative_results(results, successful_candidates)
+        if not successful_candidates:
+            self.logger.warning("[结束] 直抢投机初始批次未抢到任何一个小时")
+            return "failed"
+
+        pair = self._select_direct_speculative_pair(successful_candidates, center_hour)
+        if pair:
+            self.first_booking = pair[0]
+            self.second_booking = pair[1]
+            self.logger.info(
+                f"[完成] 直抢投机初始批次已形成连续两小时："
+                f"{pair[0]['hour']}:00-{pair[1]['hour'] + 1}:00"
+            )
+            extra_successes = len(successful_candidates) - 2
+            if extra_successes > 0:
+                self.logger.info(f"[直抢投机] 初始批次额外成功小时数={extra_successes}")
+            return "success"
+
+        anchor = self._select_direct_speculative_anchor(successful_candidates, center_hour)
+        self.first_booking = anchor
+        self.logger.info(
+            f"[直抢投机] 初始批次已有单小时成功，选择锚点继续相邻补抢："
+            f"{self._booking_candidate_text(anchor)}"
+        )
+        second_status = self.run_direct_second_stage()
+        if second_status != "success":
+            self.logger.warning("[结束] 直抢投机已有单小时成功，但相邻补抢未完成")
+            return "failed"
+        self.logger.info("[完成] 直抢投机批次加相邻补抢已完成连续两小时")
+        return "success"
+
     def run_direct_mode(self, guide_state=None):
+        if self.args.booking_mode == BOOKING_MODE_DIRECT_FAST and self.target_duration == 2:
+            return self.run_direct_speculative_mode()
+
         first_status = self.run_direct_first_stage(guide_state)
         if first_status == "dry_run":
             return "dry_run"

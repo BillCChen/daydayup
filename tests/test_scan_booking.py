@@ -1,5 +1,7 @@
+import json
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -302,6 +304,35 @@ class ScanBookingTest(unittest.TestCase):
             finally:
                 web_console.send_scan_email = original
 
+    def test_web_console_can_disable_embedded_scan_worker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_tasks_path = web_console.SCAN_TASKS_PATH
+            original_events_path = web_console.SCAN_EVENTS_PATH
+            original_history_path = web_console.HISTORY_PATH
+            web_console.SCAN_TASKS_PATH = Path(tmpdir) / "scan_tasks.json"
+            web_console.SCAN_EVENTS_PATH = Path(tmpdir) / "scan_events.json"
+            web_console.HISTORY_PATH = Path(tmpdir) / "booking_history.json"
+            config = web_console.ServerConfig(
+                shop_num="1001",
+                base_url="https://example.invalid/easyserpClient",
+                timeout=1.0,
+            )
+            try:
+                console = web_console.WebConsole(config, FakeUserStore(), start_scan_worker=False)
+                self.assertIsNone(console.scans.thread)
+                created = console.create_scan_task(
+                    {
+                        "user_key": "user_1",
+                        "targets": [{"date": "2026-05-22", "start_time": "18:00", "end_time": "19:00"}],
+                    }
+                )
+                self.assertEqual(created["task"]["status"], "active")
+                console.close()
+            finally:
+                web_console.SCAN_TASKS_PATH = original_tasks_path
+                web_console.SCAN_EVENTS_PATH = original_events_path
+                web_console.HISTORY_PATH = original_history_path
+
     def test_daily_summary_is_sent_once(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = web_console.ScanTaskManager.__new__(web_console.ScanTaskManager)
@@ -327,6 +358,40 @@ class ScanBookingTest(unittest.TestCase):
             summaries = [item for item in manager.events.list(limit=20) if item.get("type") == "daily_summary"]
             self.assertEqual(len(sent), 1)
             self.assertEqual(len(summaries), 1)
+
+    def test_booking_history_window_and_retention(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "booking_history.json"
+            now = time.time()
+            records = [
+                {"id": "recent", "requested_ts": now - 2 * 60 * 60, "requested_at": "2026-05-23 08:00:00"},
+                {"id": "older", "requested_ts": now - 8 * 60 * 60, "requested_at": "2026-05-23 02:00:00"},
+                {"id": "expired", "requested_ts": now - 8 * 24 * 60 * 60, "requested_at": "2026-05-15 08:00:00"},
+            ]
+            path.write_text(json.dumps(records), encoding="utf-8")
+            store = web_console.BookingHistoryStore(path)
+
+            self.assertEqual([item["id"] for item in store.list(limit=10, window_hours=6)], ["recent"])
+            self.assertEqual({item["id"] for item in store.list(limit=10, window_hours=12)}, {"recent", "older"})
+            retained = json.loads(path.read_text(encoding="utf-8"))
+            self.assertNotIn("expired", {item["id"] for item in retained})
+
+    def test_scan_events_window_and_retention(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "scan_events.json"
+            now = time.time()
+            events = [
+                {"id": "recent", "type": "scan", "created_ts": now - 2 * 60 * 60, "created_at": "2026-05-23 08:00:00"},
+                {"id": "older", "type": "scan", "created_ts": now - 8 * 60 * 60, "created_at": "2026-05-23 02:00:00"},
+                {"id": "expired", "type": "scan", "created_ts": now - 8 * 24 * 60 * 60, "created_at": "2026-05-15 08:00:00"},
+            ]
+            path.write_text(json.dumps({"events": events}), encoding="utf-8")
+            store = web_console.ScanEventStore(path)
+
+            self.assertEqual([item["id"] for item in store.list(limit=10, window_hours=6)], ["recent"])
+            self.assertEqual({item["id"] for item in store.list(limit=10, window_hours=12)}, {"recent", "older"})
+            retained = json.loads(path.read_text(encoding="utf-8"))["events"]
+            self.assertNotIn("expired", {item["id"] for item in retained})
 
 
 if __name__ == "__main__":

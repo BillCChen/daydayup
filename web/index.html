@@ -321,7 +321,10 @@
               <p class="eyebrow">History</p>
               <h2 id="bookingHistoryTitle">历史预约</h2>
             </div>
-            <button class="button secondary compact" id="refreshBookingHistory" type="button">刷新历史</button>
+            <div class="section-actions">
+              <div class="log-window-control" data-log-window-control aria-label="历史预约时间窗"></div>
+              <button class="button secondary compact" id="refreshBookingHistory" type="button">刷新历史</button>
+            </div>
           </div>
           <div class="history-list" id="bookingHistoryList">
             <div class="empty-state">还没有通过操作台发起过预约。</div>
@@ -334,7 +337,10 @@
               <p class="eyebrow">Log</p>
               <h2 id="logsTitle">预约成功/失败日志</h2>
             </div>
-            <span class="chip" id="jobState">空闲</span>
+            <div class="section-actions">
+              <div class="log-window-control" data-log-window-control aria-label="页面日志时间窗"></div>
+              <span class="chip" id="jobState">空闲</span>
+            </div>
           </div>
           <div class="log-stream" id="logStream" aria-live="polite"></div>
         </section>

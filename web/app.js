@@ -4,6 +4,8 @@ const state = {
   selectedBill: "",
   jobTimer: null,
   lastJobLineCount: 0,
+  uiLogs: [],
+  logWindowHours: 6,
   availabilityLoading: false,
   availabilityDays: [],
   selectedAvailabilitySlots: [],
@@ -32,8 +34,18 @@ const state = {
 const SAFE_COURTS = [2, 3, 4, 6, 7, 8, 9, 10, 11];
 const WALL_COURTS = [4, 5, 12];
 const ALL_COURTS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+const LOG_WINDOW_OPTIONS = [
+  { hours: 6, label: "6 小时" },
+  { hours: 12, label: "12 小时" },
+  { hours: 24, label: "24 小时" },
+  { hours: 168, label: "一周" },
+];
+const LOG_RETENTION_HOURS = 168;
+const LOG_STORAGE_KEY = "daydayupLogWindowHours";
 const MIN_HOUR = 8;
 const MAX_HOUR = 23;
+
+state.logWindowHours = readStoredLogWindowHours();
 
 const els = {
   authScreen: document.querySelector("#authScreen"),
@@ -102,6 +114,38 @@ const els = {
 
 function fmtTime(ts = Date.now()) {
   return new Date(ts).toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+function fmtLogTime(ts = Date.now()) {
+  return new Date(ts).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
+function readStoredLogWindowHours() {
+  return normalizeLogWindowHours(localStorage.getItem(LOG_STORAGE_KEY));
+}
+
+function normalizeLogWindowHours(value) {
+  const hours = Number(value);
+  return LOG_WINDOW_OPTIONS.some((option) => option.hours === hours) ? hours : 6;
+}
+
+function logWindowLabel(hours = state.logWindowHours) {
+  return LOG_WINDOW_OPTIONS.find((option) => option.hours === hours)?.label || "6 小时";
+}
+
+function logWindowQuery() {
+  return `log_window_hours=${encodeURIComponent(state.logWindowHours)}`;
+}
+
+function logWindowCutoffMs(hours = state.logWindowHours) {
+  return Date.now() - hours * 60 * 60 * 1000;
 }
 
 function dateInputValue(offsetDays = 0) {
@@ -188,14 +232,86 @@ function setChip(el, text, tone = "") {
   el.textContent = text;
 }
 
-function addUiLog(text, strong = false) {
-  const line = document.createElement("div");
-  line.className = strong ? "log-line strong" : "log-line";
-  line.textContent = `[${fmtTime()}] ${text}`;
-  els.logStream.prepend(line);
-  while (els.logStream.children.length > 180) {
-    els.logStream.lastElementChild.remove();
+function renderLogWindowButtons() {
+  return LOG_WINDOW_OPTIONS.map((option) => `
+    <button
+      type="button"
+      data-log-window-hours="${escapeAttr(option.hours)}"
+      aria-pressed="${option.hours === state.logWindowHours ? "true" : "false"}"
+    >
+      ${escapeHtml(option.label)}
+    </button>
+  `).join("");
+}
+
+function renderLogWindowControl(label) {
+  return `
+    <div class="log-window-control" data-log-window-control role="group" aria-label="${escapeAttr(label)}">
+      ${renderLogWindowButtons()}
+    </div>
+  `;
+}
+
+function renderLogWindowControls() {
+  document.querySelectorAll("[data-log-window-control]").forEach((control) => {
+    control.setAttribute("role", "group");
+    control.innerHTML = renderLogWindowButtons();
+  });
+}
+
+function setupLogWindowControls() {
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-log-window-hours]");
+    if (!button) {
+      return;
+    }
+    setLogWindowHours(button.dataset.logWindowHours);
+  });
+  renderLogWindowControls();
+}
+
+function setLogWindowHours(value) {
+  const next = normalizeLogWindowHours(value);
+  if (state.logWindowHours === next) {
+    return;
   }
+  state.logWindowHours = next;
+  localStorage.setItem(LOG_STORAGE_KEY, String(next));
+  renderLogWindowControls();
+  renderUiLogs();
+  renderViewModeDetails();
+  Promise.all([loadBookingHistory(), loadScanTasks()]).catch((error) => {
+    addUiLog(`日志时间窗刷新失败: ${error.message}`, true);
+  });
+}
+
+function pruneUiLogs() {
+  const cutoff = Date.now() - LOG_RETENTION_HOURS * 60 * 60 * 1000;
+  state.uiLogs = state.uiLogs.filter((item) => Number(item.ts) >= cutoff).slice(0, 500);
+}
+
+function visibleUiLogs() {
+  const cutoff = logWindowCutoffMs();
+  return state.uiLogs.filter((item) => Number(item.ts) >= cutoff);
+}
+
+function renderUiLogs() {
+  pruneUiLogs();
+  const logs = visibleUiLogs();
+  if (!logs.length) {
+    els.logStream.innerHTML = `<div class="empty-state compact">当前 ${escapeHtml(logWindowLabel())} 内没有页面日志。</div>`;
+    return;
+  }
+  els.logStream.innerHTML = logs.map((item) => `
+    <div class="${item.strong ? "log-line strong" : "log-line"}">
+      [${escapeHtml(fmtLogTime(item.ts))}] ${escapeHtml(item.text)}
+    </div>
+  `).join("");
+}
+
+function addUiLog(text, strong = false) {
+  state.uiLogs.unshift({ ts: Date.now(), text: String(text || ""), strong: Boolean(strong) });
+  renderUiLogs();
   renderViewModeDetails();
 }
 
@@ -578,7 +694,7 @@ async function startBooking(event) {
 }
 
 async function loadBookingHistory() {
-  const data = await api(userScopedPath("/api/booking/history"));
+  const data = await api(userScopedPath(`/api/booking/history?${logWindowQuery()}`));
   state.bookingHistory = data.history || [];
   renderBookingHistory(state.bookingHistory);
   return data;
@@ -586,7 +702,7 @@ async function loadBookingHistory() {
 
 function renderBookingHistory(history) {
   if (!history.length) {
-    els.bookingHistoryList.innerHTML = `<div class="empty-state">还没有通过操作台发起过预约</div>`;
+    els.bookingHistoryList.innerHTML = `<div class="empty-state">当前 ${escapeHtml(logWindowLabel())} 内没有历史预约。</div>`;
     return;
   }
 
@@ -765,6 +881,12 @@ function renderAvailabilityTools() {
   renderViewModeDetails();
 }
 
+function availabilityHasSelectableSlots() {
+  return (state.availabilityDays || []).some((day) => (
+    (day.hours || []).some((hour) => (hour.courts || []).length > 0)
+  ));
+}
+
 function renderAvailabilityCombos() {
   if (!els.availabilityCombos) {
     return;
@@ -822,6 +944,11 @@ function renderExactSelection() {
     return;
   }
   const slots = state.selectedAvailabilitySlots;
+  const hasSelectableSlots = availabilityHasSelectableSlots();
+  els.availabilitySelection.hidden = !hasSelectableSlots && !slots.length;
+  if (els.availabilitySelection.hidden) {
+    return;
+  }
   const total = exactSlotsTotal(slots);
   const balance = currentBalanceValue();
   els.availabilitySelection.classList.toggle("has-selection", slots.length > 0);
@@ -1026,7 +1153,7 @@ async function submitExactBooking() {
 }
 
 async function loadScanTasks() {
-  const data = await api(userScopedPath("/api/scan/tasks"));
+  const data = await api(userScopedPath(`/api/scan/tasks?${logWindowQuery()}`));
   state.scanTasks = data.tasks || [];
   state.scanEvents = data.events || [];
   renderScanTasks();
@@ -1078,14 +1205,21 @@ function renderScanEvents() {
   }
   const events = compactScanEvents((state.scanEvents || []).filter((event) => event.important)).slice(0, 8);
   if (!events.length) {
-    els.scanEventList.innerHTML = `<div class="empty-state compact">暂无重要决策。</div>`;
+    els.scanEventList.innerHTML = `
+      <div class="availability-tool-head">
+        <strong>最近重要决策</strong>
+        ${renderLogWindowControl("扫描事件时间窗")}
+      </div>
+      <div class="empty-state compact">当前 ${escapeHtml(logWindowLabel())} 内暂无重要决策。</div>
+    `;
     return;
   }
   els.scanEventList.innerHTML = `
     <div class="availability-tool-head">
       <strong>最近重要决策</strong>
-      <span class="booking-meta">预约、取消、重约、完成、过期</span>
+      ${renderLogWindowControl("扫描事件时间窗")}
     </div>
+    <span class="booking-meta">预约、取消、重约、完成、过期</span>
     ${events.map((event) => `
       <div class="scan-event-row">
         ${event.folded_count ? `<span class="scan-event-badge">+${escapeHtml(event.folded_count)}</span>` : ""}
@@ -1607,7 +1741,7 @@ function buildViewModeDetailGroups() {
   const priority = formValue(bookingForm, "priority", "").trim();
   const backup = formValue(bookingForm, "backup", "").trim();
   const courtPool = [priority, backup].filter(Boolean).join(" + ") || "-";
-  const logCount = els.logStream.children.length;
+  const logCount = visibleUiLogs().length;
 
   return [
     {
@@ -1664,11 +1798,12 @@ function buildViewModeDetailGroups() {
     {
       title: "日志",
       rows: [
-        ["保留上限", "180 行"],
+        ["时间窗", logWindowLabel()],
+        ["保留上限", "一周"],
         ["当前行数", `${logCount}`],
         ["任务状态", els.jobState.textContent || "空闲"],
       ],
-      behavior: "任务输出被轮询读取后会压缩成页面日志；页面只保留最新 180 行，任务状态芯片来自当前 job 快照。",
+      behavior: "任务输出被轮询读取后会压缩成页面日志；页面按当前时间窗展示，超过一周的日志会被裁剪。",
     },
   ];
 }
@@ -1939,7 +2074,9 @@ els.cancelDialogSubmit.addEventListener("click", () => {
 setupBookingDate();
 setupSessionHelp();
 setupViewModeControl();
+setupLogWindowControls();
 setupTouchControls();
+renderUiLogs();
 addScanTargetRow();
 if (localStorage.getItem("daydayupAccessKey")) {
   showApp().catch(() => showLogin());
