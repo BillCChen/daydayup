@@ -45,6 +45,7 @@ from easyserp_client import (
     summarize_order,
     trim_time,
 )
+import availability_analytics
 
 
 ROOT = Path(__file__).resolve().parent
@@ -1696,6 +1697,30 @@ class WebConsole:
                 )
         return {"days": results, "user": serialize_user(user), "updated_at": time.time()}
 
+    def availability_analytics(
+        self,
+        *,
+        metric: str,
+        window_days: int | str = 7,
+        start_hour: int | str = availability_analytics.DEFAULT_START_HOUR,
+        end_hour: int | str = availability_analytics.DEFAULT_END_HOUR,
+        courts: list[int] | None = None,
+        slots: list[str] | None = None,
+        cache_ttl_seconds: int = availability_analytics.DEFAULT_CACHE_TTL_SECONDS,
+    ) -> dict[str, Any]:
+        try:
+            return availability_analytics.get_analytics(
+                metric,
+                window_days=window_days,
+                start_hour=start_hour,
+                end_hour=end_hour,
+                courts=courts,
+                slots=slots,
+                cache_ttl_seconds=cache_ttl_seconds,
+            )
+        except ValueError as exc:
+            raise EasySerpError(str(exc))
+
     def cancel_preview(self, bill_num: str, user_key: str = "") -> dict[str, Any]:
         user = self.users.get_user(user_key)
         order = self._find_recent_order(bill_num, user)
@@ -2435,6 +2460,34 @@ class RequestHandler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return
             self.write_json(app.jobs.snapshot())
+        elif parsed.path == "/api/analytics/availability":
+            if not self.authorized():
+                return
+            metric = single_query(query, "metric")
+            if not metric:
+                raise EasySerpError("metric is required")
+            window_days = single_query(query, "window_days")
+            start_hour = single_query(query, "start_hour")
+            end_hour = single_query(query, "end_hour")
+            courts = parse_int_list(query.get("courts"))
+            raw_slots = query.get("slots", [])
+            slots: list[str] = []
+            for raw_slot in raw_slots:
+                slots.extend([item for item in str(raw_slot).replace(",", " ").split() if item])
+            if not slots:
+                slots = []
+            cache_ttl = single_query(query, "cache_ttl_seconds")
+            self.write_json(
+                app.availability_analytics(
+                    metric=metric,
+                    window_days=window_days,
+                    start_hour=start_hour,
+                    end_hour=end_hour,
+                    courts=courts,
+                    slots=slots,
+                    cache_ttl_seconds=int_or_default(cache_ttl, availability_analytics.DEFAULT_CACHE_TTL_SECONDS),
+                )
+            )
         elif parsed.path == "/api/scan/tasks":
             if not self.authorized():
                 return
