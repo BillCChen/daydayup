@@ -34,6 +34,7 @@ const state = {
 const SAFE_COURTS = [2, 3, 4, 6, 7, 8, 9, 10, 11];
 const WALL_COURTS = [4, 5, 12];
 const ALL_COURTS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+const VISIBLE_SCAN_TASK_STATUSES = new Set(["active", "paused"]);
 const LOG_WINDOW_OPTIONS = [
   { hours: 6, label: "6 小时" },
   { hours: 12, label: "12 小时" },
@@ -419,8 +420,7 @@ function renderBookings(bookings) {
     return `
       <div class="booking-row${selected}" role="button" tabindex="0" data-bill="${escapeAttr(booking.bill_num)}">
         <span class="booking-main">
-          <span><span class="booking-time">${escapeHtml(booking.date)} ${escapeHtml(booking.time_range)}</span> · ${escapeHtml(booking.court || "场地")}</span>
-          <span class="booking-meta">bill ${escapeHtml(booking.bill_num)} · ${escapeHtml(booking.pay_type || "-")} · ${escapeHtml(booking.created_at || "-")}</span>
+          <span class="booking-summary"><span class="booking-time">${escapeHtml(booking.date)} ${escapeHtml(booking.time_range)}</span> · ${escapeHtml(booking.court || "场地")}</span>
         </span>
         ${renderRefundAction(booking, refundState)}
       </div>
@@ -794,11 +794,15 @@ function renderAvailability(days) {
     const hourMarkup = hours.length
       ? hours.map((hour) => renderAvailabilityHour(day, hour)).join("")
       : `<div class="availability-empty">没有可约场地</div>`;
+    const total = Number(day.total || 0);
+    const countMarkup = total > 0
+      ? `<span class="chip success">${escapeHtml(total)} 个可约时段</span>`
+      : "";
     return `
       <div class="availability-day" data-date="${escapeAttr(day.date)}">
         <div class="availability-head">
           <strong>${escapeHtml(day.label)} ${escapeHtml(day.date)}</strong>
-          <span class="chip ${day.total ? "success" : ""}">${escapeHtml(day.total)} 个可约时段</span>
+          ${countMarkup}
         </div>
         <div class="availability-hours">${hourMarkup}</div>
       </div>
@@ -1163,11 +1167,14 @@ async function loadScanTasks() {
 }
 
 function renderScanTasks() {
-  if (!state.scanTasks.length) {
-    els.scanTaskList.innerHTML = `<div class="empty-state">还没有扫描任务。</div>`;
+  const scanTasks = state.scanTasks || [];
+  const visibleTasks = visibleScanTasks(scanTasks);
+  if (!visibleTasks.length) {
+    const emptyMessage = scanTasks.length ? "当前没有扫描中的任务。" : "还没有扫描任务。";
+    els.scanTaskList.innerHTML = `<div class="empty-state">${escapeHtml(emptyMessage)}</div>`;
     return;
   }
-  els.scanTaskList.innerHTML = state.scanTasks.map((task) => {
+  els.scanTaskList.innerHTML = visibleTasks.map((task) => {
     const tone = scanTaskTone(task.status);
     const targets = task.targets || [];
     const done = targets.filter((target) => target.status === "booked").length;
@@ -1197,6 +1204,10 @@ function renderScanTasks() {
   els.scanTaskList.querySelectorAll("[data-scan-action]").forEach((button) => {
     button.addEventListener("click", () => updateScanTask(button.dataset.scanId, button.dataset.scanAction));
   });
+}
+
+function visibleScanTasks(tasks) {
+  return (tasks || []).filter((task) => VISIBLE_SCAN_TASK_STATUSES.has(task.status));
 }
 
 function renderScanEvents() {

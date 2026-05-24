@@ -550,11 +550,11 @@ select:focus-visible {
 .booking-row {
   width: 100%;
   display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
   align-items: center;
-  min-height: 72px;
-  padding: 12px;
+  min-height: 44px;
+  padding: 4px 8px;
   border: 1px solid var(--border-muted);
   border-radius: 8px;
   background: var(--surface-raised);
@@ -596,6 +596,14 @@ select:focus-visible {
   font-family: var(--font-numeric);
   font-weight: 650;
   font-variant-numeric: tabular-nums;
+}
+
+.booking-summary {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .booking-meta {
@@ -834,6 +842,7 @@ select:focus-visible {
 
 .scan-target-row {
   align-items: end;
+  grid-template-columns: minmax(118px, 1fr) minmax(76px, 0.7fr) minmax(76px, 0.7fr);
   border: 1px solid var(--border-muted);
   border-radius: 8px;
   background: var(--surface-raised);
@@ -842,6 +851,28 @@ select:focus-visible {
 
 .scan-grid {
   grid-template-columns: minmax(0, 1fr);
+}
+
+.scan-target-row > label,
+.scan-grid > label {
+  min-width: 0;
+}
+
+.scan-target-row > .button {
+  grid-column: 1 / -1;
+  min-height: 40px;
+}
+
+.scan-form .button.compact {
+  min-height: 46px;
+}
+
+.scan-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.scan-grid > label:last-child {
+  grid-column: 1 / -1;
 }
 
 .scan-task-row {
@@ -964,12 +995,15 @@ select:focus-visible {
 
 .availability-list {
   display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+  align-items: start;
   gap: 10px;
   margin-top: 14px;
 }
 
 .availability-day {
   display: grid;
+  align-content: start;
   gap: 10px;
   border: 1px solid var(--border-muted);
   border-radius: 8px;
@@ -996,7 +1030,7 @@ select:focus-visible {
   gap: 6px 10px;
   align-items: flex-start;
   border-top: 1px solid var(--border-muted);
-  padding-top: 6px;
+  padding-top: 8px;
 }
 
 .availability-hour:first-child {
@@ -1019,7 +1053,7 @@ select:focus-visible {
 .availability-courts {
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
   min-width: 0;
 }
@@ -1101,7 +1135,7 @@ select:focus-visible {
 
 @container (min-width: 420px) {
   .availability-courts {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -1397,6 +1431,244 @@ body.modal-open {
   text-align: center;
 }
 
+.panel,
+.detail-pane {
+  padding: 14px;
+}
+
+.section-head {
+  gap: 10px;
+}
+
+.section-head h2,
+.detail-pane h2 {
+  font-size: 1.25rem;
+}
+
+.balance-block,
+.booking-list,
+.history-list,
+.booking-form,
+.scan-form,
+.scan-task-list,
+.scan-event-list,
+.subtle-details {
+  margin-top: 10px;
+}
+
+.balance-block {
+  gap: 6px;
+  padding: 12px;
+}
+
+.balance-value {
+  font-size: 1.65rem;
+}
+
+.booking-row {
+  min-height: 44px;
+  padding: 4px 8px;
+}
+
+.history-row,
+.scan-task-row {
+  min-height: 62px;
+  padding: 10px;
+}
+
+.booking-form,
+.scan-form,
+.scan-task-list,
+.scan-event-list,
+.user-form,
+.user-unlock,
+.detail-content,
+.modal-body {
+  gap: 10px;
+}
+
+.booking-form input,
+.booking-form select,
+.scan-form input,
+.scan-form select,
+.auth-card input,
+.user-unlock input,
+.user-form input,
+.confirm-input {
+  min-height: 44px;
+  padding: 8px 10px;
+}
+
+.touch-field,
+.token-helper,
+.view-mode-details {
+  gap: 8px;
+}
+
+.field-head {
+  gap: 8px;
+}
+
+.option-card {
+  padding: 8px 10px;
+}
+
+.option-card .checkline {
+  min-height: 44px;
+}
+
+.option-card small {
+  line-height: 1.35;
+}
+
+.scan-target-list,
+.scan-target-row,
+.scan-grid,
+.scan-target-summary,
+.scan-task-actions {
+  gap: 6px;
+}
+
+.scan-target-row {
+  padding: 8px;
+}
+
+.scan-target-row .button.compact {
+  align-self: end;
+}
+
+.scan-task-main {
+  gap: 4px;
+}
+
+.scan-target-chip {
+  min-height: 34px;
+  padding: 5px 7px;
+}
+
+.scan-event-row {
+  gap: 4px;
+  padding: 8px 10px;
+}
+
+.log-stream {
+  max-height: 240px;
+  margin-top: 10px;
+  padding: 8px;
+}
+
+.empty-state {
+  min-height: 64px;
+}
+
+.empty-state.compact {
+  min-height: 36px;
+  padding: 8px 0;
+}
+
+@media (min-width: 720px) {
+  .scan-form {
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    align-items: end;
+    gap: 8px;
+  }
+
+  .scan-form > .touch-field {
+    order: 1;
+    grid-column: 1 / -1;
+  }
+
+  .scan-form > .scan-grid {
+    order: 2;
+    grid-column: 1 / span 8;
+    grid-template-columns: minmax(78px, 0.6fr) minmax(116px, 1fr) minmax(116px, 1fr) minmax(150px, 1.3fr);
+  }
+
+  .scan-form > .scan-grid > label:last-child {
+    grid-column: auto;
+  }
+
+  .scan-target-row > .button {
+    grid-column: auto;
+  }
+
+  .scan-form > label {
+    order: 3;
+    grid-column: 9 / -1;
+  }
+
+  .scan-form > .option-grid {
+    order: 4;
+    grid-column: 1 / span 8;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .scan-form > .button.primary {
+    order: 5;
+    grid-column: 9 / -1;
+    align-self: stretch;
+  }
+
+  .scan-target-row {
+    grid-template-columns: minmax(136px, 1.1fr) minmax(96px, 0.65fr) minmax(96px, 0.65fr) auto;
+  }
+}
+
+@media (min-width: 1180px) {
+  .workspace {
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    align-items: start;
+    gap: 12px;
+  }
+
+  .topbar,
+  .status-band,
+  .view-mode-details,
+  #availability,
+  #scanTasks {
+    grid-column: 1 / -1;
+  }
+
+  #wallet {
+    grid-column: span 4;
+  }
+
+  #bookings {
+    grid-column: span 8;
+  }
+
+  #submit {
+    grid-column: span 7;
+  }
+
+  #bookingHistory {
+    grid-column: span 5;
+  }
+
+  #logs {
+    grid-column: span 7;
+  }
+
+  #users {
+    grid-column: span 5;
+  }
+}
+
+@media (min-width: 360px) and (max-width: 719px) {
+  .scan-target-row {
+    grid-template-columns: minmax(112px, 1fr) minmax(72px, 0.65fr) minmax(72px, 0.65fr) auto;
+  }
+
+  .scan-target-row > .button,
+  .scan-grid > label:last-child {
+    grid-column: auto;
+  }
+
+  .scan-form > .option-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 719px) {
   .topbar,
   .topbar-actions {
@@ -1552,7 +1824,114 @@ body.modal-open {
   }
 
   .booking-row {
-    grid-template-columns: 1fr auto;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+}
+
+@media (min-width: 720px) {
+  #scanTasks {
+    display: grid;
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    align-items: start;
+    gap: 10px;
+  }
+
+  #scanTasks > .section-head,
+  #scanTasks > .scan-form {
+    grid-column: 1 / -1;
+  }
+
+  #scanTasks > .scan-task-list {
+    grid-column: 1 / span 6;
+    margin-top: 0;
+  }
+
+  #scanTasks > .scan-event-list {
+    grid-column: 7 / -1;
+    margin-top: 0;
+  }
+
+  .scan-form label {
+    gap: 4px;
+    font-size: 0.875rem;
+  }
+
+  .scan-form input,
+  .scan-form select {
+    min-height: 44px;
+    padding: 8px 10px;
+  }
+
+  .scan-form > .touch-field {
+    grid-template-columns: minmax(76px, 0.18fr) minmax(0, 1fr) auto;
+    align-items: end;
+  }
+
+  .scan-form > .touch-field > .field-head {
+    display: contents;
+  }
+
+  .scan-form > .touch-field > .field-head > span {
+    align-self: start;
+    grid-column: 1;
+    grid-row: 1;
+    color: var(--text-secondary);
+    font-weight: 650;
+  }
+
+  .scan-form > .touch-field > .field-head > .button {
+    grid-column: 3;
+    grid-row: 1;
+    align-self: end;
+  }
+
+  .scan-form .button.compact {
+    min-height: 46px;
+  }
+
+  .scan-form > .touch-field > #addScanTarget {
+    grid-column: 3;
+    grid-row: 1;
+    align-self: end;
+  }
+
+  .scan-form > .touch-field > .scan-target-list {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .scan-target-row {
+    padding: 6px;
+  }
+
+  .scan-form > .button.primary {
+    align-self: end;
+    min-height: 44px;
+  }
+
+  .scan-form > .option-grid {
+    align-items: stretch;
+  }
+
+  .scan-form .option-card {
+    padding: 6px 8px;
+  }
+
+  .scan-form .option-card .checkline {
+    min-height: 44px;
+  }
+
+  .scan-form .option-card small {
+    font-size: 0.75rem;
+    line-height: 1.25;
+  }
+}
+
+@media (min-width: 1180px) {
+  .workspace {
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    align-items: start;
+    gap: 12px;
   }
 }
 
