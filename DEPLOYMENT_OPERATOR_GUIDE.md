@@ -2,9 +2,11 @@
 
 本文件用于把项目迁移到其他机器后，向协作助手说明当前系统能力、部署方式、接口边界和验证要求。它不是可安装 skill，只是操作规范。
 
+本项目生产环境统一部署在服务器 `a55002`，本地环境仅用于开发联调，不作为正式部署目标。
+
 ## Project Scope
 
-Daydayup 是一个本地 Web 预约操作台，负责查询羽毛球场地、发起抢场任务、查看余额与活跃预约、精确提交选中场地、退订预约、创建扫描预约任务，并可通过临时公网隧道发送访问地址。
+Daydayup 是一个 Web 预约控制台，负责查询羽毛球场地、发起抢场任务、查看余额与活跃预约、精确提交选中场地、退订预约、创建扫描预约任务，并可通过临时公网隧道发送访问地址。生产部署在 `a55002` 上，由服务器侧统一管理。
 
 不要在公开仓库、提交记录、日志摘录或对话中暴露真实 `token`、`JSESSIONID`、访问密码、SMTP 授权码、会员卡号。
 
@@ -15,17 +17,19 @@ Daydayup 是一个本地 Web 预约操作台，负责查询羽毛球场地、发
 - Scan worker process: `scan_worker.py`
 - Booking script: `enhanced_book_smart_v2.py`
 - Shared API client: `easyserp_client.py`
-- Default local URL: `http://127.0.0.1:8789`
+- Default deployment URL on server: `http://127.0.0.1:8789`
 - Default shop number: `1001`
 - Default EasySERP base URL: `https://www.147soft.cn/easyserpClient`
-- Local runtime files: `local/`
+- Deployment runtime files: `local/`
 - Runtime logs: `logs/`
 
-Start local service:
+Start service on server:
 
 ```bash
 uv run python web_console.py --host 127.0.0.1 --port 8789
 ```
+
+The service applies a built-in host alias fallback for `www.147soft.cn` by default. Manually set `DAYDAYUP_HOST_ALIASES` only when routing needs to be overridden for a specific network condition.
 
 Start scan worker:
 
@@ -33,7 +37,7 @@ Start scan worker:
 uv run python scan_worker.py
 ```
 
-Start LAN-accessible service:
+Start LAN-accessible service (server side):
 
 ```bash
 uv run python web_console.py --host 0.0.0.0 --port 8789
@@ -59,7 +63,7 @@ uv run python -m unittest discover -s tests
 - `local/booking_history.json`: Web-triggered booking records.
 - `local/scan_tasks.json`: persistent scan tasks and target states.
 - `local/scan_events.json`: important scan decisions and email event history.
-- `$HOME/Library/LaunchAgents/com.billchen.daydayup.scanworker.plist`: macOS background scan worker.
+- `$HOME/Library/LaunchAgents/com.billchen.daydayup.scanworker.plist`: server-side macOS background scan worker.
 - `local/cloudflared_mail.env`: SMTP and recipient settings used by tunnel monitor and scan event emails.
 - `local/cloudflared_url.txt`: latest known public tunnel URL.
 
@@ -313,7 +317,7 @@ POST /api/scan/tasks
 POST /api/scan/tasks/update
 ```
 
-All protected API requests require the local access password through `X-Daydayup-Key` after login.
+All protected API requests require the access password through `X-Daydayup-Key` after login.
 
 ## Deployment Checklist
 
@@ -321,7 +325,7 @@ All protected API requests require the local access password through `X-Daydayup
 2. Create `local/` and configure `local/users.csv`.
 3. Optional: configure `local/cloudflared_mail.env`.
 4. Start `web_console.py`.
-5. Open local URL and log in.
+5. Open server URL and log in.
 6. Verify `/api/status`, cards, active bookings, availability.
 7. Run tests before editing behavior.
 8. Keep `logs/` and `local/` out of commits unless explicitly needed.

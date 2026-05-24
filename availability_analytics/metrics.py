@@ -131,17 +131,25 @@ def compute_timeseries(
         court_numbers=court_numbers,
         slot_starts=slot_starts,
     )
-    hourly_totals = defaultdict(float)
+    bucket_slots: defaultdict[str, set[str]] = defaultdict(set)
     for item in observations:
+        if int(item["is_bookable"]) != 1:
+            continue
         observed_at = datetime.fromisoformat(item["observed_at"])
         if observed_at.tzinfo is None:
             observed_at = observed_at.replace(tzinfo=TZ)
-        bucket = observed_at.astimezone(TZ).replace(minute=0, second=0, microsecond=0)
-        hourly_totals[bucket.isoformat()] += 0.5 * item["is_bookable"]
+        local_time = observed_at.astimezone(TZ)
+        bucket = local_time.replace(
+            minute=0 if local_time.minute < 30 else 30,
+            second=0,
+            microsecond=0,
+        )
+        bucket_key = f"{int(item['court_number'])}|{item['target_date']}|{item['start_time']}"
+        bucket_slots[bucket.isoformat()].add(bucket_key)
     points = []
     last_value: float | None = None
-    for bucket in sorted(hourly_totals):
-        value = float(hourly_totals[bucket])
+    for bucket in sorted(bucket_slots):
+        value = 0.5 * len(bucket_slots[bucket])
         if last_value is None or value != last_value:
             points.append({"timestamp": bucket, "hours": value})
             last_value = value

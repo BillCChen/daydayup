@@ -11,13 +11,17 @@ cp .env.example .env
 
 Fill local values in `.env`; do not commit them.
 
-## Local UI
+## Deployment mode
+
+This project is deployed on the remote server (`a55002`) and should not be treated as a local production deployment.
+
+### Local usage (development only)
 
 ```bash
 uv run python web_console.py
 ```
 
-Default URL: `http://127.0.0.1:8789`.
+Local debug URL: `http://127.0.0.1:8789`.
 
 The Web UI creates and edits scan tasks. Run the scan worker separately for background execution:
 

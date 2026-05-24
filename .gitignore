@@ -13,6 +13,15 @@ PRODUCT.md
 DESIGN.md
 .impeccable/
 
+# Local analytics artifacts
+availability_analytics_data/
+availability_analytics_data_index.js
+availability_analytics_data_index.json
+availability_analytics_report.html
+availability_analytics_report_bundle/
+availability_analytics_report_loader.js
+scripts/daydayup_tmux.sh
+
 # C extensions
 *.so
 

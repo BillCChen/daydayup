@@ -112,7 +112,7 @@ def collect_detail_indexes(
 ]:
     hour_court_detail: dict[str, set[str]] = defaultdict(set)
     court_day_detail: dict[str, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
-    timeseries_detail: dict[str, dict[str, int]] = {}
+    timeseries_detail: dict[str, set[str]] = {}
 
     for item in observations:
         if int(item.get("is_bookable", 0)) != 1:
@@ -132,7 +132,7 @@ def collect_detail_indexes(
         else:
             observed_at = observed_at.astimezone(availability_analytics.LOCAL_TZ)
 
-        bucket = observed_at.replace(minute=0, second=0, microsecond=0)
+        bucket = observed_at.replace(minute=0 if observed_at.minute < 30 else 30, second=0, microsecond=0)
         observed_label = format_observed_time_chinese(observed_at)
 
         hour_court_detail[f"{slot}|{court}"].add(
@@ -141,8 +141,7 @@ def collect_detail_indexes(
         court_day_detail[f"{court}|{date_value}"][format_slot_range(slot)] += 1
         timeseries_key = f"{court}|{date_value}|{format_slot_range(slot)}"
         bucket_key = bucket.isoformat()
-        bucket_map = timeseries_detail.setdefault(bucket_key, {})
-        bucket_map[timeseries_key] = bucket_map.get(timeseries_key, 0) + 1
+        timeseries_detail.setdefault(bucket_key, set()).add(timeseries_key)
 
     hour_court_map = {key: sorted(values) for key, values in hour_court_detail.items()}
     court_day_map = {
@@ -161,19 +160,18 @@ def collect_detail_indexes(
     for bucket, totals in timeseries_detail.items():
         courts: set[int] = set()
         details: list[dict[str, Any]] = []
-        for composite_key, count in totals.items():
+        for composite_key in sorted(totals):
             court_text, date_text, time_text = composite_key.split("|", 2)
             court_value = int(court_text)
             courts.add(court_value)
-            if count > 0:
-                details.append(
-                    {
-                        "court": court_value,
-                        "date": date_text,
-                        "time": time_text,
-                        "count": count,
-                    }
-                )
+            details.append(
+                {
+                    "court": court_value,
+                    "date": date_text,
+                    "time": time_text,
+                    "count": 1,
+                }
+            )
         timeseries_map[bucket] = sorted(courts)
         details.sort(key=lambda item: (item["court"], item["date"], item["time"]))
         timeseries_detail_map[bucket] = details
@@ -392,7 +390,7 @@ def render_timeseries_svg(points: list[dict[str, Any]]) -> str:
     if max_y == min_y:
         max_y = min_y + 0.5
 
-    tick_min = math.floor(min_y * 2) / 2
+    tick_min = 0.0
     tick_max = math.ceil(max_y * 2) / 2
     if tick_min == tick_max:
         tick_max = tick_min + 0.5
@@ -402,65 +400,74 @@ def render_timeseries_svg(points: list[dict[str, Any]]) -> str:
     chart_left = 72
     chart_right = 30
     chart_top = 20
-    chart_bottom = 50
+    chart_bottom = 85
     inner_w = width - chart_left - chart_right
     inner_h = height - chart_top - chart_bottom
 
     sorted_points = sorted(parsed_points, key=lambda item: item[0])
-    time_values = [int(item[0].timestamp() * 1000) for item in sorted_points]
-    point_changes = {
-        int(item[0].timestamp() * 1000): {"timestamp": item[1], "value": item[2]}
-        for item in sorted_points
-    }
+    points_for_chart: list[tuple[int, str, float]] = [
+        (int(point_dt.timestamp() * 1000), raw_timestamp, float(point_hours))
+        for point_dt, raw_timestamp, point_hours in sorted_points
+    ]
+    time_values = [item[0] for item in points_for_chart]
     min_t = min(time_values)
     max_t = max(time_values)
-    if min_t == max_t:
-        max_t = min_t + 3600 * 1000
-
-    change_points = set(time_values)
-    values_by_hour: list[tuple[int, float, bool]] = []
-    current_value = float(values[0])
-    next_change_idx = 0
-    sorted_change_times = sorted(time_values)
-    for current_hour in range(min_t, max_t + 1, 3600 * 1000):
-        while next_change_idx + 1 < len(sorted_change_times) and sorted_change_times[next_change_idx + 1] <= current_hour:
-            next_change_idx += 1
-            current_value = float(point_changes[sorted_change_times[next_change_idx]]["value"])
-        is_change = current_hour in point_changes
-        values_by_hour.append((current_hour, current_value, is_change))
+    time_span_ms = max_t - min_t
+    if time_span_ms == 0:
+        time_span_ms = 30 * 60 * 1000
 
     def x_at(ts_ms: int) -> float:
-        ratio = (ts_ms - min_t) / (max_t - min_t)
+        ratio = (ts_ms - min_t) / time_span_ms
         return chart_left + ratio * inner_w
 
     def y_at(v: float) -> float:
         return chart_top + inner_h * (1 - (v - tick_min) / (tick_max - tick_min))
 
-    points_path = " ".join(f"{x_at(t):.2f},{y_at(v):.2f}" for t, v, _ in values_by_hour)
+    point_changes: dict[int, tuple[str, float]] = {}
+    for ts_ms, display_time, value in points_for_chart:
+        point_changes[ts_ms] = (display_time, float(value))
+    change_ts_set = set(point_changes.keys())
+    sorted_change_times = sorted(change_ts_set)
+
+    values_by_tick: list[tuple[int, float, bool, int]] = []
+    current_value = float(points_for_chart[0][2])
+    current_change_idx = 0
+    for current_tick in range(min_t, max_t + 1, 30 * 60 * 1000):
+        while (
+            current_change_idx + 1 < len(sorted_change_times)
+            and sorted_change_times[current_change_idx + 1] <= current_tick
+        ):
+            current_change_idx += 1
+            current_value = point_changes[sorted_change_times[current_change_idx]][1]
+        is_change = current_tick in change_ts_set
+        active_change_ts = sorted_change_times[current_change_idx]
+        values_by_tick.append((current_tick, current_value, is_change, active_change_ts))
+
+    points_path = " ".join(f"{x_at(t):.2f},{y_at(v):.2f}" for t, v, _, _ in values_by_tick)
     circles: list[str] = []
     ticks: list[str] = []
 
-    for ts_ms, value, is_change in values_by_hour:
+    for ts_ms, value, is_change, active_change_ts in values_by_tick:
         point_dt = datetime.fromtimestamp(ts_ms / 1000, tz=availability_analytics.LOCAL_TZ)
         x = x_at(ts_ms)
         y = y_at(value)
-        point_key = point_changes.get(ts_ms)
         label = point_dt.strftime("%m-%d %H:%M")
-        display_time = point_key.get("timestamp") if point_key else point_dt.isoformat()
+        display_time = point_changes.get(active_change_ts, (point_dt.isoformat(), value))[0]
+        point_class = "point clickable"
         circle_radius = "4.5" if is_change else "3.2"
         circles.append(
-            f'<circle class="point clickable" cx="{x:.2f}" cy="{y:.2f}" r="{circle_radius}" data-cx="{x:.2f}" data-cy="{y:.2f}" '
+            f'<circle class="{point_class}" cx="{x:.2f}" cy="{y:.2f}" r="{circle_radius}" data-cx="{x:.2f}" data-cy="{y:.2f}" '
             f'data-timestamp="{display_time}" data-title="{label}" data-is-change="{str(is_change).lower()}"/>'
         )
-        if is_change:
-            ticks.append(
-                f"""
+        tick_label = f"{label}" if point_dt.minute == 0 and point_dt.hour % 4 == 0 else ""
+        ticks.append(
+            f"""
           <g class="axis-tick">
             <line x1="{x:.2f}" y1="{chart_top + inner_h}" x2="{x:.2f}" y2="{chart_top + inner_h + 7}" />
-            <text x="{x:.2f}" y="{chart_top + inner_h + 22}" text-anchor="middle">{label}</text>
+            {f'<text x="{x:.2f}" y="{chart_top + inner_h + 44}" text-anchor="end" transform="rotate(45 {x:.2f} {chart_top + inner_h + 44:.2f})">{tick_label}</text>' if tick_label else ''}
           </g>
         """
-            )
+        )
 
     y_ticks: list[str] = []
     tick_count = int((tick_max - tick_min) / 0.5) + 1
@@ -491,7 +498,7 @@ def render_timeseries_svg(points: list[dict[str, Any]]) -> str:
       {"".join(ticks)}
       {"".join(circles)}
     </svg>
-    <p class="meta">所有小时点都在折线中标注；X 轴仅保留变化点刻度。</p>
+    <p class="meta">每半小时采样点在折线上连续展示；X 轴刻度文本已隐藏以避免拥挤。</p>
     """
 
 
@@ -559,20 +566,60 @@ def load_all_data(args: argparse.Namespace) -> tuple[
     )
 
 
-def build_html(args: argparse.Namespace) -> str:
+def build_data_payload(args: argparse.Namespace) -> dict[str, Any]:
     hour_payload, court_payload, timeseries_payload, hour_detail, court_detail, _timeseries_court_map, timeseries_detail = load_all_data(args)
     hour_rows = ensure_non_empty_rows(hour_payload.get("rows", []))
     court_rows = ensure_non_empty_rows(court_payload.get("rows", []))
     timeseries_points = [item for item in timeseries_payload.get("points", []) if isinstance(item, dict)]
 
-    court_dates: list[str] = []
-    if court_rows and isinstance(court_rows[0], dict):
-        court_dates = [str(day.get("date", "")) for day in court_rows[0].get("days", []) if isinstance(day.get("date"), str)]
     point_courts = {
-        str(point["timestamp"]): timeseries_detail.get(str(point["timestamp"]), [])
+        str(point.get("timestamp")): timeseries_detail.get(str(point.get("timestamp")), [])
         for point in timeseries_points
     }
+    request_payload = dict(hour_payload.get("request", {})) if isinstance(hour_payload.get("request"), dict) else {}
+    court_payload_request = court_payload.get("request")
+    if isinstance(court_payload_request, dict):
+        request_payload.update(
+            {
+                key: court_payload_request.get(key)
+                for key in ("court_day_past_days", "court_day_future_days")
+            }
+        )
 
+    courts = request_payload.get("courts")
+    if isinstance(courts, tuple):
+        request_payload["courts"] = list(courts)
+    slots = request_payload.get("slots")
+    if isinstance(slots, tuple):
+        request_payload["slots"] = list(slots)
+
+    request_payload.setdefault("court_day_past_days", max(0, int(args.court_day_past_days)))
+    request_payload.setdefault("court_day_future_days", max(0, int(args.court_day_future_days)))
+
+    return {
+        "generated_at": datetime.now(tz=availability_analytics.LOCAL_TZ).isoformat(),
+        "request": request_payload,
+        "cache": {
+            "hour": hour_payload.get("cache", {}),
+            "court_day": court_payload.get("cache", {}),
+            "timeseries": timeseries_payload.get("cache", {}),
+        },
+        "source_signature": hour_payload.get("source_signature", "-"),
+        "hour_court_table_html": render_hour_court_html(
+            hour_rows,
+            request_payload.get("start_hour", args.start_hour),
+            request_payload.get("end_hour", args.end_hour),
+            hour_detail,
+        ),
+        "court_day_table_html": render_court_day_html(court_rows, court_detail),
+        "timeseries_svg_html": render_timeseries_svg(timeseries_points),
+        "hour_court_details": hour_detail,
+        "court_day_details": court_detail,
+        "timeseries_court_details": point_courts,
+    }
+
+
+def build_html(args: argparse.Namespace) -> str:
     return f"""<!doctype html>
 <html lang=\"zh-CN\">
 <head>
@@ -824,7 +871,7 @@ def build_html(args: argparse.Namespace) -> str:
   <div class="container">
     <div class="card report-header">
       <h1 class="report-title">Availability Analytics 报表</h1>
-      <p class="report-meta">默认加载：过去 {args.court_day_past_days} 天到未来 {args.court_day_future_days} 天；时段：{hour_payload['request']['start_hour']:02d}:00-{hour_payload['request']['end_hour']:02d}:00；场地：{", ".join(map(str, hour_payload['request']['courts'])) if hour_payload['request']['courts'] else "全部"}；场地×日期可见范围：<span id="court-day-visible-range">正在计算…</span></p>
+      <p class="report-meta">默认加载：<span id="report-config">正在读取数据源…</span>；场地×日期可见范围：<span id="court-day-visible-range">正在计算…</span></p>
     </div>
     <div class="date-filter" role="region" aria-label="日期范围筛选">
       <label class="filter-field">
@@ -845,365 +892,32 @@ def build_html(args: argparse.Namespace) -> str:
 
     <section class="card">
       <h2>1）时间槽 × 场地 热力图（每小时可约时长）</h2>
-      <div class="grid-wrap">{render_hour_court_html(hour_rows, hour_payload['request']['start_hour'], hour_payload['request']['end_hour'], hour_detail)}</div>
+      <div class="grid-wrap" id="hour-court-heatmap"><p class="hint">正在加载表格…</p></div>
     </section>
 
     <section class="card">
       <h2>2）场地 × 日期 热力图（按天汇总）</h2>
-      <div class="grid-wrap" id="court-day-heatmap">{render_court_day_html(court_rows, court_detail)}</div>
+      <div class="grid-wrap" id="court-day-heatmap"><p class="hint">正在加载表格…</p></div>
     </section>
 
     <section class="card">
-      <h2>3）变化点折线图（精确小时）</h2>
-      <div>{render_timeseries_svg(timeseries_points)}</div>
+      <h2>3）变化点折线图（精确半小时）</h2>
+      <div id="timeseries-chart"><p class="hint">正在加载图表…</p></div>
     </section>
 
     <section class="card">
       <h2>缓存与口径</h2>
-      <p class="meta">数据源签名：<code>{hour_payload.get('source_signature','-')}</code></p>
-      <p class="meta">小时图 cache hit: {str(hour_payload.get('cache', {}).get('hit', False)).lower()}</p>
-      <p class="meta">court_day cache hit: {str(court_payload.get('cache', {}).get('hit', False)).lower()}</p>
-      <p class="meta">timeseries cache hit: {str(timeseries_payload.get('cache', {}).get('hit', False)).lower()}</p>
+      <p class="meta">数据源签名：<code id="cache-source-signature">读取中…</code></p>
+      <p class="meta">小时图 cache hit: <span id="cache-hour-hit">-</span></p>
+      <p class="meta">court_day cache hit: <span id="cache-court-day-hit">-</span></p>
+      <p class="meta">timeseries cache hit: <span id="cache-timeseries-hit">-</span></p>
+      <p class="meta" id="data-load-error" style="display:none;color:#b91c1c;"></p>
     </section>
   </div>
   <div id="detail-popover" class="detail-popover" role="status" aria-live="polite"></div>
 
-  <script>
-    const hourCourtDetails = {json.dumps(hour_detail, ensure_ascii=False)};
-    const courtDayDetails = {json.dumps(court_detail, ensure_ascii=False)};
-    const timeseriesCourtDetails = {json.dumps(point_courts, ensure_ascii=False)};
-    const courtDayVisibleRangeLabel = document.getElementById('court-day-visible-range');
-    const courtDayHeatmap = document.getElementById('court-day-heatmap');
-    const filterTargetDateInput = document.getElementById('filter-target-date');
-    const filterPastDaysInput = document.getElementById('filter-past-days');
-    const filterFutureDaysInput = document.getElementById('filter-future-days');
-    const filterApplyButton = document.getElementById('filter-apply');
-    const filterResetButton = document.getElementById('filter-reset');
-    const dateColumnNodes = new Map();
-    let courtDayMinDate = null;
-    let courtDayMaxDate = null;
-    const DAY_MS = 24 * 60 * 60 * 1000;
-
-    function pad2(value) {{
-      return value < 10 ? '0' + value : String(value);
-    }}
-
-    function toDateInputValue(date) {{
-      return date.getFullYear() + '-' + pad2(date.getMonth() + 1) + '-' + pad2(date.getDate());
-    }}
-
-    function normalizeDate(date) {{
-      return new Date(date.getFullYear(), date.getMonth(), date.getDate());
-    }}
-
-    function parseYmd(dateText) {{
-      const parts = String(dateText).split('-');
-      if (parts.length !== 3) {{
-        return null;
-      }}
-      const year = Number(parts[0]);
-      const month = Number(parts[1]);
-      const day = Number(parts[2]);
-      if (![year, month, day].every(Number.isFinite)) {{
-        return null;
-      }}
-      return new Date(year, month - 1, day);
-    }}
-
-    function formatDateText(date) {{
-      if (!date) {{
-        return '';
-      }}
-      return (date.getMonth() + 1) + '月' + date.getDate() + '日';
-    }}
-
-    function addDays(baseDate, offset) {{
-      const result = new Date(baseDate.getTime());
-      result.setDate(result.getDate() + offset);
-      return result;
-    }}
-
-    function initializeCourtDayColumns() {{
-      if (!courtDayHeatmap) {{
-        return;
-      }}
-      const headers = Array.from(courtDayHeatmap.querySelectorAll('th[data-court-day-date]'));
-      headers.forEach(function(header) {{
-        const dateText = header.dataset.courtDayDate;
-        if (!dateText) {{
-          return;
-        }}
-        const nodeList = [header, ...courtDayHeatmap.querySelectorAll('td[data-court-day-date="' + dateText + '"]')];
-        dateColumnNodes.set(dateText, nodeList);
-
-        const parsedDate = parseYmd(dateText);
-        if (!parsedDate) {{
-          return;
-        }}
-        if (!courtDayMinDate || parsedDate < courtDayMinDate) {{
-          courtDayMinDate = parsedDate;
-        }}
-        if (!courtDayMaxDate || parsedDate > courtDayMaxDate) {{
-          courtDayMaxDate = parsedDate;
-        }}
-      }});
-
-      const today = normalizeDate(new Date());
-      filterTargetDateInput.value = toDateInputValue(today);
-    }}
-
-    function clampDateToLoadedRange(dateValue) {{
-      if (!courtDayMinDate || !courtDayMaxDate || !dateValue) {{
-        return dateValue;
-      }}
-      if (dateValue < courtDayMinDate) {{
-        return new Date(courtDayMinDate.getTime());
-      }}
-      if (dateValue > courtDayMaxDate) {{
-        return new Date(courtDayMaxDate.getTime());
-      }}
-      return dateValue;
-    }}
-
-    function applyCourtDayDateFilter() {{
-      if (!courtDayHeatmap || !courtDayVisibleRangeLabel || !filterTargetDateInput || !filterPastDaysInput || !filterFutureDaysInput) {{
-        return;
-      }}
-      const baseDate = parseYmd(filterTargetDateInput.value || '');
-      if (!baseDate) {{
-        return;
-      }}
-      const targetDate = clampDateToLoadedRange(normalizeDate(baseDate));
-      const pastDays = Math.max(0, Number.parseInt(filterPastDaysInput.value, 10) || 0);
-      const futureDays = Math.max(0, Number.parseInt(filterFutureDaysInput.value, 10) || 0);
-
-      if (targetDate && toDateInputValue(targetDate) !== filterTargetDateInput.value) {{
-        filterTargetDateInput.value = toDateInputValue(targetDate);
-      }}
-
-      const rangeStart = new Date(targetDate.getTime() - pastDays * DAY_MS);
-      const rangeEnd = new Date(targetDate.getTime() + futureDays * DAY_MS);
-      const startTs = rangeStart.getTime();
-      const endTs = rangeEnd.getTime();
-      let visibleFirst = null;
-      let visibleLast = null;
-      let visibleCount = 0;
-
-      dateColumnNodes.forEach(function(nodes, dateText) {{
-        const dateObj = parseYmd(dateText);
-        const visible = !!dateObj && dateObj.getTime() >= startTs && dateObj.getTime() <= endTs;
-        nodes.forEach(function(node) {{
-          node.style.display = visible ? '' : 'none';
-        }});
-        if (visible && dateObj) {{
-          visibleCount += 1;
-          if (!visibleFirst || dateObj < visibleFirst) {{
-            visibleFirst = dateObj;
-          }}
-          if (!visibleLast || dateObj > visibleLast) {{
-            visibleLast = dateObj;
-          }}
-        }}
-      }});
-
-      if (visibleCount === 0) {{
-        courtDayVisibleRangeLabel.textContent = '无可见日期列';
-        return;
-      }}
-      courtDayVisibleRangeLabel.textContent = `${{formatDateText(visibleFirst)}}-${{formatDateText(visibleLast)}}（共${{visibleCount}}天）`;
-    }}
-
-    function resetDateFilterToDefault() {{
-      const today = normalizeDate(new Date());
-      filterTargetDateInput.value = toDateInputValue(today);
-      filterPastDaysInput.value = '0';
-      filterFutureDaysInput.value = '6';
-      applyCourtDayDateFilter();
-    }}
-
-    function setupCourtDayDateFilter() {{
-      if (!courtDayHeatmap || !filterApplyButton || !filterResetButton) {{
-        return;
-      }}
-      initializeCourtDayColumns();
-      if (!filterPastDaysInput.value) {{
-        filterPastDaysInput.value = '0';
-      }}
-      if (!filterFutureDaysInput.value) {{
-        filterFutureDaysInput.value = '6';
-      }}
-      filterApplyButton.addEventListener('click', function(event) {{
-        event.preventDefault();
-        event.stopPropagation();
-        applyCourtDayDateFilter();
-      }});
-      filterResetButton.addEventListener('click', function(event) {{
-        event.preventDefault();
-        event.stopPropagation();
-        resetDateFilterToDefault();
-      }});
-      [filterTargetDateInput, filterPastDaysInput, filterFutureDaysInput].forEach(function(input) {{
-        input.addEventListener('change', applyCourtDayDateFilter);
-      }});
-      applyCourtDayDateFilter();
-    }}
-
-    const popover = document.getElementById('detail-popover');
-    const timeseriesChart = document.querySelector('svg.chart');
-    const timeseriesHitRadiusPx = 14;
-    const timeseriesPoints = Array.from(document.querySelectorAll('.point.clickable[data-timestamp][data-cx][data-cy]')).map(function(point) {{
-      return {{
-        el: point,
-        timestamp: point.dataset.timestamp,
-        cx: parseFloat(point.dataset.cx || '0'),
-        cy: parseFloat(point.dataset.cy || '0'),
-      }};
-    }});
-
-    function renderList(items) {{
-      const list = Array.isArray(items) ? items : [];
-      if (!list.length) {{
-        return '<p class="meta">暂无可约明细</p>';
-      }}
-      return '<ul>' + list.map(function(item) {{
-        if (typeof item === 'string') {{
-          return '<li>' + item + '</li>';
-        }}
-        if (item && typeof item === 'object') {{
-          const count = Number.isFinite(Number(item.count)) ? Number(item.count) : 1;
-          const countText = '（' + count + '次）';
-          if (
-            typeof item.court === 'number' &&
-            typeof item.date === 'string' &&
-            typeof item.time === 'string'
-          ) {{
-            return '<li>场地 ' + item.court + ' · ' + item.date + ' ' + item.time + countText + '</li>';
-          }}
-          if (typeof item.time === 'string') {{
-            return '<li>' + item.time + countText + '</li>';
-          }}
-        }}
-        return '';
-      }}).join('') + '</ul>';
-    }}
-
-    function safeShowPopover(title, items, event) {{
-      popover.innerHTML = '<h3>' + title + '</h3>' + renderList(items);
-      popover.style.left = '0px';
-      popover.style.top = '0px';
-      popover.classList.add('visible');
-
-      const rect = popover.getBoundingClientRect();
-      const offset = 12;
-      const vw = window.innerWidth || document.documentElement.clientWidth;
-      const vh = window.innerHeight || document.documentElement.clientHeight;
-      let x = (event && typeof event.clientX === 'number' ? event.clientX : 0) + offset;
-      let y = (event && typeof event.clientY === 'number' ? event.clientY : 0) + offset;
-
-      if (x + rect.width + offset > vw) {{
-        x = (event && typeof event.clientX === 'number' ? event.clientX : 0) - rect.width - offset;
-      }}
-      if (y + rect.height + offset > vh) {{
-        y = (event && typeof event.clientY === 'number' ? event.clientY : 0) - rect.height - offset;
-      }}
-
-      x = Math.max(offset, Math.min(x, vw - rect.width - offset));
-      y = Math.max(offset, Math.min(y, vh - rect.height - offset));
-
-      popover.style.left = x + 'px';
-      popover.style.top = y + 'px';
-    }}
-
-    function hidePopover() {{
-      popover.classList.remove('visible');
-      popover.innerHTML = '';
-    }}
-
-    function showTimeseriesPoint(point, event) {{
-      const ts = point.dataset.timestamp;
-      const title = (point.dataset.title || ts) + ' 可约场地';
-      const courts = timeseriesCourtDetails[ts] || [];
-      const list = courts.length ? courts.map(function(court) {{
-        if (court && typeof court === 'object') {{
-          const courtText = Number.isFinite(Number(court.court)) ? Number(court.court) : court.court;
-          const dateText = String(court.date || '');
-          const timeText = String(court.time || '');
-          const count = Number.isFinite(Number(court.count)) ? Number(court.count) : 1;
-          return '场地 ' + courtText + ' · ' + dateText + ' ' + timeText + '（' + count + '次）';
-        }}
-        return '场地 ' + court;
-      }}) : [];
-      safeShowPopover(title, list, event);
-    }}
-
-    function findNearestTimeseriesPoint(event) {{
-      if (!timeseriesChart || !timeseriesPoints.length) {{
-        return null;
-      }}
-      const rect = timeseriesChart.getBoundingClientRect();
-      const viewBox = timeseriesChart.viewBox && timeseriesChart.viewBox.baseVal;
-      if (!rect.width || !rect.height || !viewBox) {{
-        return null;
-      }}
-      let nearest = null;
-      let nearestDistance = Infinity;
-
-      timeseriesPoints.forEach(function(point) {{
-        const px = rect.left + (point.cx / viewBox.width) * rect.width;
-        const py = rect.top + (point.cy / viewBox.height) * rect.height;
-        const dx = event.clientX - px;
-        const dy = event.clientY - py;
-        const distance = dx * dx + dy * dy;
-        if (distance < nearestDistance) {{
-          nearestDistance = distance;
-          nearest = point;
-        }}
-      }});
-
-      if (nearestDistance <= timeseriesHitRadiusPx * timeseriesHitRadiusPx) {{
-        return nearest;
-      }}
-      return null;
-    }}
-
-    document.querySelectorAll('.heat-cell.clickable[data-type][data-key]').forEach(function(cell) {{
-      cell.addEventListener('click', function(event) {{
-        event.preventDefault();
-        event.stopPropagation();
-        const type = cell.dataset.type;
-        const key = cell.dataset.key;
-        const title = cell.dataset.title || '可约明细';
-        const detail = type === 'hour-court' ? hourCourtDetails[key] : courtDayDetails[key];
-        safeShowPopover(title, detail, event);
-      }});
-    }});
-
-    document.querySelectorAll('.point.clickable[data-timestamp]').forEach(function(point) {{
-      point.addEventListener('click', function(event) {{
-        event.preventDefault();
-        event.stopPropagation();
-        showTimeseriesPoint(point, event);
-      }});
-    }});
-
-    if (timeseriesChart) {{
-      timeseriesChart.addEventListener('click', function(event) {{
-        if (event.target.classList && event.target.classList.contains('point')) {{
-          return;
-        }}
-        const nearest = findNearestTimeseriesPoint(event);
-        if (!nearest) {{
-          return;
-        }}
-        event.preventDefault();
-        event.stopPropagation();
-        showTimeseriesPoint(nearest.el, event);
-      }});
-    }}
-
-    setupCourtDayDateFilter();
-    document.body.addEventListener('click', hidePopover);
-  </script>
+  <script src="availability_analytics_data_index.js"></script>
+  <script src="availability_analytics_report_loader.js"></script>
 </body>
 </html>
 """
@@ -1221,7 +935,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--courts", type=str, default="")
     parser.add_argument("--slots", type=str, default="")
     parser.add_argument("--cache-ttl-seconds", type=int, default=availability_analytics.DEFAULT_CACHE_TTL_SECONDS)
-    parser.add_argument("--output", default="availability_analytics_report.html")
+    parser.add_argument("--output", default="availability_analytics_report_bundle/availability_analytics_report.html")
+    parser.add_argument("--data-dir", default="availability_analytics_report_bundle/availability_analytics_data")
+    parser.add_argument("--data-index", default="availability_analytics_report_bundle/availability_analytics_data_index.json")
     args = parser.parse_args()
     args.courts = parse_int_list(args.courts)
     args.slots = parse_slots(args.slots)
@@ -1230,10 +946,64 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    data_payload = build_data_payload(args)
     html_content = build_html(args)
     output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(html_content, encoding="utf-8")
+
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    generated_at = datetime.now(tz=availability_analytics.LOCAL_TZ)
+    snapshot_name = f"availability_analytics_data_{generated_at.strftime('%Y%m%dT%H%M%S')}.json"
+    snapshot_path = data_dir / snapshot_name
+    data_payload["updated_at"] = generated_at.isoformat()
+    snapshot_path.write_text(json.dumps(data_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    index_path = Path(args.data_index)
+    index_dir = index_path.parent
+    snapshot_js_path = snapshot_path.with_suffix(".js")
+
+    try:
+        latest_data_path = str(snapshot_path.relative_to(index_dir))
+    except ValueError:
+        latest_data_path = str(snapshot_path)
+
+    try:
+        latest_data_js_path = str(snapshot_js_path.relative_to(index_dir))
+    except ValueError:
+        latest_data_js_path = str(snapshot_js_path)
+
+    index_payload = {
+        "schema_version": 1,
+        "generated_at": generated_at.isoformat(),
+        "latest_data_path": latest_data_path,
+        "latest_data_js_path": latest_data_js_path,
+        "source_signature": data_payload.get("source_signature"),
+        "request": data_payload.get("request", {}),
+        "cache": data_payload.get("cache", {}),
+    }
+    snapshot_js_content = "window.__AVAILABILITY_ANALYTICS_DATA__ = " + json.dumps(
+        data_payload,
+        ensure_ascii=False,
+        indent=2,
+    ) + ";\n"
+    snapshot_js_path.write_text(snapshot_js_content, encoding="utf-8")
+
+    index_path.write_text(json.dumps(index_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    index_js_path = index_path.with_suffix(".js")
+    index_js_content = "window.__AVAILABILITY_ANALYTICS_INDEX__ = " + json.dumps(
+        index_payload,
+        ensure_ascii=False,
+        indent=2,
+    ) + ";\n"
+    index_js_path.write_text(index_js_content, encoding="utf-8")
+
     print(str(output))
+    print(str(snapshot_path))
+    print(str(snapshot_js_path))
+    print(str(index_js_path))
+    print(str(index_path))
 
 
 if __name__ == "__main__":

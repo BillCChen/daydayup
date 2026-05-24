@@ -23,10 +23,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 
-from network_alias import install_host_aliases_from_env
+from network_alias import DEFAULT_HOST_ALIASES, install_host_aliases_with_defaults
 
 
-install_host_aliases_from_env()
+install_host_aliases_with_defaults(default_aliases=DEFAULT_HOST_ALIASES)
 
 
 DEFAULT_BASE_URL = "https://www.147soft.cn/easyserpClient"

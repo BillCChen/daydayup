@@ -1,24 +1,28 @@
-# Web Service
+# Web Service (Server Deployment)
 
-Local URL:
+Production is deployed on the remote server (`a55002`) and managed there.
 
-```bash
-http://127.0.0.1:8789
-```
-
-Start once:
+Server URL (service on remote host):
 
 ```bash
-uv run python web_console.py --host 127.0.0.1 --port 8789
+http://127.0.0.1:8789 on a55002
 ```
 
-The Web service is the control plane. It does not run scan tasks unless started with `--scan-worker`.
+Start on server:
 
-Start scan worker once:
+- SSH to `a55002`, then run `uv run python web_console.py --host 127.0.0.1 --port 8789`
+- The service auto-configures `www.147soft.cn` host alias fallback, so starting command itself is enough for normal environments. Set `DAYDAYUP_HOST_ALIASES` only when you need a custom mapping.
+- Start scan worker in an isolated tmux process: `./scripts/daydayup_tmux.sh start`
+  - This starts:
+    - `daydayup-web`: `web_console.py`
+    - `daydayup-scan`: `scan_worker.py`
+- Control helper:
+  - `./scripts/daydayup_tmux.sh stop`
+  - `./scripts/daydayup_tmux.sh restart`
+  - `./scripts/daydayup_tmux.sh status`
+- The Web service is the control plane. It does not run scan tasks unless started with `--scan-worker`.
 
-```bash
-uv run python scan_worker.py
-```
+Local `launchctl` setup is not used for production anymore.
 
 Check port:
 
@@ -32,30 +36,7 @@ Stop port process:
 lsof -tiTCP:8789 -sTCP:LISTEN | xargs -r kill
 ```
 
-Run as macOS background service:
-
-```bash
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.billchen.daydayup.webconsole.plist"
-launchctl enable "gui/$(id -u)/com.billchen.daydayup.webconsole"
-launchctl kickstart -k "gui/$(id -u)/com.billchen.daydayup.webconsole"
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.billchen.daydayup.scanworker.plist"
-launchctl enable "gui/$(id -u)/com.billchen.daydayup.scanworker"
-launchctl kickstart -k "gui/$(id -u)/com.billchen.daydayup.scanworker"
-```
-
-Pause background service:
-
-```bash
-launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.billchen.daydayup.webconsole.plist"
-launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.billchen.daydayup.scanworker.plist"
-```
-
-Service config:
-
-```bash
-$HOME/Library/LaunchAgents/com.billchen.daydayup.webconsole.plist
-$HOME/Library/LaunchAgents/com.billchen.daydayup.scanworker.plist
-```
+Production service lifecycle is controlled in the remote environment (not local host).
 
 Local user CSV:
 
