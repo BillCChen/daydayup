@@ -137,17 +137,12 @@
           </div>
 
           <form class="scan-form" id="scanTaskForm">
-            <label>
-              <span>任务名称</span>
-              <input name="name" type="text" autocomplete="off" placeholder="晚场捡漏" />
-            </label>
-
             <div class="touch-field">
               <div class="field-head">
                 <span>小目标</span>
-                <button class="button secondary compact" id="addScanTarget" type="button">添加目标</button>
               </div>
               <div class="scan-target-list" id="scanTargetList"></div>
+              <button class="button secondary compact" id="addScanTarget" type="button">添加目标</button>
             </div>
 
             <div class="scan-grid">
@@ -174,6 +169,11 @@
                 <input name="selected_courts" type="text" autocomplete="off" value="2 3 4 6 7 8 9 10 11" />
               </label>
             </div>
+
+            <label>
+              <span>任务名称</span>
+              <input name="name" type="text" autocomplete="off" placeholder="晚场捡漏" />
+            </label>
 
             <div class="option-grid">
               <div class="option-card">
@@ -321,7 +321,10 @@
               <p class="eyebrow">History</p>
               <h2 id="bookingHistoryTitle">历史预约</h2>
             </div>
-            <button class="button secondary compact" id="refreshBookingHistory" type="button">刷新历史</button>
+            <div class="section-actions">
+              <div class="log-window-control" data-log-window-control aria-label="历史预约时间窗"></div>
+              <button class="button secondary compact" id="refreshBookingHistory" type="button">刷新历史</button>
+            </div>
           </div>
           <div class="history-list" id="bookingHistoryList">
             <div class="empty-state">还没有通过操作台发起过预约。</div>
@@ -334,7 +337,10 @@
               <p class="eyebrow">Log</p>
               <h2 id="logsTitle">预约成功/失败日志</h2>
             </div>
-            <span class="chip" id="jobState">空闲</span>
+            <div class="section-actions">
+              <div class="log-window-control" data-log-window-control aria-label="页面日志时间窗"></div>
+              <span class="chip" id="jobState">空闲</span>
+            </div>
           </div>
           <div class="log-stream" id="logStream" aria-live="polite"></div>
         </section>
@@ -440,6 +446,24 @@
         </div>
       </div>
     </div>
+
+    <aside class="release-notice hidden" id="releaseNotice" role="dialog" aria-modal="false" aria-labelledby="releaseNoticeTitle" aria-describedby="releaseNoticeBody">
+      <div class="release-notice-head">
+        <div>
+          <p class="eyebrow">Update</p>
+          <h2 id="releaseNoticeTitle">本次界面与抢订流程已更新</h2>
+        </div>
+        <span class="release-notice-count" id="releaseNoticeCount">1 / 4</span>
+      </div>
+      <div class="release-progress" aria-hidden="true" id="releaseNoticeProgress"></div>
+      <div class="release-notice-body" id="releaseNoticeBody"></div>
+      <div class="release-notice-actions">
+        <button class="button secondary compact" id="releaseNoticeBack" type="button">上一页</button>
+        <button class="button primary compact" id="releaseNoticeNext" type="button">下一页</button>
+        <button class="button secondary compact hidden" id="releaseNoticeClose" type="button">本次关闭</button>
+        <button class="button primary compact hidden" id="releaseNoticeDismiss" type="button">以后不再提醒</button>
+      </div>
+    </aside>
 
     <script src="/app.js" defer></script>
   </body>

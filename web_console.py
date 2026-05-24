@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 import json
 import os
 import re
@@ -73,6 +74,9 @@ SCAN_DEFAULT_INTERVAL_MINUTES = 30
 SCAN_SILENT_START = datetime_time(11, 30)
 SCAN_SILENT_END = datetime_time(12, 30)
 SCAN_SUMMARY_TIME = datetime_time(22, 0)
+LOG_WINDOW_CHOICES_HOURS = {6, 12, 24, 168}
+LOG_DEFAULT_WINDOW_HOURS = 6
+LOG_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
 @dataclass
@@ -276,9 +280,16 @@ class BookingHistoryStore:
         self.path = path
         self.lock = threading.Lock()
 
-    def list(self, limit: int = 30) -> list[dict[str, Any]]:
+    def list(self, limit: int = 30, window_hours: int | None = LOG_DEFAULT_WINDOW_HOURS) -> list[dict[str, Any]]:
         with self.lock:
             records = self._read_unlocked()
+            retained = self._retained_records(records)
+            if len(retained) != len(records):
+                self._write_unlocked(retained)
+            records = retained
+        cutoff = log_window_cutoff_ts(window_hours)
+        if cutoff is not None:
+            records = [record for record in records if self._record_ts(record) >= cutoff]
         records.sort(key=lambda item: item.get("requested_ts", 0), reverse=True)
         return records[:limit]
 
@@ -358,10 +369,19 @@ class BookingHistoryStore:
         return [item for item in data if isinstance(item, dict)]
 
     def _write_unlocked(self, records: list[dict[str, Any]]) -> None:
+        records = self._retained_records(records)
+        records.sort(key=lambda item: self._record_ts(item))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(records[-200:], ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_path.replace(self.path)
+
+    def _retained_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        cutoff = time.time() - LOG_RETENTION_SECONDS
+        return [record for record in records if self._record_ts(record) >= cutoff]
+
+    def _record_ts(self, record: dict[str, Any]) -> float:
+        return numeric_ts(record.get("requested_ts")) or parse_log_datetime(record.get("requested_at")) or parse_log_datetime(record.get("finished_at")) or 0.0
 
 
 class JobManager:
@@ -441,6 +461,20 @@ class JobManager:
             job.history_finalized = True
 
 
+class FileLock:
+    def __init__(self, handle: Any):
+        self.handle = handle
+
+    def __enter__(self) -> "FileLock":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        try:
+            fcntl.flock(self.handle, fcntl.LOCK_UN)
+        finally:
+            self.handle.close()
+
+
 class JsonStore:
     def __init__(self, path: Path, default: Any):
         self.path = path
@@ -449,11 +483,20 @@ class JsonStore:
 
     def read(self) -> Any:
         with self.lock:
-            return self._read_unlocked()
+            with self._file_lock_unlocked():
+                return self._read_unlocked()
 
     def write(self, value: Any) -> None:
         with self.lock:
-            self._write_unlocked(value)
+            with self._file_lock_unlocked():
+                self._write_unlocked(value)
+
+    def _file_lock_unlocked(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        handle = lock_path.open("a+", encoding="utf-8")
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        return FileLock(handle)
 
     def _read_unlocked(self) -> Any:
         if not self.path.exists():
@@ -482,25 +525,47 @@ class ScanTaskStore(JsonStore):
     def save_all(self, tasks: list[dict[str, Any]]) -> None:
         self.write({"tasks": tasks[-200:]})
 
+    def mutate(self, update: Any) -> Any:
+        with self.lock:
+            with self._file_lock_unlocked():
+                data = self._read_unlocked()
+                tasks = data.get("tasks", []) if isinstance(data, dict) else []
+                tasks = [task for task in tasks if isinstance(task, dict)]
+                result = update(tasks)
+                if result is not False:
+                    self._write_unlocked({"tasks": tasks[-200:]})
+                return result
+
 
 class ScanEventStore(JsonStore):
     def __init__(self, path: Path):
         super().__init__(path, {"events": []})
 
-    def list(self, limit: int = 80) -> list[dict[str, Any]]:
-        data = self.read()
-        events = data.get("events", []) if isinstance(data, dict) else []
-        valid = [event for event in events if isinstance(event, dict)]
+    def list(self, limit: int = 80, window_hours: int | None = None) -> list[dict[str, Any]]:
+        with self.lock:
+            with self._file_lock_unlocked():
+                data = self._read_unlocked()
+                events = data.get("events", []) if isinstance(data, dict) else []
+                events = [event for event in events if isinstance(event, dict)]
+                retained = self._retained_events(events)
+                if len(retained) != len(events):
+                    self._write_unlocked({"events": retained[-500:]})
+                valid = retained
+        cutoff = log_window_cutoff_ts(window_hours)
+        if cutoff is not None:
+            valid = [event for event in valid if self._event_ts(event) >= cutoff]
         valid.sort(key=lambda item: item.get("created_ts", 0), reverse=True)
         return valid[:limit]
 
     def append(self, event: dict[str, Any]) -> None:
         with self.lock:
-            data = self._read_unlocked()
-            events = data.get("events", []) if isinstance(data, dict) else []
-            events = [item for item in events if isinstance(item, dict)]
-            events.append(event)
-            self._write_unlocked({"events": events[-500:]})
+            with self._file_lock_unlocked():
+                data = self._read_unlocked()
+                events = data.get("events", []) if isinstance(data, dict) else []
+                events = [item for item in events if isinstance(item, dict)]
+                events.append(event)
+                events = self._retained_events(events)
+                self._write_unlocked({"events": events[-500:]})
 
     def recent_important(self, since_ts: float) -> list[dict[str, Any]]:
         events = self.list(limit=500)
@@ -516,26 +581,41 @@ class ScanEventStore(JsonStore):
             for event in self.list(limit=120)
         )
 
+    def _retained_events(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        cutoff = time.time() - LOG_RETENTION_SECONDS
+        return [event for event in events if self._event_ts(event) >= cutoff]
+
+    def _event_ts(self, event: dict[str, Any]) -> float:
+        return numeric_ts(event.get("created_ts")) or parse_log_datetime(event.get("created_at")) or 0.0
+
 
 class ScanTaskManager:
-    def __init__(self, app: "WebConsole"):
+    def __init__(self, app: "WebConsole", *, start_worker: bool = True):
         self.app = app
         self.tasks = ScanTaskStore(SCAN_TASKS_PATH)
         self.events = ScanEventStore(SCAN_EVENTS_PATH)
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        if start_worker:
+            self.start()
+
+    def start(self) -> None:
+        if self.thread and self.thread.is_alive():
+            return
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
     def close(self) -> None:
         self.stop_event.set()
-        self.thread.join(timeout=2)
+        if self.thread:
+            self.thread.join(timeout=2)
 
-    def snapshot(self, user_key: str = "") -> dict[str, Any]:
+    def snapshot(self, user_key: str = "", event_window_hours: int = LOG_DEFAULT_WINDOW_HOURS) -> dict[str, Any]:
         tasks = self.tasks.list()
         if user_key:
             tasks = [task for task in tasks if clean_string(task.get("user_key")) == user_key]
-        events = self.events.list(limit=80)
+        events = self.events.list(limit=80, window_hours=event_window_hours)
         if user_key:
             events = [
                 event
@@ -555,10 +635,11 @@ class ScanTaskManager:
         task["created_at"] = format_datetime(now)
         task["updated_at"] = task["created_at"]
         task["next_scan_at"] = format_datetime(next_scan_time_for_task(task, now))
-        with self.lock:
-            tasks = self.tasks.list()
+        def append_task(tasks: list[dict[str, Any]]) -> None:
             tasks.append(task)
-            self.tasks.save_all(tasks)
+
+        with self.lock:
+            self.tasks.mutate(append_task)
         self.record_event(
             task,
             "task_created",
@@ -574,8 +655,7 @@ class ScanTaskManager:
         action = clean_string(payload.get("action"))
         if action not in {"pause", "resume", "stop"}:
             raise EasySerpError("invalid scan task action")
-        with self.lock:
-            tasks = self.tasks.list()
+        def update_task(tasks: list[dict[str, Any]]) -> dict[str, Any]:
             task = next((item for item in tasks if item.get("id") == task_id), None)
             if not task:
                 raise EasySerpError("scan task was not found")
@@ -593,7 +673,10 @@ class ScanTaskManager:
                     raise EasySerpError("only active or paused scan tasks can be stopped")
                 task["status"] = "stopped"
             task["updated_at"] = format_datetime(datetime.now())
-            self.tasks.save_all(tasks)
+            return task
+
+        with self.lock:
+            task = self.tasks.mutate(update_task)
         self.record_event(
             task,
             f"task_{action}",
@@ -606,16 +689,23 @@ class ScanTaskManager:
 
     def _loop(self) -> None:
         while not self.stop_event.wait(30):
-            try:
-                self.scan_due_tasks()
-                self.send_daily_summary_if_due()
-            except Exception as exc:
-                self.events.append(make_scan_event(None, "scan_loop_error", "扫描循环异常", redact_sensitive_text(exc), important=True))
+            self.run_pending_cycle()
+
+    def run_forever(self, interval_seconds: float = 30.0) -> None:
+        while True:
+            self.run_pending_cycle()
+            time.sleep(interval_seconds)
+
+    def run_pending_cycle(self) -> None:
+        try:
+            self.scan_due_tasks()
+            self.send_daily_summary_if_due()
+        except Exception as exc:
+            self.events.append(make_scan_event(None, "scan_loop_error", "扫描循环异常", redact_sensitive_text(exc), important=True))
 
     def scan_due_tasks(self, now: datetime | None = None) -> None:
         now = now or datetime.now()
-        with self.lock:
-            tasks = self.tasks.list()
+        def scan_tasks(tasks: list[dict[str, Any]]) -> bool:
             changed = False
             for task in tasks:
                 if task.get("status") != "active":
@@ -625,8 +715,10 @@ class ScanTaskManager:
                     continue
                 self.process_task(task, now)
                 changed = True
-            if changed:
-                self.tasks.save_all(tasks)
+            return changed
+
+        with self.lock:
+            self.tasks.mutate(scan_tasks)
 
     def process_task(self, task: dict[str, Any], now: datetime) -> None:
         if quiet_window_active(now):
@@ -936,6 +1028,13 @@ def clean_string(value: Any) -> str:
     return str(value).strip()
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def clean_user_key(value: Any) -> str:
     text = clean_string(value).lower()
     text = re.sub(r"[^a-z0-9_]+", "_", text)
@@ -1087,6 +1186,34 @@ def int_or_default(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def parse_log_window_hours(value: Any) -> int:
+    hours = int_or_default(value, LOG_DEFAULT_WINDOW_HOURS)
+    return hours if hours in LOG_WINDOW_CHOICES_HOURS else LOG_DEFAULT_WINDOW_HOURS
+
+
+def log_window_cutoff_ts(window_hours: int | None) -> float | None:
+    if window_hours is None:
+        return None
+    return time.time() - max(0, window_hours) * 60 * 60
+
+
+def numeric_ts(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_log_datetime(value: Any) -> float:
+    text = clean_string(value)
+    if not text:
+        return 0.0
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        return 0.0
 
 
 def parse_datetime(value: str) -> datetime | None:
@@ -1380,12 +1507,12 @@ def send_scan_email(subject: str, body: str) -> None:
 
 
 class WebConsole:
-    def __init__(self, config: ServerConfig, users: UserStore):
+    def __init__(self, config: ServerConfig, users: UserStore, *, start_scan_worker: bool = True):
         self.config = config
         self.users = users
         self.history = BookingHistoryStore(HISTORY_PATH)
         self.jobs = JobManager(config, self.history)
-        self.scans = ScanTaskManager(self)
+        self.scans = ScanTaskManager(self, start_worker=start_scan_worker)
 
     def close(self) -> None:
         self.scans.close()
@@ -1724,8 +1851,8 @@ class WebConsole:
         result["history_id"] = self.history.create_exact({"slots": slots}, result, user)
         return result
 
-    def booking_history(self, user_key: str = "") -> dict[str, Any]:
-        history = self.history.list()
+    def booking_history(self, user_key: str = "", log_window_hours: int = LOG_DEFAULT_WINDOW_HOURS) -> dict[str, Any]:
+        history = self.history.list(window_hours=log_window_hours)
         if user_key:
             default_key = self.users.get_user("").key
             history = [
@@ -1735,8 +1862,8 @@ class WebConsole:
             ]
         return {"history": history, "updated_at": time.time()}
 
-    def scan_tasks(self, user_key: str = "") -> dict[str, Any]:
-        return self.scans.snapshot(clean_string(user_key))
+    def scan_tasks(self, user_key: str = "", log_window_hours: int = LOG_DEFAULT_WINDOW_HOURS) -> dict[str, Any]:
+        return self.scans.snapshot(clean_string(user_key), event_window_hours=log_window_hours)
 
     def create_scan_task(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.scans.create(payload)
@@ -2298,7 +2425,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/booking/history":
             if not self.authorized():
                 return
-            self.write_json(app.booking_history(single_query(query, "user_key")))
+            self.write_json(
+                app.booking_history(
+                    single_query(query, "user_key"),
+                    log_window_hours=parse_log_window_hours(single_query(query, "log_window_hours")),
+                )
+            )
         elif parsed.path == "/api/booking/job":
             if not self.authorized():
                 return
@@ -2306,7 +2438,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/scan/tasks":
             if not self.authorized():
                 return
-            self.write_json(app.scan_tasks(single_query(query, "user_key")))
+            self.write_json(
+                app.scan_tasks(
+                    single_query(query, "user_key"),
+                    log_window_hours=parse_log_window_hours(single_query(query, "log_window_hours")),
+                )
+            )
         elif parsed.path == "/":
             self.serve_static(WEB_DIR / "index.html", "text/html; charset=utf-8")
         elif parsed.path in ("/app.js", "/styles.css"):
@@ -2409,6 +2546,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="EasySERP API base URL")
     parser.add_argument("--timeout", type=float, default=10.0, help="request timeout in seconds")
     parser.add_argument("--users-csv", default=str(USERS_PATH), help="local users CSV path")
+    parser.add_argument(
+        "--scan-worker",
+        action="store_true",
+        default=env_flag("DAYDAYUP_WEB_SCAN_WORKER"),
+        help="run scan tasks inside the web service process",
+    )
     return parser.parse_args()
 
 
@@ -2421,7 +2564,7 @@ def main() -> int:
     )
     users = UserStore(Path(args.users_csv), default_token=args.token, default_jsessionid=args.jsessionid)
     httpd = ThreadingHTTPServer((args.host, args.port), RequestHandler)
-    httpd.console = WebConsole(config, users)  # type: ignore[attr-defined]
+    httpd.console = WebConsole(config, users, start_scan_worker=args.scan_worker)  # type: ignore[attr-defined]
     print(f"Daydayup web console running at http://{args.host}:{args.port}")
     print(f"Users CSV={users.path}")
     print(f"Enabled users={len(users.enabled_users())}")

@@ -108,6 +108,232 @@ class FastBookingModeTest(unittest.TestCase):
         self.assertEqual({item["hour"] for item in candidates}, {17, 19})
         self.assertEqual(candidates[0]["court_id"], "ymq7")
 
+    def test_direct_speculative_adjacent_candidates_use_three_priority_courts_per_neighbor(self):
+        bot = smart.SmartBookingBotV2(
+            make_args(time="18-21", priority=[7, 8, 9, 1], backup=[2, 3])
+        )
+        first_candidates = bot.generate_direct_first_candidates()
+        center = first_candidates[0]
+        center_candidates = bot.generate_direct_speculative_center_candidates(first_candidates, center["hour"])
+        adjacent_candidates = bot.generate_direct_speculative_adjacent_candidates(center["hour"])
+
+        self.assertEqual(center["hour"], 19)
+        self.assertEqual(
+            [(item["hour"], item["court_id"]) for item in center_candidates],
+            [
+                (19, "ymq7"),
+                (19, "ymq8"),
+                (19, "ymq9"),
+            ],
+        )
+        self.assertEqual(
+            [(item["hour"], item["court_id"]) for item in adjacent_candidates],
+            [
+                (18, "ymq7"),
+                (18, "ymq8"),
+                (18, "ymq9"),
+                (20, "ymq7"),
+                (20, "ymq8"),
+                (20, "ymq9"),
+            ],
+        )
+
+    def test_direct_speculative_mode_starts_adjacent_before_center_returns(self):
+        bot = smart.SmartBookingBotV2(
+            make_args(
+                time="18-21",
+                booking_mode=smart.BOOKING_MODE_DIRECT_FAST,
+                dry_run=False,
+                step_sleep=0,
+            )
+        )
+        center_started = threading.Event()
+        center_released = threading.Event()
+        center_finished = threading.Event()
+        adjacent_started_before_center_finished = threading.Event()
+        calls = []
+        calls_lock = threading.Lock()
+
+        def fake_attempt(candidate, label, round_index, candidate_index, candidate_total, client=None, failure_stats=None):
+            with calls_lock:
+                calls.append((label, candidate["hour"]))
+            if label.startswith("direct_spec_center"):
+                center_started.set()
+                center_released.wait(1.0)
+                center_finished.set()
+                return "success"
+            if center_started.is_set() and not center_finished.is_set():
+                adjacent_started_before_center_finished.set()
+            return "business_fail"
+
+        bot.attempt_single_hour_booking = fake_attempt
+        bot.run_direct_second_stage = lambda guide_state=None: "failed"
+        results = []
+        thread = threading.Thread(target=lambda: results.append(bot.run_direct_mode()))
+        thread.start()
+
+        self.assertTrue(center_started.wait(0.2))
+        self.assertTrue(adjacent_started_before_center_finished.wait(0.2))
+        self.assertFalse(center_finished.is_set())
+        center_released.set()
+        thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(any(label.startswith("direct_spec_center") and hour == 19 for label, hour in calls))
+        self.assertTrue(any(label.startswith("direct_spec_") and hour in (18, 20) for label, hour in calls))
+        self.assertEqual(results, ["failed"])
+
+    def test_direct_speculative_mode_attempts_three_center_courts_initially(self):
+        bot = smart.SmartBookingBotV2(
+            make_args(
+                time="18-21",
+                booking_mode=smart.BOOKING_MODE_DIRECT_FAST,
+                dry_run=False,
+                step_sleep=0,
+            )
+        )
+        calls = []
+
+        def fake_attempt(candidate, label, round_index, candidate_index, candidate_total, client=None, failure_stats=None):
+            calls.append((label, candidate["hour"], candidate["court_id"]))
+            return "business_fail"
+
+        bot.attempt_single_hour_booking = fake_attempt
+
+        self.assertEqual(bot.run_direct_mode(), "failed")
+        self.assertEqual(
+            [(hour, court_id) for label, hour, court_id in calls if label.startswith("direct_spec_center")],
+            [
+                (19, "ymq7"),
+                (19, "ymq8"),
+                (19, "ymq9"),
+            ],
+        )
+
+    def test_direct_speculative_mode_uses_adjacent_success_as_anchor_when_center_fails(self):
+        bot = smart.SmartBookingBotV2(
+            make_args(
+                time="18-21",
+                booking_mode=smart.BOOKING_MODE_DIRECT_FAST,
+                dry_run=False,
+                step_sleep=0,
+            )
+        )
+        second_stage_anchors = []
+
+        def fake_attempt(candidate, label, round_index, candidate_index, candidate_total, client=None, failure_stats=None):
+            if label.startswith("direct_spec_left") and candidate["hour"] == 18 and candidate["court_id"] == "ymq7":
+                return "success"
+            return "business_fail"
+
+        def fake_second_stage(guide_state=None):
+            second_stage_anchors.append(bot.first_booking)
+            return "success"
+
+        bot.attempt_single_hour_booking = fake_attempt
+        bot.run_direct_second_stage = fake_second_stage
+
+        self.assertEqual(bot.run_direct_mode(), "success")
+        self.assertEqual(bot.first_booking["hour"], 18)
+        self.assertEqual(bot.first_booking["court_id"], "ymq7")
+        self.assertEqual([item["hour"] for item in second_stage_anchors], [18])
+
+    def test_direct_speculative_mode_finishes_when_initial_batch_has_contiguous_pair(self):
+        bot = smart.SmartBookingBotV2(
+            make_args(
+                time="18-21",
+                booking_mode=smart.BOOKING_MODE_DIRECT_FAST,
+                dry_run=False,
+                step_sleep=0,
+            )
+        )
+        second_stage_called = threading.Event()
+
+        def fake_attempt(candidate, label, round_index, candidate_index, candidate_total, client=None, failure_stats=None):
+            if label.startswith("direct_spec_center"):
+                return "success"
+            if label.startswith("direct_spec_left") and candidate["hour"] == 18 and candidate["court_id"] == "ymq7":
+                return "success"
+            return "business_fail"
+
+        def fake_second_stage(guide_state=None):
+            second_stage_called.set()
+            return "failed"
+
+        bot.attempt_single_hour_booking = fake_attempt
+        bot.run_direct_second_stage = fake_second_stage
+
+        self.assertEqual(bot.run_direct_mode(), "success")
+        self.assertFalse(second_stage_called.is_set())
+        self.assertEqual([bot.first_booking["hour"], bot.second_booking["hour"]], [18, 19])
+
+    def test_direct_speculative_dry_run_only_attempts_center_candidate(self):
+        bot = smart.SmartBookingBotV2(
+            make_args(
+                time="18-21",
+                booking_mode=smart.BOOKING_MODE_DIRECT_FAST,
+                dry_run=True,
+            )
+        )
+        calls = []
+
+        def fake_attempt(candidate, label, round_index, candidate_index, candidate_total, client=None, failure_stats=None):
+            calls.append((label, candidate["hour"]))
+            return "dry_run"
+
+        bot.attempt_single_hour_booking = fake_attempt
+
+        self.assertEqual(bot.run_direct_mode(), "dry_run")
+        self.assertEqual(calls, [("direct_spec_center", 19)])
+
+    def test_reservation_place_fast_retry_keeps_same_candidate(self):
+        bot = smart.SmartBookingBotV2(
+            make_args(
+                booking_mode=smart.BOOKING_MODE_DIRECT_FAST,
+                dry_run=False,
+                step_sleep=0,
+            )
+        )
+        candidate = bot._synthetic_candidate(19, "ymq7")
+        sleeps = []
+
+        class FakeClient:
+            def __init__(self):
+                self.reservation_attempts = 0
+
+            def request(self, method, endpoint, *, params=None, data=None, timeout=None, label=""):
+                if endpoint == "/place/reservationPlace":
+                    self.reservation_attempts += 1
+                    if self.reservation_attempts == 1:
+                        return smart.HttpResult(
+                            status=200,
+                            text="",
+                            elapsed=0.01,
+                            json_data={"msg": "fail", "data": "操作过快,请稍后重试。"},
+                        )
+                return smart.HttpResult(
+                    status=200,
+                    text="",
+                    elapsed=0.01,
+                    json_data={"msg": "success", "data": ""},
+                )
+
+        fake_client = FakeClient()
+        bot._sleep_after_fast_retry = lambda: sleeps.append(0.8)
+
+        result = bot.attempt_single_hour_booking(
+            candidate,
+            "direct_second",
+            1,
+            1,
+            1,
+            client=fake_client,
+        )
+
+        self.assertEqual(result, "success")
+        self.assertEqual(fake_client.reservation_attempts, 2)
+        self.assertEqual(sleeps, [0.8])
+
     def test_guided_sort_uses_snapshot_and_failures(self):
         state = smart.GuidedBookingState({"ymq7": 0, "ymq8": 1})
         base = [

@@ -4,6 +4,8 @@ const state = {
   selectedBill: "",
   jobTimer: null,
   lastJobLineCount: 0,
+  uiLogs: [],
+  logWindowHours: 6,
   availabilityLoading: false,
   availabilityDays: [],
   selectedAvailabilitySlots: [],
@@ -27,13 +29,82 @@ const state = {
   selectedUserKey: "",
   userManagementUnlocked: false,
   adminPassword: "",
+  releaseNoticePage: 0,
+  releaseNoticeShown: false,
 };
 
 const SAFE_COURTS = [2, 3, 4, 6, 7, 8, 9, 10, 11];
 const WALL_COURTS = [4, 5, 12];
 const ALL_COURTS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+const VISIBLE_SCAN_TASK_STATUSES = new Set(["active", "paused"]);
+const LOG_WINDOW_OPTIONS = [
+  { hours: 6, label: "6 小时" },
+  { hours: 12, label: "12 小时" },
+  { hours: 24, label: "24 小时" },
+  { hours: 168, label: "一周" },
+];
+const LOG_RETENTION_HOURS = 168;
+const LOG_STORAGE_KEY = "daydayupLogWindowHours";
+const RELEASE_NOTICE_STORAGE_KEY = "daydayupInitialReleaseNotice20260524";
+const RELEASE_NOTICE_MAX_SHOWS = 3;
+const RELEASE_NOTICE_PAGES = [
+  {
+    label: "概览",
+    title: "更新目标",
+    tone: "warning",
+    body: `
+      <p class="release-lede">这次更新把页面空间、扫描执行和高峰抢订放在同一条操作链里优化，目标是打开 Web 服务后更快看到当前状态，更少被无效信息打断。</p>
+      <div class="release-tag-row">
+        <span>紧凑排版</span>
+        <span>扫描精简</span>
+        <span>独立执行</span>
+        <span>快速直抢</span>
+      </div>
+    `,
+  },
+  {
+    label: "界面",
+    title: "首屏空间更集中",
+    tone: "info",
+    body: `
+      <ul class="release-point-list">
+        <li><strong>可约分布纵向排列。</strong><span>没有可约场地时保持低高度，只有多个可约场地时才自然展开。</span></li>
+        <li><strong>扫描预约紧凑化。</strong><span>目标、时间、场地范围和条件控件压缩为更短的扫描路径。</span></li>
+        <li><strong>活跃预约单行展示。</strong><span>保留日期、时段、场地、状态和操作入口，减少重复描述。</span></li>
+        <li><strong>日志可选时间窗口。</strong><span>默认聚焦最近记录，需要回看时再切换到更长范围。</span></li>
+      </ul>
+    `,
+  },
+  {
+    label: "扫描",
+    title: "当前任务更清楚",
+    tone: "success",
+    body: `
+      <ul class="release-point-list">
+        <li><strong>只显示扫描中任务。</strong><span>已完成、已过期或已停止的任务不再占据主任务列表。</span></li>
+        <li><strong>扫描 worker 可独立运行。</strong><span>后台扫描不必绑死在 Web 服务进程里，部署和重启边界更清晰。</span></li>
+        <li><strong>本地文件写入加锁。</strong><span>Web 服务和扫描 worker 同时读写任务与事件时，降低状态互相覆盖的风险。</span></li>
+      </ul>
+    `,
+  },
+  {
+    label: "抢订",
+    title: "高峰执行更主动",
+    tone: "warning",
+    body: `
+      <ul class="release-point-list">
+        <li><strong>快速直抢增加两小时投机策略。</strong><span>中间小时和相邻小时候选会更早并发尝试。</span></li>
+        <li><strong>操作过快自动重试。</strong><span>遇到平台提示“操作过快”时，短暂等待后重试同一候选。</span></li>
+        <li><strong>默认 host alias。</strong><span>减少 DNS 或连接波动对抢订请求的影响。</span></li>
+      </ul>
+      <p class="release-outcome">预期效果：首屏信息更密，扫描判断更快，高峰抢订更稳，后台任务也更容易单独维护。</p>
+    `,
+  },
+];
 const MIN_HOUR = 8;
 const MAX_HOUR = 23;
+
+state.logWindowHours = readStoredLogWindowHours();
 
 const els = {
   authScreen: document.querySelector("#authScreen"),
@@ -98,10 +169,51 @@ const els = {
   closeCancelDialog: document.querySelector("#closeCancelDialog"),
   cancelDialogBack: document.querySelector("#cancelDialogBack"),
   cancelDialogSubmit: document.querySelector("#cancelDialogSubmit"),
+  releaseNotice: document.querySelector("#releaseNotice"),
+  releaseNoticeTitle: document.querySelector("#releaseNoticeTitle"),
+  releaseNoticeCount: document.querySelector("#releaseNoticeCount"),
+  releaseNoticeProgress: document.querySelector("#releaseNoticeProgress"),
+  releaseNoticeBody: document.querySelector("#releaseNoticeBody"),
+  releaseNoticeBack: document.querySelector("#releaseNoticeBack"),
+  releaseNoticeNext: document.querySelector("#releaseNoticeNext"),
+  releaseNoticeClose: document.querySelector("#releaseNoticeClose"),
+  releaseNoticeDismiss: document.querySelector("#releaseNoticeDismiss"),
 };
 
 function fmtTime(ts = Date.now()) {
   return new Date(ts).toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+function fmtLogTime(ts = Date.now()) {
+  return new Date(ts).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
+function readStoredLogWindowHours() {
+  return normalizeLogWindowHours(localStorage.getItem(LOG_STORAGE_KEY));
+}
+
+function normalizeLogWindowHours(value) {
+  const hours = Number(value);
+  return LOG_WINDOW_OPTIONS.some((option) => option.hours === hours) ? hours : 6;
+}
+
+function logWindowLabel(hours = state.logWindowHours) {
+  return LOG_WINDOW_OPTIONS.find((option) => option.hours === hours)?.label || "6 小时";
+}
+
+function logWindowQuery() {
+  return `log_window_hours=${encodeURIComponent(state.logWindowHours)}`;
+}
+
+function logWindowCutoffMs(hours = state.logWindowHours) {
+  return Date.now() - hours * 60 * 60 * 1000;
 }
 
 function dateInputValue(offsetDays = 0) {
@@ -176,6 +288,86 @@ async function showApp() {
   els.appShell.classList.remove("hidden");
   await loadUsers();
   await refreshAll();
+  maybeShowReleaseNotice();
+}
+
+function readReleaseNoticeState() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(RELEASE_NOTICE_STORAGE_KEY) || "{}");
+    return {
+      dismissed: Boolean(parsed.dismissed),
+      viewCount: Number.isFinite(Number(parsed.viewCount)) ? Number(parsed.viewCount) : 0,
+      lastShownAt: String(parsed.lastShownAt || ""),
+    };
+  } catch {
+    return { dismissed: false, viewCount: 0, lastShownAt: "" };
+  }
+}
+
+function writeReleaseNoticeState(value) {
+  localStorage.setItem(RELEASE_NOTICE_STORAGE_KEY, JSON.stringify(value));
+}
+
+function shouldShowReleaseNotice() {
+  const noticeState = readReleaseNoticeState();
+  return !noticeState.dismissed && noticeState.viewCount < RELEASE_NOTICE_MAX_SHOWS;
+}
+
+function maybeShowReleaseNotice() {
+  if (!els.releaseNotice || state.releaseNoticeShown || !shouldShowReleaseNotice()) {
+    return;
+  }
+  const noticeState = readReleaseNoticeState();
+  writeReleaseNoticeState({
+    ...noticeState,
+    viewCount: noticeState.viewCount + 1,
+    lastShownAt: new Date().toISOString(),
+  });
+  state.releaseNoticeShown = true;
+  state.releaseNoticePage = 0;
+  renderReleaseNotice();
+  els.releaseNotice.classList.remove("hidden");
+}
+
+function renderReleaseNotice() {
+  const page = RELEASE_NOTICE_PAGES[state.releaseNoticePage];
+  const isFirst = state.releaseNoticePage === 0;
+  const isLast = state.releaseNoticePage === RELEASE_NOTICE_PAGES.length - 1;
+  els.releaseNoticeTitle.textContent = page.title;
+  els.releaseNoticeCount.textContent = `${state.releaseNoticePage + 1} / ${RELEASE_NOTICE_PAGES.length}`;
+  els.releaseNoticeBody.innerHTML = `
+    <div class="release-page release-tone-${escapeAttr(page.tone)}">
+      <div class="release-page-label">${escapeHtml(page.label)}</div>
+      ${page.body}
+    </div>
+  `;
+  els.releaseNoticeProgress.innerHTML = RELEASE_NOTICE_PAGES.map((item, index) => `
+    <span class="${index === state.releaseNoticePage ? "active" : ""}" aria-label="${escapeAttr(item.label)}"></span>
+  `).join("");
+  els.releaseNoticeBack.disabled = isFirst;
+  els.releaseNoticeNext.classList.toggle("hidden", isLast);
+  els.releaseNoticeClose.classList.toggle("hidden", !isLast);
+  els.releaseNoticeDismiss.classList.toggle("hidden", !isLast);
+}
+
+function changeReleaseNoticePage(direction) {
+  const nextPage = Math.max(0, Math.min(RELEASE_NOTICE_PAGES.length - 1, state.releaseNoticePage + direction));
+  if (nextPage === state.releaseNoticePage) {
+    return;
+  }
+  state.releaseNoticePage = nextPage;
+  renderReleaseNotice();
+}
+
+function closeReleaseNotice({ dismiss = false } = {}) {
+  if (dismiss) {
+    writeReleaseNoticeState({
+      ...readReleaseNoticeState(),
+      dismissed: true,
+      dismissedAt: new Date().toISOString(),
+    });
+  }
+  els.releaseNotice.classList.add("hidden");
 }
 
 function setPill(el, text, tone = "") {
@@ -188,14 +380,86 @@ function setChip(el, text, tone = "") {
   el.textContent = text;
 }
 
-function addUiLog(text, strong = false) {
-  const line = document.createElement("div");
-  line.className = strong ? "log-line strong" : "log-line";
-  line.textContent = `[${fmtTime()}] ${text}`;
-  els.logStream.prepend(line);
-  while (els.logStream.children.length > 180) {
-    els.logStream.lastElementChild.remove();
+function renderLogWindowButtons() {
+  return LOG_WINDOW_OPTIONS.map((option) => `
+    <button
+      type="button"
+      data-log-window-hours="${escapeAttr(option.hours)}"
+      aria-pressed="${option.hours === state.logWindowHours ? "true" : "false"}"
+    >
+      ${escapeHtml(option.label)}
+    </button>
+  `).join("");
+}
+
+function renderLogWindowControl(label) {
+  return `
+    <div class="log-window-control" data-log-window-control role="group" aria-label="${escapeAttr(label)}">
+      ${renderLogWindowButtons()}
+    </div>
+  `;
+}
+
+function renderLogWindowControls() {
+  document.querySelectorAll("[data-log-window-control]").forEach((control) => {
+    control.setAttribute("role", "group");
+    control.innerHTML = renderLogWindowButtons();
+  });
+}
+
+function setupLogWindowControls() {
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-log-window-hours]");
+    if (!button) {
+      return;
+    }
+    setLogWindowHours(button.dataset.logWindowHours);
+  });
+  renderLogWindowControls();
+}
+
+function setLogWindowHours(value) {
+  const next = normalizeLogWindowHours(value);
+  if (state.logWindowHours === next) {
+    return;
   }
+  state.logWindowHours = next;
+  localStorage.setItem(LOG_STORAGE_KEY, String(next));
+  renderLogWindowControls();
+  renderUiLogs();
+  renderViewModeDetails();
+  Promise.all([loadBookingHistory(), loadScanTasks()]).catch((error) => {
+    addUiLog(`日志时间窗刷新失败: ${error.message}`, true);
+  });
+}
+
+function pruneUiLogs() {
+  const cutoff = Date.now() - LOG_RETENTION_HOURS * 60 * 60 * 1000;
+  state.uiLogs = state.uiLogs.filter((item) => Number(item.ts) >= cutoff).slice(0, 500);
+}
+
+function visibleUiLogs() {
+  const cutoff = logWindowCutoffMs();
+  return state.uiLogs.filter((item) => Number(item.ts) >= cutoff);
+}
+
+function renderUiLogs() {
+  pruneUiLogs();
+  const logs = visibleUiLogs();
+  if (!logs.length) {
+    els.logStream.innerHTML = `<div class="empty-state compact">当前 ${escapeHtml(logWindowLabel())} 内没有页面日志。</div>`;
+    return;
+  }
+  els.logStream.innerHTML = logs.map((item) => `
+    <div class="${item.strong ? "log-line strong" : "log-line"}">
+      [${escapeHtml(fmtLogTime(item.ts))}] ${escapeHtml(item.text)}
+    </div>
+  `).join("");
+}
+
+function addUiLog(text, strong = false) {
+  state.uiLogs.unshift({ ts: Date.now(), text: String(text || ""), strong: Boolean(strong) });
+  renderUiLogs();
   renderViewModeDetails();
 }
 
@@ -303,8 +567,7 @@ function renderBookings(bookings) {
     return `
       <div class="booking-row${selected}" role="button" tabindex="0" data-bill="${escapeAttr(booking.bill_num)}">
         <span class="booking-main">
-          <span><span class="booking-time">${escapeHtml(booking.date)} ${escapeHtml(booking.time_range)}</span> · ${escapeHtml(booking.court || "场地")}</span>
-          <span class="booking-meta">bill ${escapeHtml(booking.bill_num)} · ${escapeHtml(booking.pay_type || "-")} · ${escapeHtml(booking.created_at || "-")}</span>
+          <span class="booking-summary"><span class="booking-time">${escapeHtml(booking.date)} ${escapeHtml(booking.time_range)}</span> · ${escapeHtml(booking.court || "场地")}</span>
         </span>
         ${renderRefundAction(booking, refundState)}
       </div>
@@ -578,7 +841,7 @@ async function startBooking(event) {
 }
 
 async function loadBookingHistory() {
-  const data = await api(userScopedPath("/api/booking/history"));
+  const data = await api(userScopedPath(`/api/booking/history?${logWindowQuery()}`));
   state.bookingHistory = data.history || [];
   renderBookingHistory(state.bookingHistory);
   return data;
@@ -586,7 +849,7 @@ async function loadBookingHistory() {
 
 function renderBookingHistory(history) {
   if (!history.length) {
-    els.bookingHistoryList.innerHTML = `<div class="empty-state">还没有通过操作台发起过预约</div>`;
+    els.bookingHistoryList.innerHTML = `<div class="empty-state">当前 ${escapeHtml(logWindowLabel())} 内没有历史预约。</div>`;
     return;
   }
 
@@ -678,11 +941,15 @@ function renderAvailability(days) {
     const hourMarkup = hours.length
       ? hours.map((hour) => renderAvailabilityHour(day, hour)).join("")
       : `<div class="availability-empty">没有可约场地</div>`;
+    const total = Number(day.total || 0);
+    const countMarkup = total > 0
+      ? `<span class="chip success">${escapeHtml(total)} 个可约时段</span>`
+      : "";
     return `
       <div class="availability-day" data-date="${escapeAttr(day.date)}">
         <div class="availability-head">
           <strong>${escapeHtml(day.label)} ${escapeHtml(day.date)}</strong>
-          <span class="chip ${day.total ? "success" : ""}">${escapeHtml(day.total)} 个可约时段</span>
+          ${countMarkup}
         </div>
         <div class="availability-hours">${hourMarkup}</div>
       </div>
@@ -765,6 +1032,12 @@ function renderAvailabilityTools() {
   renderViewModeDetails();
 }
 
+function availabilityHasSelectableSlots() {
+  return (state.availabilityDays || []).some((day) => (
+    (day.hours || []).some((hour) => (hour.courts || []).length > 0)
+  ));
+}
+
 function renderAvailabilityCombos() {
   if (!els.availabilityCombos) {
     return;
@@ -822,6 +1095,11 @@ function renderExactSelection() {
     return;
   }
   const slots = state.selectedAvailabilitySlots;
+  const hasSelectableSlots = availabilityHasSelectableSlots();
+  els.availabilitySelection.hidden = !hasSelectableSlots && !slots.length;
+  if (els.availabilitySelection.hidden) {
+    return;
+  }
   const total = exactSlotsTotal(slots);
   const balance = currentBalanceValue();
   els.availabilitySelection.classList.toggle("has-selection", slots.length > 0);
@@ -1026,7 +1304,7 @@ async function submitExactBooking() {
 }
 
 async function loadScanTasks() {
-  const data = await api(userScopedPath("/api/scan/tasks"));
+  const data = await api(userScopedPath(`/api/scan/tasks?${logWindowQuery()}`));
   state.scanTasks = data.tasks || [];
   state.scanEvents = data.events || [];
   renderScanTasks();
@@ -1036,11 +1314,14 @@ async function loadScanTasks() {
 }
 
 function renderScanTasks() {
-  if (!state.scanTasks.length) {
-    els.scanTaskList.innerHTML = `<div class="empty-state">还没有扫描任务。</div>`;
+  const scanTasks = state.scanTasks || [];
+  const visibleTasks = visibleScanTasks(scanTasks);
+  if (!visibleTasks.length) {
+    const emptyMessage = scanTasks.length ? "当前没有扫描中的任务。" : "还没有扫描任务。";
+    els.scanTaskList.innerHTML = `<div class="empty-state">${escapeHtml(emptyMessage)}</div>`;
     return;
   }
-  els.scanTaskList.innerHTML = state.scanTasks.map((task) => {
+  els.scanTaskList.innerHTML = visibleTasks.map((task) => {
     const tone = scanTaskTone(task.status);
     const targets = task.targets || [];
     const done = targets.filter((target) => target.status === "booked").length;
@@ -1072,20 +1353,31 @@ function renderScanTasks() {
   });
 }
 
+function visibleScanTasks(tasks) {
+  return (tasks || []).filter((task) => VISIBLE_SCAN_TASK_STATUSES.has(task.status));
+}
+
 function renderScanEvents() {
   if (!els.scanEventList) {
     return;
   }
   const events = compactScanEvents((state.scanEvents || []).filter((event) => event.important)).slice(0, 8);
   if (!events.length) {
-    els.scanEventList.innerHTML = `<div class="empty-state compact">暂无重要决策。</div>`;
+    els.scanEventList.innerHTML = `
+      <div class="availability-tool-head">
+        <strong>最近重要决策</strong>
+        ${renderLogWindowControl("扫描事件时间窗")}
+      </div>
+      <div class="empty-state compact">当前 ${escapeHtml(logWindowLabel())} 内暂无重要决策。</div>
+    `;
     return;
   }
   els.scanEventList.innerHTML = `
     <div class="availability-tool-head">
       <strong>最近重要决策</strong>
-      <span class="booking-meta">预约、取消、重约、完成、过期</span>
+      ${renderLogWindowControl("扫描事件时间窗")}
     </div>
+    <span class="booking-meta">预约、取消、重约、完成、过期</span>
     ${events.map((event) => `
       <div class="scan-event-row">
         ${event.folded_count ? `<span class="scan-event-badge">+${escapeHtml(event.folded_count)}</span>` : ""}
@@ -1607,7 +1899,7 @@ function buildViewModeDetailGroups() {
   const priority = formValue(bookingForm, "priority", "").trim();
   const backup = formValue(bookingForm, "backup", "").trim();
   const courtPool = [priority, backup].filter(Boolean).join(" + ") || "-";
-  const logCount = els.logStream.children.length;
+  const logCount = visibleUiLogs().length;
 
   return [
     {
@@ -1664,11 +1956,12 @@ function buildViewModeDetailGroups() {
     {
       title: "日志",
       rows: [
-        ["保留上限", "180 行"],
+        ["时间窗", logWindowLabel()],
+        ["保留上限", "一周"],
         ["当前行数", `${logCount}`],
         ["任务状态", els.jobState.textContent || "空闲"],
       ],
-      behavior: "任务输出被轮询读取后会压缩成页面日志；页面只保留最新 180 行，任务状态芯片来自当前 job 快照。",
+      behavior: "任务输出被轮询读取后会压缩成页面日志；页面按当前时间窗展示，超过一周的日志会被裁剪。",
     },
   ];
 }
@@ -1935,11 +2228,17 @@ els.cancelDialogSubmit.addEventListener("click", () => {
   }
   cancelBooking(state.cancelDialogBill, confirmation);
 });
+els.releaseNoticeBack.addEventListener("click", () => changeReleaseNoticePage(-1));
+els.releaseNoticeNext.addEventListener("click", () => changeReleaseNoticePage(1));
+els.releaseNoticeClose.addEventListener("click", () => closeReleaseNotice());
+els.releaseNoticeDismiss.addEventListener("click", () => closeReleaseNotice({ dismiss: true }));
 
 setupBookingDate();
 setupSessionHelp();
 setupViewModeControl();
+setupLogWindowControls();
 setupTouchControls();
+renderUiLogs();
 addScanTargetRow();
 if (localStorage.getItem("daydayupAccessKey")) {
   showApp().catch(() => showLogin());

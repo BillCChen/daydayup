@@ -10,6 +10,9 @@ from typing import Callable
 
 
 _ORIGINAL_GETADDRINFO: Callable | None = None
+DEFAULT_HOST_ALIASES: dict[str, str] = {
+    "www.147soft.cn": "121.194.1.22",
+}
 
 
 def parse_host_aliases(value: str) -> dict[str, str]:
@@ -45,3 +48,12 @@ def install_host_aliases(aliases: dict[str, str]) -> bool:
 
 def install_host_aliases_from_env(env_name: str = "DAYDAYUP_HOST_ALIASES") -> bool:
     return install_host_aliases(parse_host_aliases(os.getenv(env_name, "")))
+
+
+def install_host_aliases_with_defaults(
+    env_name: str = "DAYDAYUP_HOST_ALIASES",
+    default_aliases: dict[str, str] | None = None,
+) -> bool:
+    aliases = dict(default_aliases or {})
+    aliases.update(parse_host_aliases(os.getenv(env_name, "")))
+    return install_host_aliases(aliases)
