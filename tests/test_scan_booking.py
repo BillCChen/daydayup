@@ -1,8 +1,10 @@
 import json
+import io
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from datetime import datetime
 from pathlib import Path
 
@@ -344,15 +346,17 @@ class ScanBookingTest(unittest.TestCase):
                 "已预约 18:00-20:00",
                 important=True,
             )
-            event["created_at"] = "2026-05-17 21:30:00"
-            event["created_ts"] = datetime(2026, 5, 17, 21, 30).timestamp()
+            summary_time = datetime.now().replace(hour=22, minute=0, second=0, microsecond=0)
+            event_time = summary_time.replace(hour=21, minute=30)
+            event["created_at"] = web_console.format_datetime(event_time)
+            event["created_ts"] = event_time.timestamp()
             manager.events.append(event)
             sent = []
             original = web_console.send_scan_email
             web_console.send_scan_email = lambda subject, body: sent.append((subject, body))
             try:
-                manager.send_daily_summary_if_due(datetime(2026, 5, 17, 22, 0))
-                manager.send_daily_summary_if_due(datetime(2026, 5, 17, 22, 5))
+                manager.send_daily_summary_if_due(summary_time)
+                manager.send_daily_summary_if_due(summary_time.replace(minute=5))
             finally:
                 web_console.send_scan_email = original
             summaries = [item for item in manager.events.list(limit=20) if item.get("type") == "daily_summary"]
@@ -392,6 +396,86 @@ class ScanBookingTest(unittest.TestCase):
             self.assertEqual({item["id"] for item in store.list(limit=10, window_hours=12)}, {"recent", "older"})
             retained = json.loads(path.read_text(encoding="utf-8"))["events"]
             self.assertNotIn("expired", {item["id"] for item in retained})
+
+
+class FakeBookingProcess:
+    def __init__(self):
+        self.stdout = io.StringIO("")
+        self.terminated = False
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        self.terminated = True
+
+
+class JobManagerTests(unittest.TestCase):
+    def test_start_allows_multiple_concurrent_booking_jobs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history = web_console.BookingHistoryStore(Path(tmpdir) / "booking_history.json")
+            manager = web_console.JobManager(
+                web_console.ServerConfig("1", "https://example.invalid/easyserpClient", 10),
+                history,
+            )
+            user = web_console.UserAccount(
+                key="user_1",
+                label="User 1",
+                token="token",
+                jsessionid="session",
+                card_name="学生球类卡",
+                enabled=True,
+            )
+            processes = [FakeBookingProcess(), FakeBookingProcess()]
+            payload = {
+                "date": "2026-05-22",
+                "time": "18-21",
+                "duration": "1",
+                "booking_mode": "direct-fast",
+            }
+
+            with mock.patch("web_console.subprocess.Popen", side_effect=processes):
+                first = manager.start(payload, user, "card_1")
+                second = manager.start(payload, user, "card_1")
+
+            snapshot = manager.snapshot()
+            self.assertEqual(first.id, 1)
+            self.assertEqual(second.id, 2)
+            self.assertTrue(snapshot["running"])
+            self.assertEqual(snapshot["active_count"], 2)
+            self.assertEqual([job["id"] for job in snapshot["jobs"]], [1, 2])
+            self.assertEqual(snapshot["job"]["id"], 2)
+            self.assertEqual(
+                len({item["id"] for item in history.list(limit=10, window_hours=None)}),
+                2,
+            )
+
+            stopped = manager.stop()
+            self.assertTrue(stopped["stopped"])
+            self.assertEqual(stopped["stopped_count"], 2)
+            self.assertTrue(all(process.terminated for process in processes))
+
+    def test_history_marks_running_records_without_active_process_as_orphaned(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "booking_history.json"
+            path.write_text(
+                json.dumps(
+                    [
+                        {"id": "active", "job_id": 1, "status": "running", "result": "运行中", "requested_ts": time.time()},
+                        {"id": "lost", "job_id": 2, "status": "running", "result": "运行中", "requested_ts": time.time()},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            history = web_console.BookingHistoryStore(path)
+
+            history.mark_orphaned_running({1})
+
+            records = {item["id"]: item for item in history.list(limit=10, window_hours=None)}
+            self.assertEqual(records["active"]["status"], "running")
+            self.assertEqual(records["lost"]["status"], "orphaned")
+            self.assertEqual(records["lost"]["result"], "已失联")
+            self.assertTrue(records["lost"].get("finished_at"))
 
 
 if __name__ == "__main__":

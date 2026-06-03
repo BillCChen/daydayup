@@ -296,7 +296,7 @@ class BookingHistoryStore:
 
     def create(self, payload: dict[str, Any], job_id: int, command_label: str, user: UserAccount) -> str:
         now = time.time()
-        record_id = str(int(now * 1000))
+        record_id = f"{int(now * 1000)}-{job_id}"
         record = {
             "id": record_id,
             "job_id": job_id,
@@ -358,6 +358,25 @@ class BookingHistoryStore:
                     break
             self._write_unlocked(records)
 
+    def mark_orphaned_running(self, active_job_ids: set[int]) -> None:
+        now_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        changed = False
+        with self.lock:
+            records = self._read_unlocked()
+            for record in records:
+                if clean_string(record.get("status")) != "running":
+                    continue
+                job_id = int_or_default(record.get("job_id"), -1)
+                if job_id in active_job_ids:
+                    continue
+                record["status"] = "orphaned"
+                record["result"] = "已失联"
+                record["finished_at"] = now_text
+                record["note"] = "Web 服务已重启或后台进程已结束，任务不再可停止。"
+                changed = True
+            if changed:
+                self._write_unlocked(records)
+
     def _read_unlocked(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
@@ -390,14 +409,11 @@ class JobManager:
         self.config = config
         self.history = history
         self.lock = threading.Lock()
-        self.job: BookingJob | None = None
+        self.jobs: dict[int, BookingJob] = {}
         self.next_id = 1
 
     def start(self, payload: dict[str, Any], user: UserAccount, card_index: str) -> BookingJob:
         with self.lock:
-            if self.job and self.job.status in ("running", "stopping"):
-                raise EasySerpError("a booking job is already running")
-
             command, command_label = build_booking_command(payload)
             env = os.environ.copy()
             env["DAYDAYUP_TOKEN"] = user.token
@@ -416,24 +432,36 @@ class JobManager:
             job = BookingJob(self.next_id, process, time.time(), command_label, "")
             job.history_id = self.history.create(payload, job.id, command_label, user)
             self.next_id += 1
-            self.job = job
+            self.jobs[job.id] = job
+            self._trim_locked()
             threading.Thread(target=self._read_output, args=(job,), daemon=True).start()
             return job
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
-            if not self.job:
-                return {"running": False, "job": None}
-            self._poll_locked(self.job)
-            return {"running": self.job.status == "running", "job": serialize_job(self.job)}
+            for job in self.jobs.values():
+                self._poll_locked(job)
+            self._trim_locked()
+            jobs = sorted(self.jobs.values(), key=lambda item: item.id)
+            active_jobs = [job for job in jobs if job.status in {"running", "stopping"}]
+            selected_job = active_jobs[-1] if active_jobs else (jobs[-1] if jobs else None)
+            return {
+                "running": bool(active_jobs),
+                "active_count": len(active_jobs),
+                "job": serialize_job(selected_job) if selected_job else None,
+                "jobs": [serialize_job(job) for job in jobs],
+            }
 
     def stop(self) -> dict[str, Any]:
         with self.lock:
-            if not self.job or self.job.status != "running":
+            stoppable_jobs = [job for job in self.jobs.values() if job.status in {"running", "stopping"}]
+            if not stoppable_jobs:
                 return {"stopped": False, "message": "no running job"}
-            self.job.process.terminate()
-            self.job.status = "stopping"
-            return {"stopped": True}
+            for job in stoppable_jobs:
+                if job.process.poll() is None:
+                    job.process.terminate()
+                job.status = "stopping"
+            return {"stopped": True, "stopped_count": len(stoppable_jobs)}
 
     def _read_output(self, job: BookingJob) -> None:
         assert job.process.stdout is not None
@@ -460,6 +488,21 @@ class JobManager:
         if finalize_history and not job.history_finalized:
             self.history.finish(job)
             job.history_finalized = True
+
+    def _trim_locked(self) -> None:
+        if len(self.jobs) <= 20:
+            return
+        active_ids = {job.id for job in self.jobs.values() if job.status in {"running", "stopping"}}
+        retained_ids = set(active_ids)
+        completed_jobs = [job for job in self.jobs.values() if job.id not in active_ids]
+        retained_ids.update(job.id for job in sorted(completed_jobs, key=lambda item: item.id)[-20:])
+        self.jobs = {job_id: job for job_id, job in self.jobs.items() if job_id in retained_ids}
+
+    def active_job_ids(self) -> set[int]:
+        with self.lock:
+            for job in self.jobs.values():
+                self._poll_locked(job)
+            return {job.id for job in self.jobs.values() if job.status in {"running", "stopping"}}
 
 
 class FileLock:
@@ -1877,6 +1920,7 @@ class WebConsole:
         return result
 
     def booking_history(self, user_key: str = "", log_window_hours: int = LOG_DEFAULT_WINDOW_HOURS) -> dict[str, Any]:
+        self.history.mark_orphaned_running(self.jobs.active_job_ids())
         history = self.history.list(window_hours=log_window_hours)
         if user_key:
             default_key = self.users.get_user("").key
