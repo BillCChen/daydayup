@@ -31,6 +31,7 @@ const state = {
   refreshQueued: false,
   refreshQueuedForce: false,
   refreshStamps: {},
+  accessExpiryTimer: null,
   viewMode: "default",
   users: [],
   selectedUserKey: "",
@@ -50,6 +51,9 @@ const LOG_WINDOW_OPTIONS = [
 ];
 const LOG_RETENTION_HOURS = 168;
 const LOG_STORAGE_KEY = "daydayupLogWindowHours";
+const ACCESS_KEY_STORAGE_KEY = "daydayupAccessKey";
+const ACCESS_EXPIRES_STORAGE_KEY = "daydayupAccessExpiresAt";
+const ACCESS_SESSION_TTL_MS = 60 * 60 * 1000;
 const ALIGNED_REFRESH_MS = 5000;
 const AVAILABILITY_REFRESH_TTL_MS = 60000;
 const MIN_HOUR = 8;
@@ -168,22 +172,77 @@ function dateInputValue(offsetDays = 0) {
   return `${year}-${month}-${day}`;
 }
 
+function clearStoredAccess() {
+  localStorage.removeItem(ACCESS_KEY_STORAGE_KEY);
+  localStorage.removeItem(ACCESS_EXPIRES_STORAGE_KEY);
+}
+
+function storeAccessKey(accessKey) {
+  localStorage.setItem(ACCESS_KEY_STORAGE_KEY, accessKey);
+  localStorage.setItem(ACCESS_EXPIRES_STORAGE_KEY, String(Date.now() + ACCESS_SESSION_TTL_MS));
+}
+
+function readStoredAccessKey(now = Date.now()) {
+  const accessKey = localStorage.getItem(ACCESS_KEY_STORAGE_KEY);
+  if (!accessKey) {
+    localStorage.removeItem(ACCESS_EXPIRES_STORAGE_KEY);
+    return "";
+  }
+
+  const expiresAt = Number(localStorage.getItem(ACCESS_EXPIRES_STORAGE_KEY));
+  if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+    clearStoredAccess();
+    return "";
+  }
+
+  return accessKey;
+}
+
+function clearAccessExpiryTimer() {
+  if (state.accessExpiryTimer) {
+    window.clearTimeout(state.accessExpiryTimer);
+    state.accessExpiryTimer = null;
+  }
+}
+
+function scheduleAccessExpiry() {
+  clearAccessExpiryTimer();
+  const expiresAt = Number(localStorage.getItem(ACCESS_EXPIRES_STORAGE_KEY));
+  if (!Number.isFinite(expiresAt)) {
+    return;
+  }
+
+  state.accessExpiryTimer = window.setTimeout(() => {
+    expireAccessSession("访问已过期，请重新输入密码。");
+  }, Math.max(0, expiresAt - Date.now()));
+}
+
+function expireAccessSession(message = "访问已过期，请重新输入密码。") {
+  clearStoredAccess();
+  clearAlignedRefresh();
+  clearAccessExpiryTimer();
+  state.adminPassword = "";
+  state.userManagementUnlocked = false;
+  showLogin(message);
+}
+
 async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json" };
-  const accessKey = localStorage.getItem("daydayupAccessKey");
-  if (accessKey) {
-    headers["X-Daydayup-Key"] = accessKey;
+  const accessKey = readStoredAccessKey();
+  if (!accessKey) {
+    expireAccessSession();
+    throw new Error("access expired");
   }
+  headers["X-Daydayup-Key"] = accessKey;
 
   let response = await fetch(path, {
     headers,
     ...options,
   });
   if (response.status === 401) {
-    localStorage.removeItem("daydayupAccessKey");
-    showLogin();
+    expireAccessSession("访问失败或已过期，请重新输入密码。");
   }
-  const payload = await response.json();
+  const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(payload.error || "request failed");
   }
@@ -305,7 +364,7 @@ async function login(event) {
       }
       return payload;
     });
-    localStorage.setItem("daydayupAccessKey", password);
+    storeAccessKey(password);
     els.authForm.reset();
     await showApp();
   } catch (error) {
@@ -313,12 +372,18 @@ async function login(event) {
   }
 }
 
-function showLogin() {
+function showLogin(message = "") {
+  clearAlignedRefresh();
+  clearAccessExpiryTimer();
   els.authScreen.classList.remove("hidden");
   els.appShell.classList.add("hidden");
+  if (message) {
+    els.authMessage.textContent = message;
+  }
 }
 
 async function showApp() {
+  scheduleAccessExpiry();
   els.authScreen.classList.add("hidden");
   els.appShell.classList.remove("hidden");
   await loadUsers();
@@ -2372,7 +2437,10 @@ els.cancelDialogSubmit.addEventListener("click", () => {
   }
   cancelBooking(state.cancelDialogBill, confirmation);
 });
-window.addEventListener("beforeunload", clearAlignedRefresh);
+window.addEventListener("beforeunload", () => {
+  clearAlignedRefresh();
+  clearAccessExpiryTimer();
+});
 
 setupBookingDate();
 setupSessionHelp();
@@ -2381,8 +2449,8 @@ setupLogWindowControls();
 setupTouchControls();
 renderUiLogs();
 addScanTargetRow();
-if (localStorage.getItem("daydayupAccessKey")) {
-  showApp().catch(() => showLogin());
+if (readStoredAccessKey()) {
+  showApp().catch(() => expireAccessSession("访问失败，请重新输入密码。"));
 } else {
   showLogin();
 }
