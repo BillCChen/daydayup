@@ -3,7 +3,7 @@ const state = {
   bookingHistory: [],
   selectedBill: "",
   jobTimer: null,
-  lastJobLineCount: 0,
+  jobLineCounts: {},
   uiLogs: [],
   logWindowHours: 6,
   availabilityLoading: false,
@@ -23,7 +23,14 @@ const state = {
   cards: [],
   startHour: 17,
   endHour: 21,
-  priorityCourts: [7, 8, 9, 6],
+  priorityCourts: [6, 7, 8, 9],
+  activeBookingsExpanded: false,
+  availabilityExpandedDates: new Set(),
+  alignedRefreshTimer: null,
+  refreshInFlight: false,
+  refreshQueued: false,
+  refreshQueuedForce: false,
+  refreshStamps: {},
   viewMode: "default",
   users: [],
   selectedUserKey: "",
@@ -31,7 +38,7 @@ const state = {
   adminPassword: "",
 };
 
-const SAFE_COURTS = [2, 3, 4, 6, 7, 8, 9, 10, 11];
+const SAFE_COURTS = [1, 2, 3, 6, 7, 8, 9, 10, 11];
 const WALL_COURTS = [4, 5, 12];
 const ALL_COURTS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 const VISIBLE_SCAN_TASK_STATUSES = new Set(["active", "paused"]);
@@ -43,6 +50,8 @@ const LOG_WINDOW_OPTIONS = [
 ];
 const LOG_RETENTION_HOURS = 168;
 const LOG_STORAGE_KEY = "daydayupLogWindowHours";
+const ALIGNED_REFRESH_MS = 5000;
+const AVAILABILITY_REFRESH_TTL_MS = 60000;
 const MIN_HOUR = 8;
 const MAX_HOUR = 23;
 
@@ -99,7 +108,8 @@ const els = {
   courtPicker: document.querySelector("#courtPicker"),
   priorityValue: document.querySelector("#priorityValue"),
   durationPicker: document.querySelector("#durationPicker"),
-  windowPicker: document.querySelector("#windowPicker"),
+  windowSlider: document.querySelector("#windowSlider"),
+  windowValue: document.querySelector("#windowValue"),
   pollPicker: document.querySelector("#pollPicker"),
   stopJob: document.querySelector("#stopJob"),
   jobState: document.querySelector("#jobState"),
@@ -188,6 +198,98 @@ function userScopedPath(path) {
   return `${path}${separator}user_key=${encodeURIComponent(state.selectedUserKey)}`;
 }
 
+function msUntilNextRefreshBoundary(now = Date.now()) {
+  const remainder = now % ALIGNED_REFRESH_MS;
+  return remainder === 0 ? 0 : ALIGNED_REFRESH_MS - remainder;
+}
+
+function clearAlignedRefresh() {
+  if (state.alignedRefreshTimer) {
+    window.clearTimeout(state.alignedRefreshTimer);
+    state.alignedRefreshTimer = null;
+  }
+}
+
+function scheduleAlignedRefresh() {
+  clearAlignedRefresh();
+  state.alignedRefreshTimer = window.setTimeout(() => {
+    runAlignedRefresh();
+  }, msUntilNextRefreshBoundary());
+}
+
+function startAlignedRefresh() {
+  scheduleAlignedRefresh();
+}
+
+async function runAlignedRefresh() {
+  await refreshLiveData();
+  scheduleAlignedRefresh();
+}
+
+function clearRefreshStamps() {
+  state.refreshStamps = {};
+}
+
+function shouldRefreshAvailability(force = false) {
+  if (force) {
+    return true;
+  }
+  const lastRefresh = Number(state.refreshStamps.availability || 0);
+  return !lastRefresh || Date.now() - lastRefresh >= AVAILABILITY_REFRESH_TTL_MS;
+}
+
+async function refreshAvailabilityIfDue({ force = false } = {}) {
+  if (!shouldRefreshAvailability(force)) {
+    return null;
+  }
+  return loadAvailabilitySnapshot({ silent: true, preserveSelection: true });
+}
+
+async function refreshLiveData({ force = false } = {}) {
+  if (state.refreshInFlight) {
+    state.refreshQueued = true;
+    state.refreshQueuedForce = state.refreshQueuedForce || force;
+    return;
+  }
+  state.refreshInFlight = true;
+  try {
+    await Promise.all([
+      loadStatus(),
+      loadCards(),
+      loadBookings(),
+      loadBookingHistory(),
+      loadScanTasks(),
+      loadJob(),
+      refreshAvailabilityIfDue({ force }),
+    ]);
+    renderViewModeDetails();
+  } catch (error) {
+    markConnectivity(false);
+    addUiLog(`刷新失败: ${error.message}`, true);
+  } finally {
+    state.refreshInFlight = false;
+    if (state.refreshQueued) {
+      const queuedForce = state.refreshQueuedForce;
+      state.refreshQueued = false;
+      state.refreshQueuedForce = false;
+      await refreshLiveData({ force: queuedForce });
+    }
+  }
+}
+
+async function triggerRefresh({ includeUsers = false, force = false } = {}) {
+  if (includeUsers) {
+    await loadUsers();
+  }
+  await refreshLiveData({ force });
+  scheduleAlignedRefresh();
+}
+
+function markConnectivity(ok) {
+  setPill(els.lastRefresh, ok ? "活跃" : "离线", ok ? "ok" : "danger");
+  els.lastRefresh.title = ok ? `最近刷新 ${fmtTime()}` : `刷新失败 ${fmtTime()}`;
+}
+
 async function login(event) {
   event.preventDefault();
   const password = new FormData(els.authForm).get("password") || "";
@@ -220,7 +322,7 @@ async function showApp() {
   els.authScreen.classList.add("hidden");
   els.appShell.classList.remove("hidden");
   await loadUsers();
-  await refreshAll();
+  startAlignedRefresh();
 }
 
 function setPill(el, text, tone = "") {
@@ -319,8 +421,12 @@ function addUiLog(text, strong = false) {
 async function loadUsers() {
   const data = await api("/api/users");
   state.users = data.users || [];
+  const previousUserKey = state.selectedUserKey;
   if (!state.selectedUserKey || !state.users.some((user) => user.key === state.selectedUserKey)) {
     state.selectedUserKey = data.default_user_key || state.users[0]?.key || "";
+  }
+  if (previousUserKey !== state.selectedUserKey) {
+    clearRefreshStamps();
   }
   renderUsers();
   return data;
@@ -349,8 +455,11 @@ function renderUserManagementLock() {
 
 async function loadStatus() {
   const status = await api(userScopedPath("/api/status"));
-  const hasSession = status.jsessionid.present;
-  setPill(els.tokenState, status.token.present ? "Token ✅" : "Token ❌", status.token.present ? "ok" : "danger");
+  const credentials = status.user?.credential_status || status;
+  const tokenState = credentials.token || {};
+  const sessionState = credentials.jsessionid || {};
+  const hasSession = Boolean(sessionState.present);
+  setPill(els.tokenState, tokenState.present ? "Token ✅" : "Token ❌", tokenState.present ? "ok" : "danger");
   setPill(
     els.sessionState,
     hasSession ? "Session ✅" : "Session ❌",
@@ -360,13 +469,13 @@ async function loadStatus() {
   els.sessionHelpTrigger.hidden = hasSession;
   els.sessionHelp.hidden = hasSession;
   els.sessionHelpTrigger.setAttribute("aria-expanded", "false");
+  markConnectivity(true);
+  return status;
 }
 
 async function loadCards() {
   const data = await api(userScopedPath("/api/cards"));
   renderCards(data.cards, data.primary_card);
-  els.lastRefresh.textContent = `余额 ${fmtTime()}`;
-  els.lastRefresh.className = "status-pill ok";
   return data;
 }
 
@@ -382,8 +491,6 @@ function renderCards(cards, primaryCard) {
 
   els.primaryCard.innerHTML = `
     <div class="balance-value">${escapeHtml(primaryCard.cash_balance)}</div>
-    <div><strong>${escapeHtml(primaryCard.card_name)}</strong> <span class="chip success">${escapeHtml(primaryCard.status)}</span></div>
-    <div class="balance-meta">卡号 ${escapeHtml(primaryCard.card_index)} · 有效期 ${escapeHtml(primaryCard.end_date || "-")}</div>
   `;
 
   const others = cards.filter((card) => card.card_index !== primaryCard.card_index);
@@ -403,32 +510,50 @@ async function loadBookings() {
   state.bookings = data.bookings;
   renderBookings(data.bookings);
   renderViewModeDetails();
-  els.lastRefresh.textContent = `活跃 ${fmtTime()}`;
-  els.lastRefresh.className = "status-pill ok";
   return data;
 }
 
 function renderBookings(bookings) {
-  if (!bookings.length) {
-    els.bookingList.innerHTML = `<div class="empty-state">没有活跃预约</div>`;
+  const sortedBookings = sortBookingsByStart(bookings || []).filter(isUpcomingBooking);
+  if (!sortedBookings.length) {
+    els.bookingList.innerHTML = `<div class="empty-state compact">没有活跃预约</div>`;
     return;
   }
 
-  els.bookingList.innerHTML = bookings.map((booking) => {
+  const visibleBookings = state.activeBookingsExpanded ? sortedBookings : sortedBookings.slice(0, 3);
+  const toggleMarkup = sortedBookings.length > 3
+    ? `<button class="button secondary compact active-toggle" type="button" data-active-toggle>${state.activeBookingsExpanded ? "收起" : `展开 ${sortedBookings.length - 3}`}</button>`
+    : "";
+
+  els.bookingList.innerHTML = `
+    <div class="active-booking-grid">
+      ${visibleBookings.map((booking) => {
     const selected = booking.bill_num === state.selectedBill ? " selected" : "";
     const refundState = bookingRefundState(booking);
     return `
-      <div class="booking-row${selected}" role="button" tabindex="0" data-bill="${escapeAttr(booking.bill_num)}">
-        <span class="booking-main">
-          <span class="booking-summary"><span class="booking-time">${escapeHtml(booking.date)} ${escapeHtml(booking.time_range)}</span> · ${escapeHtml(booking.court || "场地")}</span>
-        </span>
-        ${renderRefundAction(booking, refundState)}
-      </div>
+      <details class="booking-row${selected}" data-bill="${escapeAttr(booking.bill_num)}">
+        <summary>
+          <span class="booking-summary"><span class="booking-time">${escapeHtml(activeBookingLabel(booking))}</span></span>
+          <span class="chip ${refundState.tone}">${escapeHtml(refundState.label)}</span>
+        </summary>
+        <div class="booking-detail-line">
+          <span>bill <span class="numeric">${escapeHtml(booking.bill_num || "-")}</span></span>
+          <span>${escapeHtml(booking.amount || "-")}</span>
+          ${!booking.cancelled && !refundState.expired ? renderRefundAction(booking, refundState) : ""}
+        </div>
+      </details>
     `;
-  }).join("");
+      }).join("")}
+    </div>
+    ${toggleMarkup}
+  `;
 
   els.bookingList.querySelectorAll(".booking-row").forEach((row) => {
-    row.addEventListener("click", () => selectBooking(row.dataset.bill));
+    row.addEventListener("toggle", () => {
+      if (row.open) {
+        selectBooking(row.dataset.bill, { scroll: false, renderList: false });
+      }
+    });
     row.addEventListener("keydown", (event) => {
       if (event.target.closest("[data-cancel-bill]")) {
         return;
@@ -439,12 +564,52 @@ function renderBookings(bookings) {
       }
     });
   });
+  els.bookingList.querySelector("[data-active-toggle]")?.addEventListener("click", () => {
+    state.activeBookingsExpanded = !state.activeBookingsExpanded;
+    renderBookings(state.bookings);
+  });
   els.bookingList.querySelectorAll("[data-cancel-bill]").forEach((button) => {
     button.addEventListener("click", (event) => {
       event.stopPropagation();
       openCancelDialog(button.dataset.cancelBill);
     });
   });
+}
+
+function sortBookingsByStart(bookings) {
+  return (bookings || []).slice().sort((a, b) => bookingStartMs(a) - bookingStartMs(b));
+}
+
+function bookingStartMs(booking) {
+  const date = String(booking.date || "").trim();
+  const range = String(booking.time_range || "").trim();
+  const start = range.split("-")[0] || "00:00";
+  const parsed = new Date(`${date}T${start}:00`);
+  return Number.isNaN(parsed.getTime()) ? Number.MAX_SAFE_INTEGER : parsed.getTime();
+}
+
+function isUpcomingBooking(booking) {
+  const startMs = bookingStartMs(booking);
+  return startMs === Number.MAX_SAFE_INTEGER || startMs >= Date.now();
+}
+
+function activeBookingLabel(booking) {
+  const dateText = String(booking.date || "").trim();
+  const match = dateText.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+  const dateLabel = match ? `${Number(match[2])}.${Number(match[3])}` : dateText || "-";
+  return `${dateLabel}-${courtNumberLabel(booking.court)}`;
+}
+
+function courtNumberLabel(value) {
+  const text = String(value || "场地").trim();
+  const match = text.match(/(\d+)/);
+  return match ? `${match[1]} 号` : text;
+}
+
+function courtShortLabel(value) {
+  const text = String(value || "场地").trim();
+  const match = text.match(/(\d+)/);
+  return match ? `球${match[1]}` : text;
 }
 
 function renderRefundAction(booking, refundState) {
@@ -454,13 +619,18 @@ function renderRefundAction(booking, refundState) {
   return `<span class="chip ${refundState.tone}">${escapeHtml(refundState.label)}</span>`;
 }
 
-function selectBooking(billNum) {
+function selectBooking(billNum, options = {}) {
   state.selectedBill = billNum;
-  renderBookings(state.bookings);
+  if (options.renderList !== false) {
+    renderBookings(state.bookings);
+  }
   const booking = state.bookings.find((item) => item.bill_num === billNum);
   renderDetail(booking);
   renderViewModeDetails();
-  document.querySelector("#detailPane").scrollIntoView({ behavior: "smooth", block: "start" });
+  const detailPane = document.querySelector("#detailPane");
+  if (options.scroll !== false && detailPane && getComputedStyle(detailPane).display !== "none") {
+    detailPane.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
 }
 
 function renderDetail(booking, preview = null, error = "") {
@@ -682,11 +852,11 @@ async function startBooking(event) {
       method: "POST",
       body: JSON.stringify(payload),
     });
-    state.lastJobLineCount = 0;
+    state.jobLineCounts[result.job.id] = 0;
     setChip(els.jobState, "运行中", "warning");
     renderViewModeDetails();
     addUiLog(`预约任务启动: ${result.job.command_label}`, true);
-    await loadBookingHistory();
+    await Promise.all([loadJob(), loadBookingHistory()]);
     startJobPolling();
   } catch (error) {
     addUiLog(`预约任务启动失败: ${error.message}`, true);
@@ -702,23 +872,34 @@ async function loadBookingHistory() {
 
 function renderBookingHistory(history) {
   if (!history.length) {
-    els.bookingHistoryList.innerHTML = `<div class="empty-state">当前 ${escapeHtml(logWindowLabel())} 内没有历史预约。</div>`;
+    els.bookingHistoryList.innerHTML = `<div class="empty-state compact">当前 ${escapeHtml(logWindowLabel())} 内没有历史预约。</div>`;
     return;
   }
 
-  els.bookingHistoryList.innerHTML = history.map((item) => {
+  els.bookingHistoryList.innerHTML = history.slice(0, 5).map((item) => {
     const tone = historyResultTone(item.result);
+    const summary = compactHistorySummary(item);
     return `
       <div class="history-row">
         <div class="history-main">
-          <span class="history-title">${escapeHtml(item.target_date || "-")} · ${escapeHtml(item.target_time || "-")}</span>
-          <span class="booking-meta">${escapeHtml(item.user_label || "用户")} · 发起 ${escapeHtml(item.requested_at || "-")}</span>
-          <span class="booking-meta">成功目标 ${escapeHtml(item.success_target || "-")}</span>
+          <span class="history-title">${escapeHtml(shortDateLabel(item.target_date || ""))}</span>
+          <span class="history-time">${escapeHtml(summary.time)}</span>
+          <span class="history-court">${escapeHtml(summary.court)}</span>
         </div>
         <span class="chip ${tone}">${escapeHtml(item.result || "未知")}</span>
       </div>
     `;
   }).join("");
+}
+
+function compactHistorySummary(item) {
+  const source = item.success_target || item.target_time || "";
+  const timeMatch = String(source).match(/(\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2})/);
+  const courtMatch = String(source).match(/(?:羽毛球|球|场地)\s*(\d{1,2})\b/);
+  return {
+    time: timeMatch ? timeMatch[1].replace(/\s+/g, "") : "-",
+    court: item.result && !String(item.result).includes("成功") ? "失败" : courtMatch ? `球${courtMatch[1]}` : "-",
+  };
 }
 
 function historyResultTone(result) {
@@ -733,37 +914,49 @@ function historyResultTone(result) {
 }
 
 async function scanAvailability() {
+  await loadAvailabilitySnapshot({ silent: false, preserveSelection: false });
+}
+
+async function loadAvailabilitySnapshot({ silent = false, preserveSelection = true } = {}) {
   if (state.availabilityLoading) {
     return;
   }
   state.availabilityLoading = true;
-  els.scanAvailability.disabled = true;
-  els.scanAvailability.textContent = "查询中";
-  els.availabilityList.innerHTML = `
-    <div class="availability-day">
-      <div class="availability-head">
-        <strong>正在查询</strong>
-        <span class="chip warning">今天到 4 天后</span>
+  if (!silent) {
+    els.scanAvailability.disabled = true;
+    els.scanAvailability.textContent = "查询中";
+    els.availabilityList.innerHTML = `
+      <div class="availability-day compact-day">
+        <div class="availability-head">
+          <strong>刷新中</strong>
+          <span class="chip warning">5 天</span>
+        </div>
+        <div class="availability-hours">
+          <span class="skeleton wide"></span>
+        </div>
       </div>
-      <div class="availability-hours">
-        <span class="skeleton wide"></span>
-        <span class="skeleton"></span>
-      </div>
-    </div>
-  `;
+    `;
+  }
 
   try {
     const data = await api(userScopedPath("/api/availability?days=5"));
     state.availabilityDays = data.days || [];
-    state.selectedAvailabilitySlots = [];
+    if (!preserveSelection) {
+      state.selectedAvailabilitySlots = [];
+    }
     renderAvailability(data.days || []);
     renderAvailabilityTools();
-    els.lastRefresh.textContent = `分布 ${fmtTime()}`;
-    els.lastRefresh.className = "status-pill ok";
-    addUiLog("可约分布查询完成");
+    state.refreshStamps.availability = Date.now();
+    if (!silent) {
+      addUiLog("可约分布查询完成");
+    }
+    return data;
   } catch (error) {
-    els.availabilityList.innerHTML = `<div class="empty-state">可约分布查询失败：${escapeHtml(error.message)}</div>`;
-    addUiLog(`可约分布查询失败: ${error.message}`, true);
+    if (!silent) {
+      els.availabilityList.innerHTML = `<div class="empty-state compact">可约分布查询失败：${escapeHtml(error.message)}</div>`;
+      addUiLog(`可约分布查询失败: ${error.message}`, true);
+    }
+    throw error;
   } finally {
     state.availabilityLoading = false;
     els.scanAvailability.disabled = false;
@@ -773,7 +966,7 @@ async function scanAvailability() {
 
 function renderAvailability(days) {
   if (!days.length) {
-    els.availabilityList.innerHTML = `<div class="empty-state">没有返回可约分布</div>`;
+    els.availabilityList.innerHTML = `<div class="empty-state compact">没有返回可约分布</div>`;
     renderAvailabilityTools();
     return;
   }
@@ -781,36 +974,50 @@ function renderAvailability(days) {
   els.availabilityList.innerHTML = days.map((day) => {
     if (day.error) {
       return `
-        <div class="availability-day">
+        <div class="availability-day compact-day">
           <div class="availability-head">
-            <strong>${escapeHtml(day.label)} ${escapeHtml(day.date)}</strong>
-            <span class="chip danger">查询失败</span>
+            <strong>${escapeHtml(shortDateLabel(day.date))}</strong>
+            <span class="chip danger">失败</span>
           </div>
           <p class="availability-error">${escapeHtml(day.error)}</p>
         </div>
       `;
     }
     const hours = day.hours || [];
+    const expanded = state.availabilityExpandedDates.has(day.date);
+    const visibleHours = expanded ? hours : hours.slice(0, 2);
     const hourMarkup = hours.length
-      ? hours.map((hour) => renderAvailabilityHour(day, hour)).join("")
-      : `<div class="availability-empty">没有可约场地</div>`;
+      ? visibleHours.map((hour) => renderAvailabilityHour(day, hour)).join("")
+      : `<div class="availability-empty">无可约</div>`;
     const total = Number(day.total || 0);
-    const countMarkup = total > 0
-      ? `<span class="chip success">${escapeHtml(total)} 个可约时段</span>`
+    const moreMarkup = hours.length > 2
+      ? `<button class="day-more" type="button" data-availability-more="${escapeAttr(day.date)}">${expanded ? "收起" : `更多 ${hours.length - 2}`}</button>`
       : "";
     return `
-      <div class="availability-day" data-date="${escapeAttr(day.date)}">
+      <div class="availability-day compact-day" data-date="${escapeAttr(day.date)}">
         <div class="availability-head">
-          <strong>${escapeHtml(day.label)} ${escapeHtml(day.date)}</strong>
-          ${countMarkup}
+          <strong>${escapeHtml(shortDateLabel(day.date))}</strong>
+          <span class="chip ${total > 0 ? "success" : ""}">${escapeHtml(total)}组</span>
         </div>
         <div class="availability-hours">${hourMarkup}</div>
+        ${moreMarkup}
       </div>
     `;
   }).join("");
 
   els.availabilityList.querySelectorAll("[data-availability-slot]").forEach((button) => {
     button.addEventListener("click", () => toggleAvailabilitySlot(button));
+  });
+  els.availabilityList.querySelectorAll("[data-availability-more]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const dateValue = button.dataset.availabilityMore;
+      if (state.availabilityExpandedDates.has(dateValue)) {
+        state.availabilityExpandedDates.delete(dateValue);
+      } else {
+        state.availabilityExpandedDates.add(dateValue);
+      }
+      renderAvailability(state.availabilityDays);
+    });
   });
 }
 
@@ -826,18 +1033,20 @@ function renderAvailabilityHour(day, hour) {
       aria-pressed="${isAvailabilitySlotSelected(day.date, hour, court) ? "true" : "false"}"
       title="${court.wall ? "靠墙场地" : "普通场地"}"
     >
-      <span class="court-check" aria-hidden="true"></span>
-      <span>${escapeHtml(court.name)}</span>
-      <span class="court-price">实扣 ${escapeHtml(court.pay || court.pay_value || "-")}</span>
+      <span>${escapeHtml(courtShortLabel(court.name))}</span>
     </button>
   `).join("");
   return `
     <div class="availability-hour">
       <span class="availability-time">${escapeHtml(hour.time)}</span>
-      <span class="availability-count">${escapeHtml(hour.count)} 场</span>
       <span class="availability-courts">${courts}</span>
     </div>
   `;
+}
+
+function shortDateLabel(value) {
+  const parts = String(value || "").split("-");
+  return parts.length === 3 ? `${parts[1]}/${parts[2]}` : String(value || "-");
 }
 
 function toggleAvailabilitySlot(button) {
@@ -948,8 +1157,7 @@ function renderExactSelection() {
     return;
   }
   const slots = state.selectedAvailabilitySlots;
-  const hasSelectableSlots = availabilityHasSelectableSlots();
-  els.availabilitySelection.hidden = !hasSelectableSlots && !slots.length;
+  els.availabilitySelection.hidden = !slots.length;
   if (els.availabilitySelection.hidden) {
     return;
   }
@@ -1345,6 +1553,25 @@ function scanTargetStatusLabel(status) {
   }[status] || "等待扫描";
 }
 
+function hourOptions(selectedValue, { start = MIN_HOUR, end = MAX_HOUR } = {}) {
+  const selected = normalizeHourValue(selectedValue);
+  const options = [];
+  for (let hour = start; hour <= end; hour += 1) {
+    const value = `${String(hour).padStart(2, "0")}:00`;
+    options.push(`<option value="${value}" ${value === selected ? "selected" : ""}>${String(hour).padStart(2, "0")}:00</option>`);
+  }
+  return options.join("");
+}
+
+function normalizeHourValue(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\d{1,2})/);
+  if (!match) {
+    return "";
+  }
+  return `${String(Math.min(MAX_HOUR, Math.max(MIN_HOUR, Number(match[1])))).padStart(2, "0")}:00`;
+}
+
 function addScanTargetRow(values = {}) {
   state.scanTargetCounter += 1;
   const id = `scanTarget${state.scanTargetCounter}`;
@@ -1358,17 +1585,20 @@ function addScanTargetRow(values = {}) {
     </label>
     <label>
       <span>开始</span>
-      <input name="target_start" type="time" value="${escapeAttr(values.start_time || "18:00")}" required />
+      <select name="target_start" required>${hourOptions(values.start_time || "18:00", { end: MAX_HOUR - 1 })}</select>
     </label>
     <label>
       <span>结束</span>
-      <input name="target_end" type="time" value="${escapeAttr(values.end_time || "22:00")}" required />
+      <select name="target_end" required>${hourOptions(values.end_time || "20:00", { start: MIN_HOUR + 1 })}</select>
     </label>
     <button class="button secondary compact" type="button" aria-label="删除目标" data-remove-target="${escapeAttr(id)}">删除</button>
   `;
   els.scanTargetList.append(row);
   row.addEventListener("input", renderViewModeDetails);
-  row.addEventListener("change", renderViewModeDetails);
+  row.addEventListener("change", () => {
+    normalizeScanTargetRow(row);
+    renderViewModeDetails();
+  });
   row.querySelector("[data-remove-target]").addEventListener("click", () => {
     if (els.scanTargetList.querySelectorAll("[data-scan-target-row]").length <= 1) {
       addUiLog("至少保留一个扫描目标", true);
@@ -1380,11 +1610,24 @@ function addScanTargetRow(values = {}) {
   renderViewModeDetails();
 }
 
+function normalizeScanTargetRow(row) {
+  const start = row.querySelector('[name="target_start"]');
+  const end = row.querySelector('[name="target_end"]');
+  if (!start || !end || end.value > start.value) {
+    return;
+  }
+  const nextHour = Math.min(MAX_HOUR, Number(start.value.slice(0, 2)) + 2);
+  end.value = `${String(nextHour).padStart(2, "0")}:00`;
+  if (end.value <= start.value) {
+    end.value = `${String(Math.min(MAX_HOUR, Number(start.value.slice(0, 2)) + 1)).padStart(2, "0")}:00`;
+  }
+}
+
 function scanTargetsFromForm() {
   return Array.from(els.scanTargetList.querySelectorAll("[data-scan-target-row]")).map((row) => ({
     date: row.querySelector('input[name="target_date"]').value,
-    start_time: row.querySelector('input[name="target_start"]').value,
-    end_time: row.querySelector('input[name="target_end"]').value,
+    start_time: row.querySelector('[name="target_start"]').value,
+    end_time: row.querySelector('[name="target_end"]').value,
   }));
 }
 
@@ -1608,6 +1851,7 @@ async function exchangeUserToken() {
 async function changeUser() {
   state.selectedUserKey = els.userSelect.value;
   state.selectedBill = "";
+  clearRefreshStamps();
   renderDetail(null);
   renderUsers();
   addUiLog(`切换用户: ${currentUser()?.label || state.selectedUserKey}`, true);
@@ -1616,8 +1860,15 @@ async function changeUser() {
 
 async function stopJob() {
   try {
-    await api("/api/booking/stop", { method: "POST", body: "{}" });
-    addUiLog("已发送停止任务请求", true);
+    const result = await api("/api/booking/stop", { method: "POST", body: "{}" });
+    const stoppedCount = Number(result.stopped_count || 0);
+    if (result.stopped) {
+      addUiLog(stoppedCount > 1 ? `已发送停止 ${stoppedCount} 个任务的请求` : "已发送停止任务请求", true);
+    } else {
+      addUiLog(result.message === "no running job" ? "没有可停止的运行任务，正在刷新状态" : `停止失败: ${result.message || "未知状态"}`, true);
+    }
+    await loadJob();
+    await loadBookingHistory();
   } catch (error) {
     addUiLog(`停止失败: ${error.message}`, true);
   }
@@ -1626,29 +1877,47 @@ async function stopJob() {
 function startJobPolling() {
   if (state.jobTimer) {
     window.clearInterval(state.jobTimer);
+    state.jobTimer = null;
   }
-  state.jobTimer = window.setInterval(loadJob, 1200);
   loadJob();
 }
 
 async function loadJob() {
   try {
     const snapshot = await api("/api/booking/job");
-    if (!snapshot.job) {
+    const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : snapshot.job ? [snapshot.job] : [];
+    if (!jobs.length) {
       setChip(els.jobState, "空闲");
+      state.jobLineCounts = {};
       renderViewModeDetails();
       return;
     }
-    const job = snapshot.job;
+    const activeJobs = jobs.filter((job) => job.status === "running" || job.status === "stopping");
+    const job = snapshot.job || activeJobs[activeJobs.length - 1] || jobs[jobs.length - 1];
+    const activeCount = Number(snapshot.active_count || activeJobs.length);
     setChip(
       els.jobState,
-      job.status,
-      job.status === "running" || job.status === "stopping" ? "warning" : job.status === "completed" ? "success" : "danger",
+      activeCount > 0 ? `${activeCount} 个任务运行中` : job.status,
+      activeCount > 0 ? "warning" : job.status === "completed" ? "success" : "danger",
     );
-    const newLines = job.lines.slice(state.lastJobLineCount);
-    newLines.map(summarizeJobLine).filter(Boolean).forEach((line) => addUiLog(line));
-    state.lastJobLineCount = job.lines.length;
-    if (job.status !== "running" && job.status !== "stopping" && state.jobTimer) {
+    jobs.forEach((item) => {
+      const knownCount = state.jobLineCounts[item.id] || 0;
+      const newLines = item.lines.slice(knownCount);
+      newLines
+        .map(summarizeJobLine)
+        .filter(Boolean)
+        .forEach((line) => addUiLog(`#${item.id} ${line}`));
+      state.jobLineCounts[item.id] = item.lines.length;
+    });
+    if (jobs.length > 30) {
+      const liveIds = new Set(jobs.map((item) => String(item.id)));
+      Object.keys(state.jobLineCounts).forEach((id) => {
+        if (!liveIds.has(id)) {
+          delete state.jobLineCounts[id];
+        }
+      });
+    }
+    if (activeCount === 0 && state.jobTimer) {
       window.clearInterval(state.jobTimer);
       state.jobTimer = null;
       await loadBookings();
@@ -1689,8 +1958,7 @@ function summarizeJobLine(line) {
 
 async function refreshAll() {
   try {
-    await loadUsers();
-    await Promise.all([loadStatus(), loadCards(), loadBookings(), loadBookingHistory(), loadScanTasks(), loadJob()]);
+    await triggerRefresh({ includeUsers: true, force: true });
     addUiLog("刷新完成");
     renderViewModeDetails();
   } catch (error) {
@@ -1747,8 +2015,8 @@ function buildViewModeDetailGroups() {
   const scanTargets = scanTargetsFromForm();
   const successSelect = scanForm.elements.success_mode;
   const modeValue = formValue(bookingForm, "booking_mode", "balanced");
-  const windowSeconds = formValue(bookingForm, "window_seconds", "60");
-  const pollInterval = formValue(bookingForm, "poll_interval", "0.08");
+  const windowSeconds = formValue(bookingForm, "window_seconds", "30");
+  const pollInterval = formValue(bookingForm, "poll_interval", "0.05");
   const priority = formValue(bookingForm, "priority", "").trim();
   const backup = formValue(bookingForm, "backup", "").trim();
   const courtPool = [priority, backup].filter(Boolean).join(" + ") || "-";
@@ -1800,8 +2068,8 @@ function buildViewModeDetailGroups() {
         ["window_seconds", `${windowSeconds}s`],
         ["poll_interval", secondsToMsText(pollInterval)],
         ["step_sleep", "30ms"],
-        ["guide_interval", "500ms"],
-        ["guide_max_inflight", "4"],
+        ["guide_interval", modeValue === "guided-fast" ? "500ms" : "-"],
+        ["guide_max_inflight", modeValue === "guided-fast" ? "4" : "-"],
         ["场地池", courtPool],
       ],
       behavior: "balanced 先查询再排序下单；direct-fast 跳过 get_places 连续直抢；guided-fast 用直抢 worker 和 collector 探测共同更新排序。",
@@ -1863,7 +2131,7 @@ function setupBookingDate() {
 function setupTouchControls() {
   setupTimeControl();
   setupSegmentedControl(els.durationPicker, 'input[name="duration"]', "2");
-  setupSegmentedControl(els.windowPicker, 'input[name="window_seconds"]', "60");
+  setupWindowSlider();
   setupPollControl();
   setupCourtPicker();
 }
@@ -1890,10 +2158,12 @@ function setupTimeControl() {
 function renderTimeControl() {
   const start = `${String(state.startHour).padStart(2, "0")}:00`;
   const end = `${String(state.endHour).padStart(2, "0")}:00`;
+  const durationHours = Math.max(1, Math.min(2, state.endHour - state.startHour));
   els.timeStartValue.textContent = start;
   els.timeEndValue.textContent = end;
   els.timeRangeValue.textContent = `${start}-${end}`;
   els.bookingForm.elements.time.value = `${state.startHour}-${state.endHour}`;
+  els.bookingForm.elements.duration.value = String(durationHours);
 
   const disabled = {
     "start-down": state.startHour <= MIN_HOUR,
@@ -1908,7 +2178,13 @@ function renderTimeControl() {
 }
 
 function setupSegmentedControl(container, inputSelector, initialValue) {
+  if (!container) {
+    return;
+  }
   const input = els.bookingForm.querySelector(inputSelector);
+  if (!input) {
+    return;
+  }
   const selectValue = (value) => {
     input.value = value;
     container.querySelectorAll("button[data-value]").forEach((button) => {
@@ -1920,6 +2196,21 @@ function setupSegmentedControl(container, inputSelector, initialValue) {
     button.addEventListener("click", () => selectValue(button.dataset.value));
   });
   selectValue(initialValue);
+}
+
+function setupWindowSlider() {
+  if (!els.windowSlider) {
+    return;
+  }
+  const sync = () => {
+    if (els.windowValue) {
+      els.windowValue.textContent = `${els.windowSlider.min || "10"}秒`;
+    }
+    renderViewModeDetails();
+  };
+  els.windowSlider.addEventListener("input", sync);
+  els.windowSlider.value = "30";
+  sync();
 }
 
 function setupPollControl() {
@@ -2055,7 +2346,7 @@ els.exchangeToken.addEventListener("click", exchangeUserToken);
 els.refreshAll.addEventListener("click", refreshAll);
 els.refreshCards.addEventListener("click", () => loadCards().catch((error) => addUiLog(`余额刷新失败: ${error.message}`, true)));
 els.refreshBookings.addEventListener("click", () => loadBookings().catch((error) => addUiLog(`活跃预约刷新失败: ${error.message}`, true)));
-els.scanAvailability.addEventListener("click", scanAvailability);
+els.scanAvailability.addEventListener("click", () => scanAvailability().catch((error) => addUiLog(`可约分布查询失败: ${error.message}`, true)));
 els.exactSubmit.addEventListener("click", () => submitExactBooking());
 els.refreshScanTasks.addEventListener("click", () => loadScanTasks().catch((error) => addUiLog(`扫描任务刷新失败: ${error.message}`, true)));
 els.addScanTarget.addEventListener("click", () => addScanTargetRow());
@@ -2081,6 +2372,7 @@ els.cancelDialogSubmit.addEventListener("click", () => {
   }
   cancelBooking(state.cancelDialogBill, confirmation);
 });
+window.addEventListener("beforeunload", clearAlignedRefresh);
 
 setupBookingDate();
 setupSessionHelp();

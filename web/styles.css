@@ -313,8 +313,7 @@ button {
 
 .behavior-detail {
   margin: 2px 0 0;
-  border-left: 3px solid var(--primary-amber);
-  padding-left: 10px;
+  padding-left: 0;
   color: var(--text-secondary);
   font-size: 0.88rem;
 }
@@ -701,6 +700,11 @@ select:focus-visible {
   font-weight: 650;
 }
 
+#timeRangeValue,
+#priorityValue {
+  display: none;
+}
+
 .touch-value,
 .time-value {
   color: var(--text-primary);
@@ -944,10 +948,10 @@ select:focus-visible {
   min-width: 24px;
   height: 24px;
   padding: 0 7px;
-  border: 2px solid var(--surface);
+  border: 2px solid var(--surface-raised);
   border-radius: 999px;
-  background: #d64545;
-  color: #fff;
+  background: var(--danger-red);
+  color: var(--surface-raised);
   font-size: 12px;
   font-weight: 800;
   line-height: 1;
@@ -1633,10 +1637,6 @@ body.modal-open {
     grid-column: span 4;
   }
 
-  #bookings {
-    grid-column: span 8;
-  }
-
   #submit {
     grid-column: span 7;
   }
@@ -1945,5 +1945,1283 @@ body.modal-open {
   *::after {
     transition-duration: 0.001ms !important;
     animation-duration: 0.001ms !important;
+  }
+}
+
+/* Compact console workspace */
+[hidden] {
+  display: none !important;
+}
+
+.hidden-control,
+.utility-panel,
+.rail,
+.detail-pane {
+  display: none !important;
+}
+
+.shell {
+  display: block;
+  min-height: 100vh;
+  padding: 10px;
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  max-width: 1440px;
+  margin: 0 auto;
+  --console-tile-height: 70px;
+  --console-control-height: 36px;
+  --console-gap: 6px;
+}
+
+.workspace > .console-row,
+.workspace > .view-mode-details {
+  grid-column: 1 / -1;
+}
+
+.panel,
+.topbar {
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+  background: color-mix(in oklch, var(--surface-panel), var(--surface-raised) 34%);
+  padding: 8px;
+}
+
+.console-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: stretch;
+  gap: 8px;
+  min-width: 0;
+}
+
+.compact-label,
+.brand-tile {
+  display: grid;
+  align-content: center;
+  align-self: stretch;
+  min-width: 132px;
+  min-height: var(--console-tile-height);
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  padding: 8px 10px;
+}
+
+.compact-label h2,
+.brand-tile h1 {
+  margin: 0;
+  font-size: 1.35rem;
+  line-height: 1.05;
+  font-weight: 800;
+}
+
+.brand-tile {
+  min-width: 250px;
+}
+
+.brand-tile h1 {
+  font-size: 2rem;
+}
+
+.top-console-row {
+  grid-template-columns: minmax(238px, 0.7fr) minmax(360px, 1.2fr) minmax(214px, 0.55fr);
+  align-items: center;
+  position: relative;
+  z-index: 1;
+}
+
+.top-console-center {
+  display: grid;
+  gap: 6px;
+}
+
+.status-band {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+}
+
+.status-pill,
+.chip {
+  min-height: 34px;
+  padding: 5px 10px;
+  font-weight: 700;
+}
+
+.view-switcher {
+  grid-template-columns: repeat(3, minmax(86px, 1fr));
+  gap: 4px;
+  min-width: 0;
+}
+
+.view-switcher button,
+.log-window-control button {
+  min-height: 36px;
+}
+
+.topbar-actions {
+  display: grid;
+  grid-template-columns: minmax(132px, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+
+.user-select {
+  gap: 3px;
+}
+
+.user-select select {
+  min-height: 38px;
+}
+
+.view-mode-details {
+  padding: 8px;
+}
+
+.view-detail-grid {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 6px;
+  overflow: visible;
+}
+
+.view-detail-group {
+  gap: 6px;
+  min-width: 150px;
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  padding: 8px;
+}
+
+.view-detail-group:first-child,
+.view-detail-group:nth-child(2) {
+  border-top: 1px solid var(--border-muted);
+  padding-top: 8px;
+}
+
+.view-detail-item {
+  grid-template-columns: 0.86fr 1fr;
+  gap: 6px;
+}
+
+.behavior-detail {
+  border-left: 0;
+  padding-left: 0;
+}
+
+.wallet-active-row {
+  grid-template-columns: auto minmax(154px, 0.42fr) auto minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.wallet-active-row > .compact-label,
+.wallet-active-row > .balance-block,
+.wallet-active-row > .booking-list {
+  grid-column: auto;
+  grid-row: auto;
+  min-height: 76px;
+}
+
+.balance-block {
+  display: grid;
+  min-height: 76px;
+  place-items: center;
+  margin-top: 0;
+  border-color: color-mix(in oklch, var(--success-green), var(--border-muted) 38%);
+  background: var(--success-green-soft);
+  padding: 8px 16px;
+}
+
+.balance-value {
+  font-size: 3.4rem;
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.booking-list,
+.history-list,
+.scan-task-list,
+.scan-event-list,
+.booking-form,
+.scan-form {
+  margin-top: 0;
+}
+
+.active-booking-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 6px;
+  align-items: stretch;
+  min-width: 0;
+}
+
+.booking-row {
+  display: grid;
+  min-height: 44px;
+  padding: 0;
+  overflow: hidden;
+}
+
+.booking-row summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  min-height: 42px;
+  padding: 6px 8px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.booking-row summary::-webkit-details-marker {
+  display: none;
+}
+
+.booking-detail-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-top: 1px solid var(--border-muted);
+  padding: 6px 8px;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+}
+
+.active-toggle {
+  align-self: stretch;
+  justify-self: stretch;
+  min-height: 44px;
+  margin-top: 0;
+}
+
+.wallet-active-row > .booking-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.wallet-active-row > .booking-list > .active-booking-grid {
+  grid-column: 1;
+}
+
+.wallet-active-row > .booking-list > .active-toggle {
+  grid-column: 2;
+}
+
+.wallet-active-row > .booking-list > .empty-state {
+  grid-column: 1 / -1;
+}
+
+.availability-row {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.availability-list {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+  align-items: stretch;
+  grid-auto-rows: 1fr;
+  margin-top: 0;
+  overflow: visible;
+}
+
+.availability-list > .empty-state {
+  grid-column: 1 / -1;
+}
+
+.availability-day {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 6px;
+  min-height: 76px;
+  height: 100%;
+  padding: 8px;
+}
+
+.availability-head {
+  gap: 6px;
+}
+
+.availability-head strong,
+.availability-time,
+.history-time {
+  font-family: var(--font-numeric);
+  font-weight: 800;
+}
+
+.availability-hours {
+  align-content: start;
+  gap: 4px;
+}
+
+.availability-hour {
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 5px;
+  border-top: 0;
+  padding-top: 0;
+}
+
+.availability-courts {
+  grid-column: auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.court-chip {
+  display: inline-flex;
+  width: auto;
+  min-height: 25px;
+  padding: 3px 7px;
+  font-size: 0.78rem;
+  font-weight: 750;
+}
+
+.court-chip.selectable {
+  min-height: 28px;
+}
+
+.court-chip > span:nth-child(1) {
+  overflow: visible;
+}
+
+.court-price,
+.court-check {
+  display: none;
+}
+
+.day-more {
+  min-height: 28px;
+  border: 1px solid var(--border-muted);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.availability-combos {
+  display: none;
+}
+
+.availability-selection {
+  grid-column: 2;
+  margin-top: 0;
+  padding: 8px;
+}
+
+.availability-selection[hidden] {
+  display: none !important;
+}
+
+#scanTasks.scan-console-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas:
+    "label form"
+    "label tasks";
+  align-items: stretch;
+  gap: 8px;
+}
+
+#scanTasks > .compact-label {
+  grid-area: label;
+}
+
+#scanTasks > .scan-form {
+  grid-area: form;
+}
+
+#scanTasks > .scan-task-list {
+  grid-area: tasks;
+}
+
+#scanTasks > .scan-event-list {
+  display: none;
+}
+
+.scan-form {
+  display: grid;
+  grid-template-columns: minmax(560px, 1fr) minmax(220px, 0.4fr) minmax(118px, 0.2fr);
+  grid-template-rows: minmax(var(--console-tile-height), auto) minmax(var(--console-tile-height), auto);
+  gap: 6px;
+  align-items: stretch;
+  min-width: 0;
+}
+
+.scan-form > .touch-field {
+  display: grid;
+  grid-column: 1;
+  grid-row: 1;
+  order: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: stretch;
+  min-width: 0;
+}
+
+.scan-form > .touch-field > .field-head {
+  display: none;
+}
+
+.scan-form > .touch-field > .scan-target-list {
+  grid-column: 1;
+  grid-row: 1;
+  min-width: 0;
+}
+
+.scan-form > .touch-field > #addScanTarget {
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: stretch;
+  align-self: stretch;
+  white-space: nowrap;
+}
+
+.scan-target-list {
+  gap: 4px;
+  min-width: 0;
+}
+
+.scan-target-row {
+  grid-template-columns: minmax(128px, 1fr) minmax(82px, 0.62fr) minmax(82px, 0.62fr) auto;
+  gap: 5px;
+  align-items: end;
+  min-height: var(--console-tile-height);
+  padding: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.scan-form > .scan-grid {
+  grid-column: 1;
+  grid-row: 2;
+  order: 0;
+  grid-template-columns: 82px minmax(120px, 0.62fr) minmax(120px, 0.62fr) minmax(210px, 1fr);
+  gap: 6px;
+  align-items: end;
+  min-height: var(--console-tile-height);
+  min-width: 0;
+}
+
+.scan-form > .scan-grid > label:last-child {
+  grid-column: auto;
+}
+
+.scan-form > label {
+  grid-column: 2;
+  grid-row: 1;
+  order: 0;
+  align-self: stretch;
+  min-width: 0;
+}
+
+.scan-form > .option-grid {
+  display: grid;
+  grid-column: 2 / 4;
+  grid-row: 2;
+  order: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  align-items: stretch;
+  min-width: 0;
+}
+
+.scan-form > .button.primary {
+  grid-column: 3;
+  grid-row: 1;
+  order: 0;
+  align-self: stretch;
+  min-width: 118px;
+  min-height: var(--console-tile-height);
+  padding: 8px 10px;
+  white-space: nowrap;
+}
+
+.scan-form label,
+.booking-form label {
+  gap: 3px;
+  font-size: 0.78rem;
+}
+
+.scan-form input,
+.scan-form select,
+.booking-form input,
+.booking-form select {
+  min-height: var(--console-control-height);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.option-card {
+  align-content: center;
+  gap: 0;
+  padding: 6px 8px;
+  min-height: var(--console-tile-height);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.option-card small {
+  display: none;
+}
+
+.checkline,
+.toggle {
+  min-height: 34px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.checkline span,
+.toggle span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scan-task-row {
+  gap: 8px;
+  padding: 8px;
+}
+
+.scan-task-list {
+  max-height: none;
+  overflow: visible;
+  margin-top: 0;
+  width: 100%;
+}
+
+.scan-task-list > .empty-state {
+  min-height: 100%;
+  padding: 6px 10px;
+  place-items: center;
+  text-align: center;
+}
+
+.scan-task-actions {
+  gap: 5px;
+}
+
+.scan-target-chip {
+  min-height: 32px;
+}
+
+.submit-console-row {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.booking-form {
+  display: grid;
+  grid-template-columns:
+    minmax(116px, 0.72fr)
+    minmax(156px, 0.86fr)
+    minmax(230px, 1.15fr)
+    minmax(150px, 0.72fr)
+    minmax(160px, 0.76fr)
+    minmax(154px, 0.78fr)
+    minmax(152px, 0.7fr);
+  grid-template-areas: "date time court window poll wall actions";
+  gap: 6px;
+  align-items: stretch;
+  overflow: visible;
+}
+
+.booking-form > label:first-child {
+  grid-area: date;
+}
+
+.booking-form > .time-control {
+  grid-area: time;
+}
+
+.booking-form > .priority-control {
+  grid-area: court;
+}
+
+.booking-form > .window-control {
+  grid-area: window;
+}
+
+.booking-form > .touch-field:not(.time-control):not(.priority-control):not(.window-control):not(.hidden-control) {
+  grid-area: poll;
+}
+
+.booking-form > .option-grid {
+  grid-area: wall;
+}
+
+.booking-form > .action-row {
+  grid-area: actions;
+}
+
+.time-control,
+.priority-control {
+  grid-column: auto;
+}
+
+.booking-form > label,
+.booking-form > .touch-field,
+.booking-form > .option-grid,
+.booking-form > .action-row {
+  grid-column: auto;
+  grid-row: auto;
+  align-self: stretch;
+  min-height: var(--console-tile-height);
+}
+
+.booking-form > .option-grid {
+  display: grid;
+}
+
+.time-stepper {
+  grid-template-columns: 32px 58px 32px;
+  gap: 4px;
+}
+
+.time-separator {
+  display: none;
+}
+
+.time-stepper [data-action="end-down"] {
+  grid-column: 1;
+}
+
+#timeEndValue {
+  grid-column: 2;
+}
+
+.time-stepper [data-action="end-up"] {
+  grid-column: 3;
+}
+
+.step-button,
+.segmented-control button,
+.court-option {
+  min-height: 34px;
+  border-radius: 6px;
+}
+
+.segmented-control {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.court-grid {
+  grid-template-columns: repeat(6, 34px);
+  gap: 5px;
+}
+
+.court-option {
+  width: 34px;
+  min-width: 34px;
+  padding: 0;
+}
+
+.court-option:disabled {
+  opacity: 0.34;
+  background: color-mix(in oklch, var(--border-muted), var(--surface-raised) 35%);
+}
+
+.range-slider {
+  accent-color: var(--action-blue);
+}
+
+.range-control {
+  display: grid;
+  grid-template-columns: auto minmax(82px, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  min-height: var(--console-control-height);
+}
+
+.range-limit {
+  color: var(--text-secondary);
+  font-family: var(--font-numeric);
+  font-size: 0.78rem;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.window-control .field-head {
+  justify-content: flex-start;
+}
+
+.booking-form > .option-grid {
+  grid-template-columns: 1fr;
+  gap: 4px;
+}
+
+.booking-form > .option-grid .option-card:nth-child(1),
+.booking-form > .option-grid .option-card:nth-child(2) {
+  display: none;
+}
+
+.action-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 5px;
+}
+
+.action-row .button {
+  min-height: 38px;
+  padding: 8px 10px;
+}
+
+.history-console-row {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: stretch;
+}
+
+#wallet,
+#availability,
+#scanTasks,
+#submit,
+#bookingHistory {
+  grid-column: 1 / -1;
+}
+
+.history-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(136px, 1fr));
+  gap: 6px;
+  align-items: stretch;
+  grid-auto-rows: 1fr;
+}
+
+.history-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 74px;
+  padding: 8px;
+}
+
+.history-main {
+  gap: 2px;
+}
+
+.history-title {
+  font-size: 1rem;
+}
+
+.history-time,
+.history-court {
+  display: block;
+  color: var(--text-primary);
+  font-weight: 800;
+}
+
+.history-court {
+  font-size: 1.05rem;
+}
+
+.empty-state {
+  min-height: var(--console-tile-height);
+  padding: 6px;
+}
+
+@media (max-width: 1600px) and (min-width: 721px) {
+  .top-console-row {
+    grid-template-columns: minmax(240px, 0.72fr) minmax(360px, 1fr) minmax(230px, 0.78fr);
+  }
+
+  .wallet-active-row {
+    grid-template-columns: auto minmax(180px, 0.42fr) auto minmax(0, 1fr);
+  }
+
+  .availability-list {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+
+  .scan-form {
+    grid-template-columns: minmax(0, 1fr) minmax(160px, 0.36fr);
+    grid-template-rows: auto;
+  }
+
+  .scan-form > .touch-field {
+    grid-column: 1 / -1;
+    grid-row: auto;
+  }
+
+  .scan-form > .scan-grid {
+    grid-column: 1 / -1;
+    grid-row: auto;
+    grid-template-columns: 88px minmax(126px, 0.72fr) minmax(126px, 0.72fr) minmax(220px, 1fr);
+  }
+
+  .scan-form > label {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .scan-form > .option-grid {
+    grid-column: 1 / -1;
+    grid-row: auto;
+  }
+
+  .scan-form > .button.primary {
+    grid-column: 2;
+    grid-row: auto;
+  }
+
+  .booking-form {
+    grid-template-columns: minmax(120px, 0.7fr) minmax(162px, 0.8fr) minmax(260px, 1fr) minmax(150px, 0.68fr) minmax(160px, 0.7fr);
+    grid-template-areas:
+      "date time court window poll"
+      "date time court wall actions";
+  }
+
+  .action-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 1120px) {
+  .workspace {
+    overflow: visible;
+    --console-tile-height: 64px;
+  }
+
+  .console-row,
+  .top-console-row {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .top-console-row {
+    grid-template-columns: minmax(210px, 0.65fr) minmax(300px, 1fr) minmax(210px, 0.72fr);
+  }
+
+  .wallet-active-row {
+    grid-template-columns: auto minmax(150px, 0.48fr) auto minmax(0, 1fr);
+  }
+
+  .availability-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .availability-list {
+    grid-template-columns: repeat(auto-fit, minmax(136px, 1fr));
+  }
+
+  #scanTasks.scan-console-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .scan-form {
+    grid-template-columns: minmax(0, 1fr) minmax(150px, 0.36fr);
+    grid-template-rows: auto;
+  }
+
+  .scan-form > .touch-field {
+    grid-column: 1 / -1;
+    grid-row: auto;
+  }
+
+  .scan-form > .scan-grid {
+    grid-column: 1 / -1;
+    grid-row: auto;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .scan-form > .scan-grid > label:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .scan-form > label {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .scan-form > .option-grid {
+    grid-column: 1 / -1;
+    grid-row: auto;
+  }
+
+  .scan-form > .button.primary {
+    grid-column: 2;
+    grid-row: auto;
+  }
+
+  .submit-console-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .booking-form {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-areas:
+      "date time time court"
+      "window window poll poll"
+      "wall wall actions actions";
+  }
+
+  .action-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .history-console-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 720px) {
+  html,
+  body {
+    overflow-x: hidden;
+  }
+
+  body {
+    font-size: 14px;
+  }
+
+  .shell {
+    padding: 8px;
+  }
+
+  .workspace {
+    max-width: none;
+    overflow-x: visible;
+    gap: 8px;
+    --console-tile-height: 60px;
+    --console-control-height: 44px;
+    --console-gap: 6px;
+  }
+
+  .panel,
+  .topbar {
+    padding: 6px;
+  }
+
+  .console-row,
+  .top-console-row,
+  #scanTasks.scan-console-row,
+  .wallet-active-row,
+  .availability-row,
+  .submit-console-row,
+  .history-console-row {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+  }
+
+  .compact-label,
+  .brand-tile {
+    width: 100%;
+    min-width: 0;
+    min-height: 58px;
+    padding: 8px 10px;
+  }
+
+  .compact-label h2 {
+    font-size: 1.25rem;
+  }
+
+  .brand-tile h1 {
+    font-size: 1.85rem;
+  }
+
+  .brand-tile .eyebrow,
+  .compact-label .eyebrow {
+    font-size: 0.72rem;
+  }
+
+  .top-console-center,
+  .topbar-actions,
+  .status-band,
+  .view-switcher {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .view-switcher {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .view-switcher button {
+    min-width: 0;
+    padding: 8px 6px;
+  }
+
+  .status-band {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .status-pill {
+    min-width: 0;
+    justify-content: center;
+    padding: 6px;
+    white-space: normal;
+  }
+
+  .topbar-actions {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .user-select,
+  .user-select select {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .wallet-active-row {
+    grid-template-columns: minmax(108px, 0.42fr) minmax(0, 1fr);
+  }
+
+  .wallet-active-row > .compact-label {
+    grid-column: 1;
+  }
+
+  .wallet-active-row > .balance-block {
+    grid-column: 2;
+  }
+
+  .wallet-active-row > .active-label {
+    grid-column: 1;
+  }
+
+  .wallet-active-row > .booking-list {
+    grid-column: 2;
+    grid-template-columns: minmax(0, 1fr);
+    min-width: 0;
+  }
+
+  .wallet-active-row > .booking-list > .active-booking-grid,
+  .wallet-active-row > .booking-list > .active-toggle {
+    grid-column: 1;
+  }
+
+  .balance-block {
+    min-width: 0;
+    min-height: 64px;
+    padding: 8px 10px;
+  }
+
+  .balance-value {
+    font-size: 2.35rem;
+    white-space: nowrap;
+  }
+
+  .active-booking-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+  }
+
+  .active-booking-card,
+  .booking-row summary {
+    min-height: 44px;
+  }
+
+  .availability-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    overflow-x: visible;
+  }
+
+  .availability-day {
+    min-width: 0;
+    min-height: 76px;
+  }
+
+  .availability-head,
+  .availability-slot,
+  .availability-time {
+    min-width: 0;
+  }
+
+  .availability-time {
+    white-space: normal;
+  }
+
+  #scanTasks > .compact-label,
+  #scanTasks > .scan-form,
+  #scanTasks > .scan-task-list {
+    grid-area: auto;
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .scan-form {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .scan-form > * {
+    grid-column: 1 / -1;
+    grid-row: auto;
+    min-width: 0;
+  }
+
+  .scan-form > .touch-field,
+  .scan-form > .scan-grid,
+  .scan-form > label,
+  .scan-form > .option-grid,
+  .scan-form > .button.primary {
+    grid-column: 1 / -1;
+    grid-row: auto;
+    min-width: 0;
+  }
+
+  .scan-form > .touch-field {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .scan-form > .touch-field > .scan-target-list,
+  .scan-form > .touch-field > #addScanTarget {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .scan-target-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .scan-target-row > label:first-child,
+  .scan-target-row > .button {
+    grid-column: 1 / -1;
+  }
+
+  .scan-form > .scan-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .scan-form > .scan-grid > label:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .scan-form > .option-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .scan-form > .button.primary {
+    min-height: 48px;
+  }
+
+  .scan-task-list {
+    max-height: none;
+  }
+
+  .booking-form {
+    grid-template-columns: minmax(0, 1fr);
+    overflow-x: visible;
+    gap: 8px;
+  }
+
+  .booking-form > * {
+    grid-area: auto;
+    grid-column: 1 / -1;
+    grid-row: auto;
+    min-width: 0;
+  }
+
+  .booking-form > label,
+  .booking-form > .touch-field,
+  .booking-form > .time-field,
+  .booking-form > .court-picker,
+  .booking-form > .range-field,
+  .booking-form > .option-grid,
+  .booking-form > .action-row {
+    min-width: 0;
+  }
+
+  .time-field {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .time-stepper {
+    grid-template-columns: 44px minmax(82px, 1fr) 44px;
+  }
+
+  .step-button,
+  .button,
+  .icon-button,
+  .segmented-control button {
+    min-height: 44px;
+  }
+
+  .court-grid {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 5px;
+  }
+
+  .court-option {
+    width: auto;
+    min-width: 0;
+    min-height: 44px;
+  }
+
+  .range-control {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 6px;
+  }
+
+  .segmented-control {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .booking-form > .option-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .action-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .history-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    min-width: 0;
+  }
+
+  .history-list > .empty-state {
+    grid-column: 1 / -1;
+  }
+
+  .history-row,
+  .active-booking-card,
+  .scan-task-card,
+  .option-card,
+  .empty-state {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (max-width: 420px) {
+  .wallet-active-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .wallet-active-row > .compact-label,
+  .wallet-active-row > .balance-block,
+  .wallet-active-row > .active-label,
+  .wallet-active-row > .booking-list {
+    grid-column: 1;
+  }
+
+  .balance-value {
+    font-size: 2.15rem;
+  }
+
+  .availability-list,
+  .history-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .status-band {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

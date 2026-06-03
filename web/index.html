@@ -25,7 +25,7 @@
         <div class="rail-mark">D</div>
         <nav>
           <a href="#wallet">余额</a>
-          <a href="#bookings">活跃</a>
+          <a href="#wallet">活跃</a>
           <a href="#availability">分布</a>
           <a href="#scanTasks">扫描</a>
           <a href="#submit">提交</a>
@@ -36,17 +36,31 @@
       </aside>
 
       <main class="workspace">
-        <header class="topbar">
-          <div>
+        <header class="topbar console-row top-console-row">
+          <div class="brand-tile">
             <p class="eyebrow">Daydayup</p>
             <h1>预约操作台</h1>
           </div>
-          <div class="topbar-actions">
+          <div class="top-console-center">
             <div class="view-switcher" id="viewSwitcher" aria-label="显示风格">
               <button type="button" data-view-mode="default" aria-pressed="true">默认</button>
               <button type="button" data-view-mode="numbers" aria-pressed="false">关键参数</button>
               <button type="button" data-view-mode="behavior" aria-pressed="false">参数行为</button>
             </div>
+            <div class="status-band" aria-label="连接状态">
+              <div class="status-help">
+                <div class="status-pill" id="sessionState">Session 检查中</div>
+                <button class="help-dot" id="sessionHelpTrigger" type="button" aria-label="查看 Session 指引" aria-expanded="false" aria-describedby="sessionHelp">?</button>
+                <div class="status-popover" id="sessionHelp" role="tooltip">
+                  <strong>为什么会显示 Session 未传</strong>
+                  <p>当前服务没有收到 `DAYDAYUP_JSESSIONID` 或 `-j` 参数，所以请求不会携带登录 Cookie。查询余额和活跃预约通常只需要 Token；正式预约前建议手动登录微信页面，用 Reqable 抓取 Cookie 里的 JSESSIONID，再重启本地服务。</p>
+                </div>
+              </div>
+              <div class="status-pill" id="tokenState">Token 检查中</div>
+              <div class="status-pill" id="lastRefresh">连通检查中</div>
+            </div>
+          </div>
+          <div class="topbar-actions">
             <label class="user-select">
               <span>用户</span>
               <select id="userSelect"></select>
@@ -55,64 +69,45 @@
           </div>
         </header>
 
-        <section class="status-band" aria-label="连接状态">
-          <div class="status-pill" id="tokenState">Token 检查中</div>
-          <div class="status-help">
-            <div class="status-pill" id="sessionState">Session 检查中</div>
-            <button class="help-dot" id="sessionHelpTrigger" type="button" aria-label="查看 Session 指引" aria-expanded="false" aria-describedby="sessionHelp">?</button>
-            <div class="status-popover" id="sessionHelp" role="tooltip">
-              <strong>为什么会显示 Session 未传</strong>
-              <p>当前服务没有收到 `DAYDAYUP_JSESSIONID` 或 `-j` 参数，所以请求不会携带登录 Cookie。查询余额和活跃预约通常只需要 Token；正式预约前建议手动登录微信页面，用 Reqable 抓取 Cookie 里的 JSESSIONID，再重启本地服务。</p>
-            </div>
-          </div>
-          <div class="status-pill" id="lastRefresh">尚未刷新</div>
-        </section>
-
         <section class="panel view-mode-details" id="viewModeDetails" aria-label="参数详情" hidden></section>
 
-        <section class="panel wallet-panel" id="wallet" aria-labelledby="walletTitle">
-          <div class="section-head">
+        <section class="panel console-row wallet-active-row" id="wallet" aria-labelledby="walletTitle">
+          <div class="section-label compact-label">
             <div>
               <p class="eyebrow">Wallet</p>
               <h2 id="walletTitle">卡余额</h2>
             </div>
-            <button class="button secondary compact" id="refreshCards" type="button">刷新余额</button>
           </div>
           <div class="balance-block" id="primaryCard">
             <span class="skeleton wide"></span>
             <span class="skeleton"></span>
           </div>
-          <details class="subtle-details">
-            <summary>其他卡</summary>
-            <div id="otherCards" class="mini-list"></div>
-          </details>
-        </section>
-
-        <section class="panel" id="bookings" aria-labelledby="bookingsTitle">
-          <div class="section-head">
+          <button class="button secondary compact hidden-control" id="refreshCards" type="button">刷新余额</button>
+          <div class="section-label compact-label active-label" aria-labelledby="bookingsTitle">
             <div>
               <p class="eyebrow">Active</p>
               <h2 id="bookingsTitle">活跃预约</h2>
             </div>
-            <button class="button secondary compact" id="refreshBookings" type="button">刷新活跃</button>
           </div>
           <div class="booking-list" id="bookingList"></div>
+          <button class="button secondary compact hidden-control" id="refreshBookings" type="button">刷新活跃</button>
+          <div id="otherCards" class="mini-list hidden-control"></div>
         </section>
 
-        <section class="panel" id="availability" aria-labelledby="availabilityTitle">
-          <div class="section-head">
+        <section class="panel console-row availability-row" id="availability" aria-labelledby="availabilityTitle">
+          <div class="section-label compact-label">
             <div>
               <p class="eyebrow">Availability</p>
               <h2 id="availabilityTitle">可约分布</h2>
             </div>
-            <button class="button secondary compact" id="scanAvailability" type="button">查询 5 天分布</button>
           </div>
           <div class="availability-list" id="availabilityList">
-            <div class="empty-state">点击按钮后查询今天到 4 天后的全部可约场地。</div>
+            <div class="empty-state compact">等待可约分布刷新。</div>
           </div>
+          <button class="button secondary compact hidden-control" id="scanAvailability" type="button">查询 5 天分布</button>
           <div class="availability-warning" id="availabilityWarning" role="status" aria-live="polite" hidden></div>
           <div class="availability-combos" id="availabilityCombos"></div>
-          <div class="availability-selection" id="availabilitySelection">
+          <div class="availability-selection" id="availabilitySelection" hidden>
             <div class="availability-tool-head">
               <strong>已选场地</strong>
               <span class="chip" id="exactSelectionTotal">合计 0.00</span>
@@ -127,13 +122,12 @@
           </div>
         </section>
 
-        <section class="panel" id="scanTasks" aria-labelledby="scanTasksTitle">
-          <div class="section-head">
+        <section class="panel console-row scan-console-row" id="scanTasks" aria-labelledby="scanTasksTitle">
+          <div class="section-label compact-label">
             <div>
               <p class="eyebrow">Scan</p>
               <h2 id="scanTasksTitle">扫描预约</h2>
             </div>
-            <button class="button secondary compact" id="refreshScanTasks" type="button">刷新扫描</button>
           </div>
 
           <form class="scan-form" id="scanTaskForm">
@@ -193,9 +187,10 @@
 
             <button class="button primary" type="submit">发布扫描任务</button>
           </form>
+          <button class="button secondary compact hidden-control" id="refreshScanTasks" type="button">刷新扫描</button>
 
           <div class="scan-task-list" id="scanTaskList">
-            <div class="empty-state">还没有扫描任务。</div>
+            <div class="empty-state compact">当前没有扫描中的任务。</div>
           </div>
 
           <div class="scan-event-list" id="scanEventList">
@@ -203,13 +198,12 @@
           </div>
         </section>
 
-        <section class="panel" id="submit" aria-labelledby="submitTitle">
-          <div class="section-head">
+        <section class="panel console-row submit-console-row" id="submit" aria-labelledby="submitTitle">
+          <div class="section-label compact-label">
             <div>
               <p class="eyebrow">Submit</p>
               <h2 id="submitTitle">提交预约</h2>
             </div>
-            <span class="chip warning">默认排除 4, 5, 12</span>
           </div>
 
           <form class="booking-form" id="bookingForm">
@@ -235,7 +229,7 @@
               <input name="time" type="hidden" value="17-21" />
             </div>
 
-            <div class="touch-field">
+            <div class="touch-field hidden-control">
               <div class="field-head">
                 <span>时长</span>
               </div>
@@ -249,24 +243,22 @@
             <div class="touch-field priority-control">
               <div class="field-head">
                 <span>优先场地</span>
-                <output class="touch-value" id="priorityValue">7 8 9 6</output>
+                <output class="touch-value" id="priorityValue">6 7 8 9</output>
               </div>
               <div class="court-grid" id="courtPicker" aria-label="优先场地"></div>
-              <input name="priority" type="hidden" value="7 8 9 6" />
-              <input name="backup" type="hidden" value="2 3 4 10 11" />
+              <input name="priority" type="hidden" value="6 7 8 9" />
+              <input name="backup" type="hidden" value="1 2 3 10 11" />
             </div>
 
-            <div class="touch-field">
+            <div class="touch-field window-control">
               <div class="field-head">
                 <span>窗口秒数</span>
               </div>
-              <div class="segmented-control" id="windowPicker" aria-label="窗口秒数">
-                <button type="button" data-value="30">30s</button>
-                <button type="button" data-value="60" aria-pressed="true">60s</button>
-                <button type="button" data-value="90">90s</button>
-                <button type="button" data-value="120">120s</button>
+              <div class="range-control">
+                <output class="range-limit" id="windowValue">10秒</output>
+                <input class="range-slider" id="windowSlider" name="window_seconds" type="range" min="10" max="90" step="5" value="30" />
+                <span class="range-limit">90秒</span>
               </div>
-              <input name="window_seconds" type="hidden" value="60" />
             </div>
 
             <div class="touch-field">
@@ -274,14 +266,11 @@
                 <span>轮询间隔</span>
               </div>
               <div class="segmented-control" id="pollPicker" aria-label="轮询间隔">
-                <button type="button" data-value="0.05" data-mode="direct-fast">快速直抢</button>
+                <button type="button" data-value="0.05" data-mode="direct-fast" aria-pressed="true">快速直抢</button>
                 <button type="button" data-value="0.05" data-mode="guided-fast">快速引导</button>
-                <button type="button" data-value="0.08" aria-pressed="true">均衡</button>
-                <button type="button" data-value="0.12">稳妥</button>
-                <button type="button" data-value="0.2">保守</button>
               </div>
-              <input name="booking_mode" type="hidden" value="balanced" />
-              <input name="poll_interval" type="hidden" value="0.08" />
+              <input name="booking_mode" type="hidden" value="direct-fast" />
+              <input name="poll_interval" type="hidden" value="0.05" />
             </div>
 
             <div class="option-grid">
@@ -315,23 +304,21 @@
           </form>
         </section>
 
-        <section class="panel" id="bookingHistory" aria-labelledby="bookingHistoryTitle">
-          <div class="section-head">
+        <section class="panel console-row history-console-row" id="bookingHistory" aria-labelledby="bookingHistoryTitle">
+          <div class="section-label compact-label">
             <div>
               <p class="eyebrow">History</p>
               <h2 id="bookingHistoryTitle">历史预约</h2>
             </div>
-            <div class="section-actions">
-              <div class="log-window-control" data-log-window-control aria-label="历史预约时间窗"></div>
-              <button class="button secondary compact" id="refreshBookingHistory" type="button">刷新历史</button>
-            </div>
           </div>
+          <div class="log-window-control hidden-control" data-log-window-control aria-label="历史预约时间窗"></div>
+          <button class="button secondary compact hidden-control" id="refreshBookingHistory" type="button">刷新历史</button>
           <div class="history-list" id="bookingHistoryList">
-            <div class="empty-state">还没有通过操作台发起过预约。</div>
+            <div class="empty-state compact">暂无历史预约。</div>
           </div>
         </section>
 
-        <section class="panel" id="logs" aria-labelledby="logsTitle">
+        <section class="panel utility-panel" id="logs" aria-labelledby="logsTitle">
           <div class="section-head">
             <div>
               <p class="eyebrow">Log</p>
@@ -345,7 +332,7 @@
           <div class="log-stream" id="logStream" aria-live="polite"></div>
         </section>
 
-        <section class="panel user-panel" id="users" aria-labelledby="usersTitle">
+        <section class="panel user-panel utility-panel" id="users" aria-labelledby="usersTitle">
           <div class="section-head">
             <div>
               <p class="eyebrow">Users</p>
