@@ -20,6 +20,7 @@ const state = {
   cancelDialogPreview: null,
   cancelDialogError: "",
   cancelDialogLoading: false,
+  historyDetailId: "",
   cards: [],
   startHour: 17,
   endHour: 21,
@@ -125,6 +126,10 @@ const els = {
   closeCancelDialog: document.querySelector("#closeCancelDialog"),
   cancelDialogBack: document.querySelector("#cancelDialogBack"),
   cancelDialogSubmit: document.querySelector("#cancelDialogSubmit"),
+  historyDetailDialog: document.querySelector("#historyDetailDialog"),
+  closeHistoryDetailDialog: document.querySelector("#closeHistoryDetailDialog"),
+  historyDetailBack: document.querySelector("#historyDetailBack"),
+  historyDetailBody: document.querySelector("#historyDetailBody"),
 };
 
 function fmtTime(ts = Date.now()) {
@@ -945,16 +950,95 @@ function renderBookingHistory(history) {
     const tone = historyResultTone(item.result);
     const summary = compactHistorySummary(item);
     return `
-      <div class="history-row">
+      <button class="history-row history-row-button" type="button" data-history-id="${escapeAttr(item.id || "")}">
         <div class="history-main">
           <span class="history-title">${escapeHtml(shortDateLabel(item.target_date || ""))}</span>
           <span class="history-time">${escapeHtml(summary.time)}</span>
           <span class="history-court">${escapeHtml(summary.court)}</span>
         </div>
         <span class="chip ${tone}">${escapeHtml(item.result || "未知")}</span>
-      </div>
+      </button>
     `;
   }).join("");
+}
+
+function openHistoryDetail(recordId) {
+  const record = state.bookingHistory.find((item) => String(item.id) === String(recordId));
+  if (!record) {
+    return;
+  }
+  state.historyDetailId = String(recordId);
+  renderHistoryDetail(record);
+  els.historyDetailDialog.classList.remove("hidden");
+  document.body.classList.add("modal-open");
+}
+
+function closeHistoryDetail() {
+  els.historyDetailDialog.classList.add("hidden");
+  document.body.classList.remove("modal-open");
+  state.historyDetailId = "";
+}
+
+function renderHistoryDetail(record) {
+  const detail = record.detail && typeof record.detail === "object" ? record.detail : {};
+  const failures = Array.isArray(detail.failures) ? detail.failures : [];
+  const successes = Array.isArray(detail.successes) ? detail.successes : [];
+  const failureMarkup = failures.length
+    ? failures.map((item) => historyDetailFailureMarkup(item)).join("")
+    : record.status === "failed"
+      ? `<div class="refund-box danger"><strong>没有保存到失败明细</strong><p>这条历史记录来自旧版本，只记录了失败结果，没有保存接口返回的具体原因。</p></div>`
+      : "";
+  const successMarkup = successes.length
+    ? successes.map((item) => historyDetailSuccessMarkup(item)).join("")
+    : "";
+  const noteMarkup = record.note ? `<div class="refund-box"><strong>说明</strong><p>${escapeHtml(record.note)}</p></div>` : "";
+
+  els.historyDetailBody.innerHTML = `
+    <div class="warning-box">
+      <strong>${escapeHtml(record.target_date || "-")} ${escapeHtml(compactHistorySummary(record).time)}</strong>
+      <p>${escapeHtml(record.target_time || "-")} · ${escapeHtml(record.user_label || "-")}</p>
+    </div>
+    <div class="refund-box">
+      <strong>记录状态</strong>
+      <div class="refund-grid">
+        ${dataRow("结果", record.result || "-")}
+        ${dataRow("状态", record.status || "-")}
+        ${dataRow("创建", record.requested_at || "-")}
+        ${dataRow("结束", record.finished_at || "-")}
+      </div>
+    </div>
+    ${successMarkup}
+    ${failureMarkup}
+    ${noteMarkup}
+  `;
+}
+
+function historyDetailFailureMarkup(item) {
+  const slot = item.slot || {};
+  return `
+    <div class="refund-box danger">
+      <strong>${escapeHtml(historySlotLabel(slot))}</strong>
+      <p>${escapeHtml(item.error || "未返回具体失败原因")}</p>
+    </div>
+  `;
+}
+
+function historyDetailSuccessMarkup(item) {
+  const slot = item.slot || {};
+  const bill = item.bill_num ? ` · bill ${escapeHtml(item.bill_num)}` : "";
+  return `
+    <div class="refund-box">
+      <strong>${escapeHtml(historySlotLabel(slot))}</strong>
+      <p>预约成功${bill}</p>
+    </div>
+  `;
+}
+
+function historySlotLabel(slot) {
+  const date = slot.date || "";
+  const time = slot.time || "";
+  const name = slot.name || slot.id || "";
+  return [date, time, name].filter(Boolean).join(" · ") || "未知场地";
 }
 
 function compactHistorySummary(item) {
@@ -2428,6 +2512,13 @@ els.scanTaskForm.addEventListener("submit", createScanTask);
 els.scanTaskForm.addEventListener("input", renderViewModeDetails);
 els.scanTaskForm.addEventListener("change", renderViewModeDetails);
 els.refreshBookingHistory.addEventListener("click", () => loadBookingHistory().catch((error) => addUiLog(`历史预约刷新失败: ${error.message}`, true)));
+els.bookingHistoryList.addEventListener("click", (event) => {
+  const row = event.target.closest("[data-history-id]");
+  if (!row) {
+    return;
+  }
+  openHistoryDetail(row.dataset.historyId || "");
+});
 els.bookingForm.addEventListener("submit", startBooking);
 els.bookingForm.addEventListener("input", renderViewModeDetails);
 els.bookingForm.addEventListener("change", renderViewModeDetails);
@@ -2437,6 +2528,13 @@ els.cancelDialogBack.addEventListener("click", closeCancelDialog);
 els.cancelDialog.addEventListener("click", (event) => {
   if (event.target === els.cancelDialog) {
     closeCancelDialog();
+  }
+});
+els.closeHistoryDetailDialog.addEventListener("click", closeHistoryDetail);
+els.historyDetailBack.addEventListener("click", closeHistoryDetail);
+els.historyDetailDialog.addEventListener("click", (event) => {
+  if (event.target === els.historyDetailDialog) {
+    closeHistoryDetail();
   }
 });
 els.cancelDialogSubmit.addEventListener("click", () => {

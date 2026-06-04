@@ -582,6 +582,20 @@ select:focus-visible {
   padding: 12px;
 }
 
+.history-row-button {
+  width: 100%;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.history-row-button:hover,
+.history-row-button:focus-visible {
+  border-color: var(--primary-blue);
+  box-shadow: 0 0 0 2px color-mix(in oklch, var(--primary-blue), transparent 78%);
+}
+
 .booking-main,
 .history-main {
   display: grid;

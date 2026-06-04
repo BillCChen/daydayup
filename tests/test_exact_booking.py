@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 import web_console
 
@@ -133,6 +135,66 @@ class ExactBookingTest(unittest.TestCase):
         self.assertEqual(reservation[0], "place/reservationPlace")
         self.assertEqual(reservation[1]["oldTotal"], "80.00")
         self.assertEqual(reservation[1]["total"], "20.00")
+
+    def test_exact_booking_history_keeps_failure_detail(self):
+        console = web_console.WebConsole.__new__(web_console.WebConsole)
+        console.config = web_console.ServerConfig(
+            shop_num="1001",
+            base_url="https://example.invalid",
+            timeout=1.0,
+        )
+        console.users = FakeUserStore()
+        console.history = FakeHistory()
+        client = FakeClient()
+        console.client = lambda user: client
+        console.resolve_booking_card = lambda user: {
+            "card_index_raw": "card-1",
+            "cash_balance_value": 50.0,
+            "card_index": "car...d-1",
+        }
+        console._reserve_exact_slot = lambda *args, **kwargs: (_ for _ in ()).throw(web_console.EasySerpError("slot is gone"))
+
+        result = console.book_exact(
+            {
+                "user_key": "user_1",
+                "slots": [{"date": "2026-05-18", "start_time": "15:00", "end_time": "16:00", "id": "ymq7"}],
+            }
+        )
+
+        history_result = console.history.records[0][1]
+        detail = web_console.exact_history_detail(history_result)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(detail["failures"][0]["error"], "slot is gone")
+        self.assertEqual(detail["failures"][0]["slot"]["time"], "15:00-16:00")
+        self.assertEqual(detail["failures"][0]["slot"]["name"], "羽毛球7")
+
+    def test_create_exact_writes_failure_detail(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history = web_console.BookingHistoryStore(Path(tmpdir) / "booking_history.json")
+            user = FakeUserStore().user
+            result = {
+                "status": "failed",
+                "result_label": "失败",
+                "dry_run": False,
+                "success_targets": [],
+                "successes": [],
+                "failures": [
+                    {
+                        "slot": {"date": "2026-05-18", "time": "15:00-16:00", "name": "羽毛球7", "id": "ymq7"},
+                        "error": "selected slot is no longer bookable",
+                    }
+                ],
+            }
+
+            history.create_exact(
+                {"slots": [{"date": "2026-05-18", "start_time": "15:00", "end_time": "16:00", "id": "ymq7"}]},
+                result,
+                user,
+            )
+
+            record = history.list(limit=1, window_hours=None)[0]
+            self.assertEqual(record["detail"]["failures"][0]["error"], "selected slot is no longer bookable")
+            self.assertEqual(record["detail"]["failures"][0]["slot"]["name"], "羽毛球7")
 
 
 if __name__ == "__main__":

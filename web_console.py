@@ -341,6 +341,7 @@ class BookingHistoryStore:
             "status": clean_string(result.get("status")) or "failed",
             "command_label": "exact_booking",
             "finished_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+            "detail": exact_history_detail(result),
         }
         with self.lock:
             records = self._read_unlocked()
@@ -2388,6 +2389,40 @@ def exact_result_status(
     if successes:
         return "success", "成功"
     return "failed", "失败"
+
+
+def exact_history_detail(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "exact_booking",
+        "dry_run": bool(result.get("dry_run")),
+        "total_pay": clean_string(result.get("total_pay")),
+        "successes": [
+            {
+                "slot": public_history_slot(item.get("slot")),
+                "bill_num": clean_string((item.get("slot") or {}).get("bill_num")) if isinstance(item, dict) else "",
+            }
+            for item in result.get("successes") or []
+            if isinstance(item, dict)
+        ],
+        "failures": [
+            {
+                "slot": public_history_slot(item.get("slot")),
+                "error": clean_string(item.get("error")) if isinstance(item, dict) else "",
+            }
+            for item in result.get("failures") or []
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def public_history_slot(value: Any) -> dict[str, Any]:
+    slot = value if isinstance(value, dict) else {}
+    return {
+        "date": clean_string(slot.get("date")),
+        "time": clean_string(slot.get("time")) or slot_time_from_parts(slot),
+        "name": clean_string(slot.get("name")) or clean_string(slot.get("id")),
+        "id": clean_string(slot.get("id")),
+    }
 
 
 def slot_success_target(slot: dict[str, Any]) -> str:
