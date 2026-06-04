@@ -559,12 +559,9 @@ select:focus-visible {
   background: var(--surface-raised);
   color: var(--text-primary);
   text-align: left;
-  cursor: pointer;
 }
 
-.booking-row:hover,
-.booking-row:focus-visible,
-.booking-row.selected {
+.booking-row:focus-within {
   border-color: var(--primary-amber);
   background: color-mix(in oklch, var(--primary-amber-soft), var(--surface-raised) 45%);
   outline: none;
@@ -2177,34 +2174,11 @@ body.modal-open {
 .booking-row {
   display: grid;
   min-height: 44px;
-  padding: 0;
-  overflow: hidden;
-}
-
-.booking-row summary {
-  display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 6px;
-  min-height: 42px;
   padding: 6px 8px;
-  cursor: pointer;
-  list-style: none;
-}
-
-.booking-row summary::-webkit-details-marker {
-  display: none;
-}
-
-.booking-detail-line {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  border-top: 1px solid var(--border-muted);
-  padding: 6px 8px;
-  color: var(--text-secondary);
-  font-size: 0.82rem;
+  overflow: hidden;
 }
 
 .active-toggle {
@@ -3035,7 +3009,7 @@ body.modal-open {
   }
 
   .active-booking-card,
-  .booking-row summary {
+  .booking-row {
     min-height: 44px;
   }
 

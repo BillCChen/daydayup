@@ -1,7 +1,6 @@
 const state = {
   bookings: [],
   bookingHistory: [],
-  selectedBill: "",
   jobTimer: null,
   jobLineCounts: {},
   uiLogs: [],
@@ -598,42 +597,18 @@ function renderBookings(bookings) {
   els.bookingList.innerHTML = `
     <div class="active-booking-grid">
       ${visibleBookings.map((booking) => {
-    const selected = booking.bill_num === state.selectedBill ? " selected" : "";
     const refundState = bookingRefundState(booking);
     return `
-      <details class="booking-row${selected}" data-bill="${escapeAttr(booking.bill_num)}">
-        <summary>
-          <span class="booking-summary"><span class="booking-time">${escapeHtml(activeBookingLabel(booking))}</span></span>
-          <span class="chip ${refundState.tone}">${escapeHtml(refundState.label)}</span>
-        </summary>
-        <div class="booking-detail-line">
-          <span>bill <span class="numeric">${escapeHtml(booking.bill_num || "-")}</span></span>
-          <span>${escapeHtml(booking.amount || "-")}</span>
-          ${!booking.cancelled && !refundState.expired ? renderRefundAction(booking, refundState) : ""}
-        </div>
-      </details>
+      <div class="booking-row">
+        <span class="booking-summary"><span class="booking-time">${escapeHtml(activeBookingLabel(booking))}</span></span>
+        ${renderRefundAction(booking, refundState)}
+      </div>
     `;
       }).join("")}
     </div>
     ${toggleMarkup}
   `;
 
-  els.bookingList.querySelectorAll(".booking-row").forEach((row) => {
-    row.addEventListener("toggle", () => {
-      if (row.open) {
-        selectBooking(row.dataset.bill, { scroll: false, renderList: false });
-      }
-    });
-    row.addEventListener("keydown", (event) => {
-      if (event.target.closest("[data-cancel-bill]")) {
-        return;
-      }
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        selectBooking(row.dataset.bill);
-      }
-    });
-  });
   els.bookingList.querySelector("[data-active-toggle]")?.addEventListener("click", () => {
     state.activeBookingsExpanded = !state.activeBookingsExpanded;
     renderBookings(state.bookings);
@@ -687,20 +662,6 @@ function renderRefundAction(booking, refundState) {
     return `<button class="chip chip-button ${refundState.tone}" type="button" data-cancel-bill="${escapeAttr(booking.bill_num)}">${escapeHtml(refundState.label)}</button>`;
   }
   return `<span class="chip ${refundState.tone}">${escapeHtml(refundState.label)}</span>`;
-}
-
-function selectBooking(billNum, options = {}) {
-  state.selectedBill = billNum;
-  if (options.renderList !== false) {
-    renderBookings(state.bookings);
-  }
-  const booking = state.bookings.find((item) => item.bill_num === billNum);
-  renderDetail(booking);
-  renderViewModeDetails();
-  const detailPane = document.querySelector("#detailPane");
-  if (options.scroll !== false && detailPane && getComputedStyle(detailPane).display !== "none") {
-    detailPane.scrollIntoView({ behavior: "smooth", block: "start" });
-  }
 }
 
 function renderDetail(booking, preview = null, error = "") {
@@ -790,13 +751,10 @@ async function openCancelDialog(billNum) {
     addUiLog(`退订失败: 未找到 bill ${billNum}`, true);
     return;
   }
-  state.selectedBill = billNum;
   state.cancelDialogBill = billNum;
   state.cancelDialogPreview = null;
   state.cancelDialogError = "";
   state.cancelDialogLoading = true;
-  renderBookings(state.bookings);
-  renderDetail(booking);
   showCancelDialog();
   renderCancelDialog();
   try {
@@ -2008,7 +1966,6 @@ async function exchangeUserToken() {
 
 async function changeUser() {
   state.selectedUserKey = els.userSelect.value;
-  state.selectedBill = "";
   clearRefreshStamps();
   renderDetail(null);
   renderUsers();
@@ -2195,9 +2152,8 @@ function buildViewModeDetailGroups() {
       rows: [
         ["活跃数", `${bookings.length}`],
         ["可退数", `${refundableCount}`],
-        ["选中 bill", state.selectedBill || "-"],
       ],
-      behavior: "点击活跃预约会打开右侧详情；未过期且未取消的记录才显示退订入口，退订仍需要二次确认文本。",
+      behavior: "活跃预约卡片只展示日期、场地和退款状态；未过期且未取消的记录通过可退按钮进入退订确认。",
     },
     {
       title: "可约分布",
