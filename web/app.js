@@ -958,13 +958,22 @@ function renderBookingHistory(history) {
 }
 
 function compactHistorySummary(item) {
-  const source = item.success_target || item.target_time || "";
-  const timeMatch = String(source).match(/(\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2})/);
-  const courtMatch = String(source).match(/(?:羽毛球|球|场地)\s*(\d{1,2})\b/);
+  const successSource = item.success_target || "";
+  const timeSource = successSource || item.target_time || "";
+  const timeMatch = String(timeSource).match(/(\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2})/);
+  const courtMatch = String(successSource).match(/(?:羽毛球|球|场地)\s*(\d{1,2})\b/);
   return {
-    time: timeMatch ? timeMatch[1].replace(/\s+/g, "") : "-",
-    court: item.result && !String(item.result).includes("成功") ? "失败" : courtMatch ? `球${courtMatch[1]}` : "-",
+    time: timeMatch ? timeMatch[1].replace(/\s+/g, "") : compactHourRange(item.target_time),
+    court: courtMatch ? `球${courtMatch[1]}` : "-",
   };
+}
+
+function compactHourRange(value) {
+  const match = String(value || "").trim().match(/^(\d{1,2})\s*-\s*(\d{1,2})$/);
+  if (!match) {
+    return "-";
+  }
+  return `${match[1].padStart(2, "0")}:00-${match[2].padStart(2, "0")}:00`;
 }
 
 function historyResultTone(result) {
