@@ -642,7 +642,17 @@ function activeBookingLabel(booking) {
   const dateText = String(booking.date || "").trim();
   const match = dateText.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
   const dateLabel = match ? `${Number(match[2])}.${Number(match[3])}` : dateText || "-";
-  return `${dateLabel}-${courtNumberLabel(booking.court)}`;
+  const timeLabel = bookingHourRangeLabel(booking.time_range);
+  return [dateLabel, timeLabel, courtNumberLabel(booking.court)].filter(Boolean).join(" ");
+}
+
+function bookingHourRangeLabel(value) {
+  const range = String(value || "").trim();
+  const match = range.match(/(\d{1,2})(?::\d{2})?\s*[-–—]\s*(\d{1,2})(?::\d{2})?/);
+  if (!match) {
+    return range;
+  }
+  return `${Number(match[1])}-${Number(match[2])}`;
 }
 
 function courtNumberLabel(value) {
