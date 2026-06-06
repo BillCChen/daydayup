@@ -611,9 +611,11 @@ select:focus-visible {
 .booking-summary {
   display: block;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+  line-height: 1.18;
 }
 
 .booking-meta {
@@ -2173,12 +2175,16 @@ body.modal-open {
 
 .booking-row {
   display: grid;
-  min-height: 44px;
+  min-height: 52px;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 6px;
   padding: 6px 8px;
   overflow: hidden;
+}
+
+.booking-row .chip {
+  white-space: nowrap;
 }
 
 .active-toggle {
@@ -3010,7 +3016,7 @@ body.modal-open {
 
   .active-booking-card,
   .booking-row {
-    min-height: 44px;
+    min-height: 52px;
   }
 
   .availability-list {
