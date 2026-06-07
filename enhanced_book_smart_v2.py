@@ -40,6 +40,7 @@ BOOKING_MODE_BALANCED = "balanced"
 BOOKING_MODE_DIRECT_FAST = "direct-fast"
 BOOKING_MODE_GUIDED_FAST = "guided-fast"
 BOOKING_MODES = (BOOKING_MODE_BALANCED, BOOKING_MODE_DIRECT_FAST, BOOKING_MODE_GUIDED_FAST)
+DEFAULT_RESERVATION_SUBMIT_GAP = 0.25
 PREWARM_SECONDS = 3.0
 BUSY_RETRY_TEXT = "当前排队人数较多"
 FAST_RETRY_TEXT = "操作过快"
@@ -61,6 +62,144 @@ class HttpResult:
     elapsed: float
     json_data: dict | None = None
     json_error: bool = False
+
+
+@dataclass
+class PreparedBookingAttempt:
+    candidate: dict
+    label: str
+    start_time: str
+    end_time: str
+    court_name: str
+    reservation_data: dict
+
+
+class ReservationSubmitGate:
+    def __init__(self, ordered_keys, submit_gap, logger, adjacent_hours_for):
+        self.ordered_keys = list(ordered_keys)
+        self.ordered_set = set(self.ordered_keys)
+        self.submit_gap = max(float(submit_gap or 0), 0.0)
+        self.logger = logger
+        self.adjacent_hours_for = adjacent_hours_for
+        self.condition = threading.Condition()
+        self.started_keys = set()
+        self.done_keys = set()
+        self.canceled_keys = set()
+        self.successes = []
+        self.stop_all = False
+        self.next_allowed_at = 0.0
+
+    def wait_to_submit(self, key, label, candidate, retry=False):
+        logged_order_wait = False
+        logged_gap_wait = False
+        with self.condition:
+            while True:
+                reason = self._cancel_reason_locked(candidate)
+                if reason:
+                    self._cancel_locked(key, label, candidate, reason)
+                    return False
+
+                current_key = self._current_key_locked()
+                waits_for_order = (
+                    not retry
+                    and key in self.ordered_set
+                    and current_key is not None
+                    and current_key != key
+                )
+                if waits_for_order:
+                    if not logged_order_wait:
+                        self.logger.info(
+                            f"[提交队列] 等待顺序 label={label} key={key} current={current_key}"
+                        )
+                        logged_order_wait = True
+                    self.condition.wait(0.01)
+                    continue
+
+                now = time.monotonic()
+                wait_seconds = max(self.next_allowed_at - now, 0.0)
+                if wait_seconds > 0:
+                    if not logged_gap_wait:
+                        self.logger.info(
+                            f"[提交队列] 等待节流 label={label} key={key} "
+                            f"retry={retry} wait={wait_seconds:.3f}s"
+                        )
+                        logged_gap_wait = True
+                    self.condition.wait(wait_seconds)
+                    continue
+
+                self.started_keys.add(key)
+                self.next_allowed_at = time.monotonic() + self.submit_gap
+                self.logger.info(
+                    f"[提交队列] 放行 label={label} key={key} retry={retry} "
+                    f"gap={self.submit_gap:.3f}s"
+                )
+                self.condition.notify_all()
+                return True
+
+    def record_result(self, key, label, candidate, result):
+        with self.condition:
+            self.done_keys.add(key)
+            if result == "success":
+                self.successes.append(candidate)
+                self.logger.info(
+                    f"[提交队列] 成功记录 label={label} key={key} "
+                    f"{self._candidate_text(candidate)}"
+                )
+                if self._has_success_pair_locked():
+                    self.stop_all = True
+                    self.logger.info("[提交队列] 已形成连续两小时，停止剩余提交")
+            self.condition.notify_all()
+
+    def successful_candidates(self):
+        with self.condition:
+            return list(self.successes)
+
+    def _current_key_locked(self):
+        inactive = self.done_keys | self.canceled_keys
+        for key in self.ordered_keys:
+            if key not in inactive:
+                return key
+        return None
+
+    def _cancel_reason_locked(self, candidate):
+        if self.stop_all:
+            return "pair_complete"
+
+        success_hours = {item["hour"] for item in self.successes}
+        if not success_hours:
+            return ""
+
+        hour = candidate["hour"]
+        if hour in success_hours:
+            return "same_hour_success"
+
+        adjacent_hours = set()
+        for success_hour in success_hours:
+            adjacent_hours.update(self.adjacent_hours_for(success_hour))
+        if hour not in adjacent_hours:
+            return "not_adjacent_to_success"
+        return ""
+
+    def _cancel_locked(self, key, label, candidate, reason):
+        if key not in self.canceled_keys:
+            self.canceled_keys.add(key)
+            self.done_keys.add(key)
+            self.logger.info(
+                f"[提交队列] 取消 label={label} key={key} reason={reason} "
+                f"{self._candidate_text(candidate)}"
+            )
+            self.condition.notify_all()
+
+    def _has_success_pair_locked(self):
+        hours = sorted({item["hour"] for item in self.successes})
+        return any(right - left == 1 for left, right in zip(hours, hours[1:]))
+
+    @staticmethod
+    def _candidate_text(candidate):
+        return (
+            f"{candidate['hour']}:00-{candidate['hour'] + 1}:00 "
+            f"{candidate['court_name']}({candidate['court_id']})"
+        )
 
 
 class GuidedBookingState:
@@ -296,6 +435,8 @@ def fingerprint(value):
 class SmartBookingBotV2:
     def __init__(self, args):
         self.args = args
+        if not hasattr(self.args, "reservation_submit_gap"):
+            self.args.reservation_submit_gap = DEFAULT_RESERVATION_SUBMIT_GAP
         self.base_url = args.base_url.rstrip("/")
         self.origin = self._origin_from_base_url(self.base_url)
         self.fail_stats = Counter()
@@ -409,7 +550,7 @@ class SmartBookingBotV2:
         )
         self.logger.info(
             f"[配置] rounds={self.args.rounds} | second_rounds={self.args.second_rounds} | "
-            f"step_sleep={self.args.step_sleep}s"
+            f"step_sleep={self.args.step_sleep}s | reservation_submit_gap={self.args.reservation_submit_gap}s"
         )
         if self.args.booking_mode == BOOKING_MODE_GUIDED_FAST:
             self.logger.info(
@@ -570,6 +711,8 @@ class SmartBookingBotV2:
             raise ValueError("--guide-interval 必须大于0")
         if self.args.guide_max_inflight <= 0:
             raise ValueError("--guide-max-inflight 必须大于0")
+        if self.args.reservation_submit_gap < 0:
+            raise ValueError("--reservation-submit-gap 不能小于0")
 
     def _weekday_name(self):
         return ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][self.weekday]
@@ -905,6 +1048,31 @@ class SmartBookingBotV2:
                 )
         return candidates
 
+    def order_direct_speculative_candidates(self, center_candidates, adjacent_candidates, center_hour):
+        by_key = {(item["hour"], item["court_id"]): item for item in center_candidates + adjacent_candidates}
+        ordered = []
+        used_keys = set()
+        target_hours = self.generate_second_target_hours(center_hour)
+        ordered_courts = []
+        for item in center_candidates + adjacent_candidates:
+            if item["court_id"] not in ordered_courts:
+                ordered_courts.append(item["court_id"])
+
+        for court_id in ordered_courts:
+            for hour in [center_hour] + target_hours:
+                key = (hour, court_id)
+                candidate = by_key.get(key)
+                if candidate and key not in used_keys:
+                    ordered.append(candidate)
+                    used_keys.add(key)
+
+        for candidate in center_candidates + adjacent_candidates:
+            key = (candidate["hour"], candidate["court_id"])
+            if key not in used_keys:
+                ordered.append(candidate)
+                used_keys.add(key)
+        return ordered
+
     def _synthetic_candidate(self, hour, court_id, **extra):
         left_count = extra.pop("left_count", 0)
         right_count = extra.pop("right_count", 0)
@@ -1000,6 +1168,8 @@ class SmartBookingBotV2:
         candidate_total,
         client=None,
         failure_stats=None,
+        submit_gate=None,
+        submit_key=None,
     ):
         request_client = client or self.client
         hour = candidate["hour"]
@@ -1104,19 +1274,56 @@ class SmartBookingBotV2:
             "masterCardNum": "",
             "zengzhiMoney": "0",
         }
+        prepared = PreparedBookingAttempt(
+            candidate=candidate,
+            label=label,
+            start_time=start_time,
+            end_time=end_time,
+            court_name=court_name,
+            reservation_data=reservation_data,
+        )
+        return self.submit_prepared_booking(
+            prepared,
+            request_client,
+            failure_stats,
+            submit_gate=submit_gate,
+            submit_key=submit_key or label,
+        )
+
+    def submit_prepared_booking(
+        self,
+        prepared,
+        request_client,
+        failure_stats=None,
+        submit_gate=None,
+        submit_key=None,
+    ):
+        candidate = prepared.candidate
+        label = prepared.label
         reservation_label = f"{label}_reservationPlace"
         max_reservation_attempts = 2
+        submit_key = submit_key or label
         for reservation_attempt in range(1, max_reservation_attempts + 1):
+            retry_attempt = reservation_attempt > 1
+            if submit_gate and not submit_gate.wait_to_submit(
+                submit_key,
+                label,
+                candidate,
+                retry=retry_attempt,
+            ):
+                return "canceled"
+
             r3 = request_client.request(
                 "POST",
                 "/place/reservationPlace",
-                data=reservation_data,
+                data=prepared.reservation_data,
                 label=reservation_label,
             )
             if self._response_success(r3):
                 self.logger.info(
                     f"[成功] label={label} 预约成功 | 日期={self.target_date} | "
-                    f"时段={start_time}-{end_time} | 场地={court_name}({court_id})"
+                    f"时段={prepared.start_time}-{prepared.end_time} | "
+                    f"场地={prepared.court_name}({candidate['court_id']})"
                 )
                 return "success"
 
@@ -1126,7 +1333,7 @@ class SmartBookingBotV2:
             ):
                 self._record_booking_failure(r3, reservation_label, failure_stats)
                 self.logger.warning(
-                    f"[重试] label={reservation_label} 操作过快，等待后重试同一候选 | "
+                    f"[重试] label={reservation_label} 操作过快，等待后重新入队 | "
                     f"attempt={reservation_attempt + 1}/{max_reservation_attempts}"
                 )
                 self._sleep_after_fast_retry()
@@ -1339,7 +1546,7 @@ class SmartBookingBotV2:
 
         return "failed"
 
-    def run_direct_second_stage(self, guide_state=None):
+    def run_direct_second_stage(self, guide_state=None, submit_gate=None):
         if self.target_duration != 2:
             return "skipped"
         if not self.first_booking:
@@ -1375,7 +1582,18 @@ class SmartBookingBotV2:
             self.log_second_candidates(candidates, booked_hour)
 
             for idx, candidate in enumerate(candidates, start=1):
-                result = self.attempt_single_hour_booking(candidate, "direct_second", round_index, idx, len(candidates))
+                submit_key = f"direct_second_r{round_index}_{idx}_{candidate['hour']}_{candidate['court_id']}"
+                result = self.attempt_single_hour_booking(
+                    candidate,
+                    "direct_second",
+                    round_index,
+                    idx,
+                    len(candidates),
+                    submit_gate=submit_gate,
+                    submit_key=submit_key,
+                )
+                if submit_gate:
+                    submit_gate.record_result(submit_key, "direct_second", candidate, result)
                 if guide_state:
                     guide_state.record_attempt_result(candidate, result)
                 if result == "success":
@@ -1403,8 +1621,10 @@ class SmartBookingBotV2:
         self,
         candidate,
         label,
+        submit_key,
         candidate_index,
         candidate_total,
+        submit_gate,
         results,
         result_lock,
     ):
@@ -1427,6 +1647,8 @@ class SmartBookingBotV2:
                 candidate_total,
                 client=client,
                 failure_stats=local_stats,
+                submit_gate=submit_gate,
+                submit_key=submit_key,
             )
         except Exception as exc:
             local_stats[f"{label}_exception"] += 1
@@ -1435,15 +1657,17 @@ class SmartBookingBotV2:
         finally:
             elapsed = time.monotonic() - started_at
             client.close()
+            submit_gate.record_result(submit_key, label, candidate, result)
             with result_lock:
-                self.fail_stats.update(local_stats)
                 results.append(
                     {
                         "candidate": candidate,
                         "label": label,
+                        "submit_key": submit_key,
                         "result": result,
                         "elapsed": elapsed,
                         "completed_at": time.monotonic(),
+                        "fail_stats": local_stats,
                     }
                 )
 
@@ -1507,31 +1731,49 @@ class SmartBookingBotV2:
             self.attempt_single_hour_booking(center_candidate, "direct_spec_center", 1, 1, 1)
             return "dry_run"
 
-        initial_candidates = center_candidates + adjacent_candidates
+        initial_candidates = self.order_direct_speculative_candidates(
+            center_candidates,
+            adjacent_candidates,
+            center_hour,
+        )
         candidate_total = len(initial_candidates)
         results = []
         result_lock = threading.Lock()
         threads = []
+        submit_keys = [
+            self._direct_speculative_label(center_hour, candidate)
+            for candidate in initial_candidates
+        ]
+        submit_gate = ReservationSubmitGate(
+            submit_keys,
+            self.args.reservation_submit_gap,
+            self.logger,
+            self.generate_second_target_hours,
+        )
 
         self.logger.info(
             f"[直抢投机] 启动初始批次 | center={len(center_candidates)} | "
-            f"adjacent={len(adjacent_candidates)} | total={candidate_total}"
+            f"adjacent={len(adjacent_candidates)} | total={candidate_total} | "
+            f"reservation_submit_gap={self.args.reservation_submit_gap:.3f}s"
         )
         for idx, candidate in enumerate(initial_candidates, start=1):
             label = self._direct_speculative_label(center_hour, candidate)
             thread = threading.Thread(
                 target=self._direct_speculative_booking_worker,
-                args=(candidate, label, idx, candidate_total, results, result_lock),
+                args=(candidate, label, label, idx, candidate_total, submit_gate, results, result_lock),
             )
             thread.start()
             threads.append(thread)
-            if idx == len(center_candidates) and len(adjacent_candidates) > 0:
-                self.logger.info("[直抢投机] 中间小时候选已启动，不等待结果，立即启动相邻候选")
+
+        self.logger.info("[直抢投机] 初始候选已启动，reservationPlace 由提交队列错峰放行")
 
         for thread in threads:
             thread.join()
 
-        successful_candidates = [item["candidate"] for item in results if item["result"] == "success"]
+        for item in results:
+            self.fail_stats.update(item["fail_stats"])
+
+        successful_candidates = submit_gate.successful_candidates()
         self._log_direct_speculative_results(results, successful_candidates)
         if not successful_candidates:
             self.logger.warning("[结束] 直抢投机初始批次未抢到任何一个小时")
@@ -1556,7 +1798,7 @@ class SmartBookingBotV2:
             f"[直抢投机] 初始批次已有单小时成功，选择锚点继续相邻补抢："
             f"{self._booking_candidate_text(anchor)}"
         )
-        second_status = self.run_direct_second_stage()
+        second_status = self.run_direct_second_stage(submit_gate=submit_gate)
         if second_status != "success":
             self.logger.warning("[结束] 直抢投机已有单小时成功，但相邻补抢未完成")
             return "failed"
@@ -1847,6 +2089,12 @@ Examples:
     parser.add_argument("--rounds", type=int, default=100, help="第一阶段轮数下限，默认100")
     parser.add_argument("--second-rounds", type=int, default=100, help="第二阶段轮数下限，默认100")
     parser.add_argument("--step-sleep", type=float, default=0.03, help="下单链路请求间隔，默认0.03秒")
+    parser.add_argument(
+        "--reservation-submit-gap",
+        type=float,
+        default=0.25,
+        help="两小时 direct-fast reservationPlace 提交间隔，默认0.25秒",
+    )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="easyserpClient base URL")
     parser.add_argument("--window-seconds", type=float, default=60.0, help="每个阶段的运行窗口，默认60秒")
     parser.add_argument("--poll-interval", type=float, default=0.08, help="普通轮询间隔，默认0.08秒")
