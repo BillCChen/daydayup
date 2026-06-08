@@ -30,7 +30,9 @@ def make_args(**overrides):
         "guide_interval": 0.01,
         "guide_max_inflight": 4,
         "error_backoff": 0.25,
-        "reservation_submit_gap": 0.25,
+        "reservation_submit_gap": smart.DEFAULT_RESERVATION_SUBMIT_GAP,
+        "reservation_fast_retry_gap": smart.DEFAULT_RESERVATION_FAST_RETRY_GAP,
+        "direct_spec_initial_courts": smart.DEFAULT_DIRECT_SPEC_INITIAL_COURTS,
         "dry_run": True,
         "check_session": False,
         "timeout": 0.01,
@@ -109,7 +111,7 @@ class FastBookingModeTest(unittest.TestCase):
         self.assertEqual({item["hour"] for item in candidates}, {17, 19})
         self.assertEqual(candidates[0]["court_id"], "ymq7")
 
-    def test_direct_speculative_adjacent_candidates_use_three_priority_courts_per_neighbor(self):
+    def test_direct_speculative_adjacent_candidates_use_initial_court_limit_per_neighbor(self):
         bot = smart.SmartBookingBotV2(
             make_args(time="18-21", priority=[7, 8, 9, 1], backup=[2, 3])
         )
@@ -125,6 +127,9 @@ class FastBookingModeTest(unittest.TestCase):
                 (19, "ymq7"),
                 (19, "ymq8"),
                 (19, "ymq9"),
+                (19, "ymq1"),
+                (19, "ymq2"),
+                (19, "ymq3"),
             ],
         )
         self.assertEqual(
@@ -133,9 +138,15 @@ class FastBookingModeTest(unittest.TestCase):
                 (18, "ymq7"),
                 (18, "ymq8"),
                 (18, "ymq9"),
+                (18, "ymq1"),
+                (18, "ymq2"),
+                (18, "ymq3"),
                 (20, "ymq7"),
                 (20, "ymq8"),
                 (20, "ymq9"),
+                (20, "ymq1"),
+                (20, "ymq2"),
+                (20, "ymq3"),
             ],
         )
 
@@ -162,10 +173,19 @@ class FastBookingModeTest(unittest.TestCase):
                 (19, "ymq9"),
                 (18, "ymq9"),
                 (20, "ymq9"),
+                (19, "ymq1"),
+                (18, "ymq1"),
+                (20, "ymq1"),
+                (19, "ymq2"),
+                (18, "ymq2"),
+                (20, "ymq2"),
+                (19, "ymq3"),
+                (18, "ymq3"),
+                (20, "ymq3"),
             ],
         )
 
-    def test_reservation_submit_gate_enforces_start_gap(self):
+    def test_reservation_submit_gate_enforces_response_gap(self):
         bot = smart.SmartBookingBotV2(make_args())
         messages = []
 
@@ -184,6 +204,7 @@ class FastBookingModeTest(unittest.TestCase):
 
         start = time.monotonic()
         self.assertTrue(gate.wait_to_submit("first", "first", first))
+        gate.record_submission_response("first", "first", first)
         gate.record_result("first", "first", first, "business_fail")
         self.assertTrue(gate.wait_to_submit("second", "second", second))
         elapsed = time.monotonic() - start
@@ -219,6 +240,33 @@ class FastBookingModeTest(unittest.TestCase):
 
         self.assertFalse(thread.is_alive())
         self.assertTrue(second_passed.is_set())
+
+    def test_reservation_submit_gate_waits_briefly_for_higher_priority_not_ready(self):
+        bot = smart.SmartBookingBotV2(make_args())
+        gate = smart.ReservationSubmitGate(
+            ["first", "second"],
+            0,
+            bot.logger,
+            bot.generate_second_target_hours,
+            priority_wait=0.03,
+        )
+        second = bot._synthetic_candidate(19, "ymq7")
+        second_passed = threading.Event()
+
+        start = time.monotonic()
+        thread = threading.Thread(
+            target=lambda: second_passed.set()
+            if gate.wait_to_submit("second", "second", second)
+            else None
+        )
+        thread.start()
+
+        self.assertFalse(second_passed.wait(0.01))
+        self.assertTrue(second_passed.wait(0.08))
+        thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertGreaterEqual(time.monotonic() - start, 0.025)
 
     def test_reservation_submit_gate_cancels_redundant_success_hour(self):
         bot = smart.SmartBookingBotV2(make_args())
@@ -311,11 +359,18 @@ class FastBookingModeTest(unittest.TestCase):
         candidate = bot._synthetic_candidate(19, "ymq7")
         waits = []
         sleeps = []
+        responses = []
 
         class FakeGate:
+            def should_continue(self, key, label, candidate):
+                return True
+
             def wait_to_submit(self, key, label, candidate, retry=False):
                 waits.append((key, label, retry))
                 return True
+
+            def record_submission_response(self, key, label, candidate, *, fast_retry=False):
+                responses.append((key, label, fast_retry))
 
         class FakeClient:
             def __init__(self):
@@ -358,23 +413,80 @@ class FastBookingModeTest(unittest.TestCase):
                 ("direct_spec_center_19_ymq7", "direct_spec_center_19_ymq7", True),
             ],
         )
-        self.assertEqual(sleeps, [0.8])
+        self.assertEqual(sleeps, [])
+        self.assertEqual(
+            responses,
+            [
+                ("direct_spec_center_19_ymq7", "direct_spec_center_19_ymq7", True),
+                ("direct_spec_center_19_ymq7", "direct_spec_center_19_ymq7", False),
+            ],
+        )
 
-    def test_gated_fast_retry_respects_submit_gap(self):
+    def test_gated_prepare_stops_before_next_request_when_canceled(self):
         bot = smart.SmartBookingBotV2(
             make_args(
                 booking_mode=smart.BOOKING_MODE_DIRECT_FAST,
                 dry_run=False,
                 step_sleep=0,
-                reservation_submit_gap=0.02,
+            )
+        )
+        candidate = bot._synthetic_candidate(19, "ymq7")
+        endpoints = []
+
+        class FakeClient:
+            def request(self, method, endpoint, *, params=None, data=None, timeout=None, label=""):
+                endpoints.append(endpoint)
+                return smart.HttpResult(
+                    status=200,
+                    text="",
+                    elapsed=0.01,
+                    json_data={"msg": "success", "data": ""},
+                )
+
+        class CancelGate:
+            def __init__(self):
+                self.continue_calls = 0
+
+            def should_continue(self, key, label, candidate):
+                self.continue_calls += 1
+                return self.continue_calls == 1
+
+            def wait_to_submit(self, key, label, candidate, retry=False):
+                raise AssertionError("reservationPlace should not be reached")
+
+        gate = CancelGate()
+        result = bot.attempt_single_hour_booking(
+            candidate,
+            "direct_spec_center_19_ymq7",
+            1,
+            1,
+            1,
+            client=FakeClient(),
+            submit_gate=gate,
+            submit_key="direct_spec_center_19_ymq7",
+        )
+
+        self.assertEqual(result, "canceled")
+        self.assertEqual(endpoints, ["/place/canBook"])
+        self.assertEqual(gate.continue_calls, 2)
+
+    def test_gated_fast_retry_respects_fast_retry_gap(self):
+        bot = smart.SmartBookingBotV2(
+            make_args(
+                booking_mode=smart.BOOKING_MODE_DIRECT_FAST,
+                dry_run=False,
+                step_sleep=0,
+                reservation_submit_gap=0,
+                reservation_fast_retry_gap=0.03,
             )
         )
         candidate = bot._synthetic_candidate(19, "ymq7")
         gate = smart.ReservationSubmitGate(
             ["direct_spec_center_19_ymq7"],
-            0.02,
+            0,
             bot.logger,
             bot.generate_second_target_hours,
+            fast_retry_gap=0.03,
         )
 
         class FakeClient:
@@ -413,7 +525,7 @@ class FastBookingModeTest(unittest.TestCase):
         elapsed = time.monotonic() - start
 
         self.assertEqual(result, "success")
-        self.assertGreaterEqual(elapsed, 0.018)
+        self.assertGreaterEqual(elapsed, 0.025)
 
     def test_direct_speculative_mode_starts_adjacent_before_center_returns(self):
         bot = smart.SmartBookingBotV2(
@@ -460,7 +572,7 @@ class FastBookingModeTest(unittest.TestCase):
         self.assertTrue(any(label.startswith("direct_spec_") and hour in (18, 20) for label, hour in calls))
         self.assertEqual(results, ["failed"])
 
-    def test_direct_speculative_mode_attempts_three_center_courts_initially(self):
+    def test_direct_speculative_mode_attempts_six_center_courts_initially(self):
         bot = smart.SmartBookingBotV2(
             make_args(
                 time="18-21",
@@ -484,6 +596,9 @@ class FastBookingModeTest(unittest.TestCase):
                 (19, "ymq7"),
                 (19, "ymq8"),
                 (19, "ymq9"),
+                (19, "ymq1"),
+                (19, "ymq6"),
+                (19, "ymq2"),
             ],
         )
 
@@ -566,10 +681,14 @@ class FastBookingModeTest(unittest.TestCase):
     def test_missing_reservation_submit_gap_keeps_legacy_namespace_compatible(self):
         args = make_args()
         delattr(args, "reservation_submit_gap")
+        delattr(args, "reservation_fast_retry_gap")
+        delattr(args, "direct_spec_initial_courts")
 
         bot = smart.SmartBookingBotV2(args)
 
         self.assertEqual(bot.args.reservation_submit_gap, smart.DEFAULT_RESERVATION_SUBMIT_GAP)
+        self.assertEqual(bot.args.reservation_fast_retry_gap, smart.DEFAULT_RESERVATION_FAST_RETRY_GAP)
+        self.assertEqual(bot.args.direct_spec_initial_courts, smart.DEFAULT_DIRECT_SPEC_INITIAL_COURTS)
 
     def test_reservation_place_fast_retry_keeps_same_candidate(self):
         bot = smart.SmartBookingBotV2(
