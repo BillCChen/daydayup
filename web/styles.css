@@ -2652,6 +2652,29 @@ body.modal-open {
   justify-content: flex-start;
 }
 
+.inline-range-setting {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.inline-range-setting .field-head {
+  min-height: 0;
+  font-size: 0.78rem;
+}
+
+.inline-range-setting output {
+  color: var(--text-secondary);
+  font-family: var(--font-numeric);
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.inline-range-setting .range-control {
+  min-height: 26px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
 .booking-form > .option-grid {
   grid-template-columns: 1fr;
   gap: 4px;

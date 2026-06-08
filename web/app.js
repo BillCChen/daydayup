@@ -114,6 +114,8 @@ const els = {
   durationPicker: document.querySelector("#durationPicker"),
   windowSlider: document.querySelector("#windowSlider"),
   windowValue: document.querySelector("#windowValue"),
+  adjacentDelaySlider: document.querySelector("#adjacentDelaySlider"),
+  adjacentDelayValue: document.querySelector("#adjacentDelayValue"),
   pollPicker: document.querySelector("#pollPicker"),
   stopJob: document.querySelector("#stopJob"),
   jobState: document.querySelector("#jobState"),
@@ -879,6 +881,7 @@ async function startBooking(event) {
     booking_mode: form.get("booking_mode"),
     window_seconds: form.get("window_seconds"),
     poll_interval: form.get("poll_interval"),
+    direct_spec_adjacent_delay: form.get("direct_spec_adjacent_delay"),
     force: form.get("force") === "on",
     dry_run: form.get("dry_run") === "on",
     all_court: form.get("all_court") === "on",
@@ -2142,6 +2145,7 @@ function buildViewModeDetailGroups() {
   const modeValue = formValue(bookingForm, "booking_mode", "balanced");
   const windowSeconds = formValue(bookingForm, "window_seconds", "30");
   const pollInterval = formValue(bookingForm, "poll_interval", "0.05");
+  const adjacentDelay = formValue(bookingForm, "direct_spec_adjacent_delay", "0.2");
   const priority = formValue(bookingForm, "priority", "").trim();
   const backup = formValue(bookingForm, "backup", "").trim();
   const courtPool = [priority, backup].filter(Boolean).join(" + ") || "-";
@@ -2191,6 +2195,7 @@ function buildViewModeDetailGroups() {
         ["booking_mode", modeValue],
         ["window_seconds", `${windowSeconds}s`],
         ["poll_interval", secondsToMsText(pollInterval)],
+        ["direct_spec_adjacent_delay", secondsToMsText(adjacentDelay)],
         ["step_sleep", "30ms"],
         ["guide_interval", modeValue === "guided-fast" ? "500ms" : "-"],
         ["guide_max_inflight", modeValue === "guided-fast" ? "4" : "-"],
@@ -2256,6 +2261,7 @@ function setupTouchControls() {
   setupTimeControl();
   setupSegmentedControl(els.durationPicker, 'input[name="duration"]', "2");
   setupWindowSlider();
+  setupAdjacentDelaySlider();
   setupPollControl();
   setupCourtPicker();
 }
@@ -2334,6 +2340,21 @@ function setupWindowSlider() {
   };
   els.windowSlider.addEventListener("input", sync);
   els.windowSlider.value = "30";
+  sync();
+}
+
+function setupAdjacentDelaySlider() {
+  if (!els.adjacentDelaySlider) {
+    return;
+  }
+  const sync = () => {
+    if (els.adjacentDelayValue) {
+      els.adjacentDelayValue.textContent = secondsToMsText(els.adjacentDelaySlider.value);
+    }
+    renderViewModeDetails();
+  };
+  els.adjacentDelaySlider.addEventListener("input", sync);
+  els.adjacentDelaySlider.value = "0.2";
   sync();
 }
 
