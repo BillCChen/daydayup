@@ -27,6 +27,8 @@ def make_args(**overrides):
         "window_seconds": 0.1,
         "poll_interval": 0.05,
         "direct_spec_adjacent_delay": smart.DEFAULT_DIRECT_SPEC_ADJACENT_DELAY,
+        "reservation_place_gap": smart.DEFAULT_RESERVATION_PLACE_GAP,
+        "reservation_place_fast_retry_gap": smart.DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP,
         "booking_mode": smart.BOOKING_MODE_BALANCED,
         "guide_interval": 0.01,
         "guide_max_inflight": 4,
@@ -56,6 +58,8 @@ class FastBookingModeTest(unittest.TestCase):
         self.assertEqual(command[command.index("--guide-interval") + 1], "0.5")
         self.assertEqual(command[command.index("--guide-max-inflight") + 1], "4")
         self.assertEqual(command[command.index("--direct-spec-adjacent-delay") + 1], "0.2")
+        self.assertEqual(command[command.index("--reservation-place-gap") + 1], "0.85")
+        self.assertEqual(command[command.index("--reservation-place-fast-retry-gap") + 1], "1.35")
         self.assertIn("mode=guided-fast", label)
 
     def test_booking_command_passes_direct_spec_adjacent_delay(self):
@@ -72,9 +76,108 @@ class FastBookingModeTest(unittest.TestCase):
         self.assertIn("--direct-spec-adjacent-delay", command)
         self.assertEqual(command[command.index("--direct-spec-adjacent-delay") + 1], "0.35")
 
+    def test_booking_command_accepts_reservation_place_gate_tuning(self):
+        command, _label = web_console.build_booking_command(
+            {
+                "date": "2026-05-22",
+                "time": "17-21",
+                "duration": "2",
+                "booking_mode": "direct-fast",
+                "reservation_place_gap": "0.72",
+                "reservation_place_fast_retry_gap": "1.45",
+            }
+        )
+
+        self.assertEqual(command[command.index("--reservation-place-gap") + 1], "0.72")
+        self.assertEqual(command[command.index("--reservation-place-fast-retry-gap") + 1], "1.45")
+
     def test_booking_command_rejects_invalid_mode(self):
         with self.assertRaises(web_console.EasySerpError):
             web_console.build_booking_command({"booking_mode": "fastest"})
+
+    def test_reservation_place_gate_waits_after_response(self):
+        gate = smart.ReservationPlaceGate(0.04, 0.08)
+        first = {"hour": 18, "court_id": "ymq7"}
+        second = {"hour": 19, "court_id": "ymq7"}
+
+        self.assertTrue(gate.wait_for_turn(first, "first"))
+        gate.record_response(first, "first", "failed")
+        started_at = time.monotonic()
+
+        self.assertTrue(gate.wait_for_turn(second, "second"))
+
+        self.assertGreaterEqual(time.monotonic() - started_at, 0.03)
+
+    def test_reservation_place_gate_allows_one_active_submitter(self):
+        gate = smart.ReservationPlaceGate(0, 0)
+        first = {"hour": 18, "court_id": "ymq7"}
+        second = {"hour": 19, "court_id": "ymq7"}
+        second_allowed = threading.Event()
+
+        self.assertTrue(gate.wait_for_turn(first, "first"))
+        thread = threading.Thread(
+            target=lambda: second_allowed.set() if gate.wait_for_turn(second, "second") else None
+        )
+        thread.start()
+        time.sleep(0.03)
+
+        self.assertFalse(second_allowed.is_set())
+        gate.record_response(first, "first", "failed")
+        thread.join(timeout=0.3)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(second_allowed.is_set())
+        gate.record_response(second, "second", "failed")
+
+    def test_reservation_place_gate_uses_fast_retry_gap(self):
+        gate = smart.ReservationPlaceGate(0.01, 0.05)
+        first = {"hour": 18, "court_id": "ymq7"}
+
+        self.assertTrue(gate.wait_for_turn(first, "first"))
+        gate.record_response(first, "first", "fast_retry", fast_retry=True)
+        started_at = time.monotonic()
+
+        self.assertTrue(gate.wait_for_turn(first, "first", retry=True))
+
+        self.assertGreaterEqual(time.monotonic() - started_at, 0.04)
+        gate.record_response(first, "first", "failed")
+
+    def test_reservation_place_gate_prioritizes_fast_retry_owner(self):
+        gate = smart.ReservationPlaceGate(0.01, 0.03)
+        first = {"hour": 18, "court_id": "ymq7"}
+        second = {"hour": 19, "court_id": "ymq7"}
+        second_allowed = threading.Event()
+
+        self.assertTrue(gate.wait_for_turn(first, "first"))
+        gate.record_response(first, "first", "fast_retry", fast_retry=True)
+        thread = threading.Thread(
+            target=lambda: second_allowed.set() if gate.wait_for_turn(second, "second") else None
+        )
+        thread.start()
+        time.sleep(0.05)
+
+        self.assertFalse(second_allowed.is_set())
+        self.assertTrue(gate.wait_for_turn(first, "first", retry=True))
+        gate.record_response(first, "first", "failed")
+        thread.join(timeout=0.3)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(second_allowed.is_set())
+        gate.record_response(second, "second", "failed")
+
+    def test_reservation_place_gate_skips_non_pair_candidates_after_success(self):
+        gate = smart.ReservationPlaceGate(0, 0)
+        first = {"hour": 18, "court_id": "ymq7"}
+        same_hour = {"hour": 18, "court_id": "ymq8"}
+        non_adjacent = {"hour": 20, "court_id": "ymq7"}
+        adjacent = {"hour": 19, "court_id": "ymq7"}
+        late_candidate = {"hour": 17, "court_id": "ymq7"}
+
+        gate.record_response(first, "first", "success")
+
+        self.assertFalse(gate.wait_for_turn(same_hour, "same_hour"))
+        self.assertFalse(gate.wait_for_turn(non_adjacent, "non_adjacent"))
+        self.assertTrue(gate.wait_for_turn(adjacent, "adjacent"))
+        gate.record_response(adjacent, "adjacent", "success")
+        self.assertFalse(gate.wait_for_turn(late_candidate, "late"))
 
     def test_direct_candidates_follow_court_pool_without_wall_courts(self):
         bot = smart.SmartBookingBotV2(make_args())

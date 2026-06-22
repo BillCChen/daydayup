@@ -45,6 +45,8 @@ BUSY_RETRY_TEXT = "当前排队人数较多"
 FAST_RETRY_TEXT = "操作过快"
 TAKEN_RETRY_TEXT = "下手太晚"
 DEFAULT_DIRECT_SPEC_ADJACENT_DELAY = 0.2
+DEFAULT_RESERVATION_PLACE_GAP = 0.85
+DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP = 1.35
 USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 16; V2366HA Build/BP2A.250605.031.A3; wv) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/146.0.7680.177 "
@@ -128,6 +130,124 @@ class GuidedBookingState:
             )
 
         return sorted(candidates, key=score)
+
+
+class ReservationPlaceGate:
+    def __init__(self, gap_seconds, fast_retry_gap_seconds, logger=None):
+        self.gap_seconds = max(float(gap_seconds or 0), 0.0)
+        self.fast_retry_gap_seconds = max(float(fast_retry_gap_seconds or 0), 0.0)
+        self.logger = logger
+        self.condition = threading.Condition()
+        self.active_label = None
+        self.next_allowed_at = 0.0
+        self.successes = {}
+        self.submit_sequence = 0
+        self.retry_owner_key = None
+        self.retry_owner_label = None
+        self.retry_owner_until = 0.0
+
+    @staticmethod
+    def _candidate_key(candidate):
+        return candidate["hour"], candidate["court_id"]
+
+    def _has_contiguous_pair_locked(self):
+        hours = sorted({candidate["hour"] for candidate in self.successes.values()})
+        return any(right - left == 1 for left, right in zip(hours, hours[1:]))
+
+    def _skip_reason_locked(self, candidate):
+        if self._has_contiguous_pair_locked():
+            return "contiguous_pair_complete"
+        success_hours = {item["hour"] for item in self.successes.values()}
+        if not success_hours:
+            return ""
+        hour = candidate["hour"]
+        if hour in success_hours:
+            return "hour_already_booked"
+        if not any(abs(hour - success_hour) == 1 for success_hour in success_hours):
+            return "not_adjacent_to_success"
+        return ""
+
+    def _clear_expired_retry_owner_locked(self, now):
+        if self.retry_owner_key is not None and self.retry_owner_until > 0 and now >= self.retry_owner_until:
+            if self.logger:
+                self.logger.warning(
+                    f"[reservation gate] retry owner expired label={self.retry_owner_label}"
+                )
+            self.retry_owner_key = None
+            self.retry_owner_label = None
+            self.retry_owner_until = 0.0
+
+    def wait_for_turn(self, candidate, label, retry=False):
+        logged_wait = False
+        with self.condition:
+            while True:
+                skip_reason = self._skip_reason_locked(candidate)
+                if skip_reason:
+                    if self.logger:
+                        self.logger.info(
+                            f"[reservation gate] skip label={label} reason={skip_reason} "
+                            f"hour={candidate['hour']} court={candidate['court_id']}"
+                        )
+                    return False
+
+                now = time.monotonic()
+                self._clear_expired_retry_owner_locked(now)
+                candidate_key = self._candidate_key(candidate)
+                retry_owner_wait = (
+                    self.retry_owner_key is not None
+                    and not (retry and candidate_key == self.retry_owner_key)
+                )
+                cooldown = max(self.next_allowed_at - now, 0.0)
+                if self.active_label is None and cooldown <= 0 and not retry_owner_wait:
+                    self.active_label = label
+                    self.submit_sequence += 1
+                    if retry and candidate_key == self.retry_owner_key:
+                        self.retry_owner_key = None
+                        self.retry_owner_label = None
+                        self.retry_owner_until = 0.0
+                    if self.logger:
+                        self.logger.info(
+                            f"[reservation gate] allow seq={self.submit_sequence} label={label} "
+                            f"retry={int(bool(retry))}"
+                        )
+                    return True
+
+                if not logged_wait and self.logger:
+                    self.logger.info(
+                        f"[reservation gate] wait label={label} retry={int(bool(retry))} "
+                        f"active={self.active_label or '-'} cooldown={cooldown:.3f}s "
+                        f"retry_owner={self.retry_owner_label or '-'}"
+                    )
+                    logged_wait = True
+
+                wait_seconds = 0.02
+                if self.active_label is None and cooldown > 0:
+                    wait_seconds = min(max(cooldown, 0.001), 0.05)
+                self.condition.wait(wait_seconds)
+
+    def record_response(self, candidate, label, result, fast_retry=False):
+        with self.condition:
+            candidate_key = self._candidate_key(candidate)
+            if result == "success":
+                self.successes[candidate_key] = candidate
+            if fast_retry:
+                self.retry_owner_key = candidate_key
+                self.retry_owner_label = label
+                self.retry_owner_until = time.monotonic() + self.fast_retry_gap_seconds + 2.0
+            elif self.retry_owner_key == candidate_key or result == "success":
+                self.retry_owner_key = None
+                self.retry_owner_label = None
+                self.retry_owner_until = 0.0
+            gap = self.fast_retry_gap_seconds if fast_retry else self.gap_seconds
+            self.next_allowed_at = time.monotonic() + gap
+            self.active_label = None
+            if self.logger:
+                success_hours = sorted({item["hour"] for item in self.successes.values()})
+                self.logger.info(
+                    f"[reservation gate] release label={label} result={result} "
+                    f"next_gap={gap:.3f}s success_hours={success_hours}"
+                )
+            self.condition.notify_all()
 
 
 class KeepAliveClient:
@@ -299,11 +419,16 @@ class SmartBookingBotV2:
         self.args = args
         if not hasattr(self.args, "direct_spec_adjacent_delay"):
             self.args.direct_spec_adjacent_delay = DEFAULT_DIRECT_SPEC_ADJACENT_DELAY
+        if not hasattr(self.args, "reservation_place_gap"):
+            self.args.reservation_place_gap = DEFAULT_RESERVATION_PLACE_GAP
+        if not hasattr(self.args, "reservation_place_fast_retry_gap"):
+            self.args.reservation_place_fast_retry_gap = DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP
         self.base_url = args.base_url.rstrip("/")
         self.origin = self._origin_from_base_url(self.base_url)
         self.fail_stats = Counter()
         self.first_booking = None
         self.second_booking = None
+        self.reservation_place_gate = None
         self.dry_run_candidate = None
         self.last_get_places_error = None
         self.last_get_places_message = ""
@@ -416,7 +541,9 @@ class SmartBookingBotV2:
         )
         if self.args.booking_mode == BOOKING_MODE_DIRECT_FAST and self.target_duration == 2:
             self.logger.info(
-                f"[配置] direct_spec_adjacent_delay={self.args.direct_spec_adjacent_delay}s"
+                f"[配置] direct_spec_adjacent_delay={self.args.direct_spec_adjacent_delay}s | "
+                f"reservation_place_gap={self.args.reservation_place_gap}s | "
+                f"reservation_place_fast_retry_gap={self.args.reservation_place_fast_retry_gap}s"
             )
         if self.args.booking_mode == BOOKING_MODE_GUIDED_FAST:
             self.logger.info(
@@ -579,6 +706,10 @@ class SmartBookingBotV2:
             raise ValueError("--guide-max-inflight 必须大于0")
         if self.args.direct_spec_adjacent_delay < 0:
             raise ValueError("--direct-spec-adjacent-delay 不能小于0")
+        if self.args.reservation_place_gap < 0:
+            raise ValueError("--reservation-place-gap 不能小于0")
+        if self.args.reservation_place_fast_retry_gap < 0:
+            raise ValueError("--reservation-place-fast-retry-gap 不能小于0")
 
     def _weekday_name(self):
         return ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][self.weekday]
@@ -1116,12 +1247,35 @@ class SmartBookingBotV2:
         reservation_label = f"{label}_reservationPlace"
         max_reservation_attempts = 2
         for reservation_attempt in range(1, max_reservation_attempts + 1):
-            r3 = request_client.request(
-                "POST",
-                "/place/reservationPlace",
-                data=reservation_data,
-                label=reservation_label,
-            )
+            active_gate = self.reservation_place_gate
+            is_retry_attempt = reservation_attempt > 1
+            if active_gate and not active_gate.wait_for_turn(candidate, reservation_label, retry=is_retry_attempt):
+                return "candidate_skipped"
+
+            r3 = None
+            try:
+                r3 = request_client.request(
+                    "POST",
+                    "/place/reservationPlace",
+                    data=reservation_data,
+                    label=reservation_label,
+                )
+            finally:
+                if active_gate:
+                    is_fast_retry = (
+                        reservation_attempt < max_reservation_attempts
+                        and r3 is not None
+                        and not self._response_success(r3)
+                        and self._failure_data(r3).find(FAST_RETRY_TEXT) >= 0
+                    )
+                    gate_result = "success" if self._response_success(r3) else "fast_retry" if is_fast_retry else "failed"
+                    active_gate.record_response(
+                        candidate,
+                        reservation_label,
+                        gate_result,
+                        fast_retry=is_fast_retry,
+                    )
+
             if self._response_success(r3):
                 self.logger.info(
                     f"[成功] label={label} 预约成功 | 日期={self.target_date} | "
@@ -1245,7 +1399,7 @@ class SmartBookingBotV2:
                 if result == "success":
                     self.first_booking = candidate
                     return "success"
-                if result == "candidate_taken":
+                if result in ("candidate_taken", "candidate_skipped"):
                     continue
                 if result in ("retry_delay", "server_retry"):
                     break
@@ -1300,7 +1454,7 @@ class SmartBookingBotV2:
                 if result == "success":
                     self.second_booking = candidate
                     return "success"
-                if result == "candidate_taken":
+                if result in ("candidate_taken", "candidate_skipped"):
                     continue
                 if result in ("retry_delay", "server_retry"):
                     break
@@ -1339,7 +1493,7 @@ class SmartBookingBotV2:
                 if result == "success":
                     self.first_booking = candidate
                     return "success"
-                if result in ("candidate_taken", "business_fail"):
+                if result in ("candidate_taken", "candidate_skipped", "business_fail"):
                     continue
                 if result in ("retry_delay", "server_retry"):
                     break
@@ -1390,7 +1544,7 @@ class SmartBookingBotV2:
                 if result == "success":
                     self.second_booking = candidate
                     return "success"
-                if result in ("candidate_taken", "business_fail"):
+                if result in ("candidate_taken", "candidate_skipped", "business_fail"):
                     continue
                 if result in ("retry_delay", "server_retry"):
                     break
@@ -1528,58 +1682,67 @@ class SmartBookingBotV2:
         results = []
         result_lock = threading.Lock()
         threads = []
-
-        self.logger.info(
-            f"[直抢投机] 启动初始批次 | center={len(center_candidates)} | "
-            f"adjacent={len(adjacent_candidates)} | total={candidate_total} | "
-            f"adjacent_delay={self.args.direct_spec_adjacent_delay}s"
+        previous_gate = self.reservation_place_gate
+        self.reservation_place_gate = ReservationPlaceGate(
+            self.args.reservation_place_gap,
+            self.args.reservation_place_fast_retry_gap,
+            logger=self.logger,
         )
-        for idx, candidate in enumerate(initial_candidates, start=1):
-            label = self._direct_speculative_label(center_hour, candidate)
-            start_delay = 0.0 if candidate["hour"] == center_hour else self.args.direct_spec_adjacent_delay
-            thread = threading.Thread(
-                target=self._direct_speculative_booking_worker,
-                args=(candidate, label, idx, candidate_total, results, result_lock, start_delay),
-            )
-            thread.start()
-            threads.append(thread)
-            if idx == len(center_candidates) and len(adjacent_candidates) > 0:
-                self.logger.info("[直抢投机] 中间小时候选已启动，相邻候选按配置延迟进入下单链路")
 
-        for thread in threads:
-            thread.join()
-
-        successful_candidates = [item["candidate"] for item in results if item["result"] == "success"]
-        self._log_direct_speculative_results(results, successful_candidates)
-        if not successful_candidates:
-            self.logger.warning("[结束] 直抢投机初始批次未抢到任何一个小时")
-            return "failed"
-
-        pair = self._select_direct_speculative_pair(successful_candidates, center_hour)
-        if pair:
-            self.first_booking = pair[0]
-            self.second_booking = pair[1]
+        try:
             self.logger.info(
-                f"[完成] 直抢投机初始批次已形成连续两小时："
-                f"{pair[0]['hour']}:00-{pair[1]['hour'] + 1}:00"
+                f"[直抢投机] 启动初始批次 | center={len(center_candidates)} | "
+                f"adjacent={len(adjacent_candidates)} | total={candidate_total} | "
+                f"adjacent_delay={self.args.direct_spec_adjacent_delay}s"
             )
-            extra_successes = len(successful_candidates) - 2
-            if extra_successes > 0:
-                self.logger.info(f"[直抢投机] 初始批次额外成功小时数={extra_successes}")
-            return "success"
+            for idx, candidate in enumerate(initial_candidates, start=1):
+                label = self._direct_speculative_label(center_hour, candidate)
+                start_delay = 0.0 if candidate["hour"] == center_hour else self.args.direct_spec_adjacent_delay
+                thread = threading.Thread(
+                    target=self._direct_speculative_booking_worker,
+                    args=(candidate, label, idx, candidate_total, results, result_lock, start_delay),
+                )
+                thread.start()
+                threads.append(thread)
+                if idx == len(center_candidates) and len(adjacent_candidates) > 0:
+                    self.logger.info("[直抢投机] 中间小时候选已启动，相邻候选按配置延迟进入下单链路")
 
-        anchor = self._select_direct_speculative_anchor(successful_candidates, center_hour)
-        self.first_booking = anchor
-        self.logger.info(
-            f"[直抢投机] 初始批次已有单小时成功，选择锚点继续相邻补抢："
-            f"{self._booking_candidate_text(anchor)}"
-        )
-        second_status = self.run_direct_second_stage()
-        if second_status != "success":
-            self.logger.warning("[结束] 直抢投机已有单小时成功，但相邻补抢未完成")
-            return "failed"
-        self.logger.info("[完成] 直抢投机批次加相邻补抢已完成连续两小时")
-        return "success"
+            for thread in threads:
+                thread.join()
+
+            successful_candidates = [item["candidate"] for item in results if item["result"] == "success"]
+            self._log_direct_speculative_results(results, successful_candidates)
+            if not successful_candidates:
+                self.logger.warning("[结束] 直抢投机初始批次未抢到任何一个小时")
+                return "failed"
+
+            pair = self._select_direct_speculative_pair(successful_candidates, center_hour)
+            if pair:
+                self.first_booking = pair[0]
+                self.second_booking = pair[1]
+                self.logger.info(
+                    f"[完成] 直抢投机初始批次已形成连续两小时："
+                    f"{pair[0]['hour']}:00-{pair[1]['hour'] + 1}:00"
+                )
+                extra_successes = len(successful_candidates) - 2
+                if extra_successes > 0:
+                    self.logger.info(f"[直抢投机] 初始批次额外成功小时数={extra_successes}")
+                return "success"
+
+            anchor = self._select_direct_speculative_anchor(successful_candidates, center_hour)
+            self.first_booking = anchor
+            self.logger.info(
+                f"[直抢投机] 初始批次已有单小时成功，选择锚点继续相邻补抢："
+                f"{self._booking_candidate_text(anchor)}"
+            )
+            second_status = self.run_direct_second_stage()
+            if second_status != "success":
+                self.logger.warning("[结束] 直抢投机已有单小时成功，但相邻补抢未完成")
+                return "failed"
+            self.logger.info("[完成] 直抢投机批次加相邻补抢已完成连续两小时")
+            return "success"
+        finally:
+            self.reservation_place_gate = previous_gate
 
     def run_direct_mode(self, guide_state=None):
         if self.args.booking_mode == BOOKING_MODE_DIRECT_FAST and self.target_duration == 2:
@@ -1873,6 +2036,18 @@ Examples:
         type=float,
         default=DEFAULT_DIRECT_SPEC_ADJACENT_DELAY,
         help="两小时 direct-fast 相邻小时候选启动延迟，默认0.2秒",
+    )
+    parser.add_argument(
+        "--reservation-place-gap",
+        type=float,
+        default=DEFAULT_RESERVATION_PLACE_GAP,
+        help="两小时 direct-fast reservationPlace 响应后的最小间隔，默认0.85秒",
+    )
+    parser.add_argument(
+        "--reservation-place-fast-retry-gap",
+        type=float,
+        default=DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP,
+        help="两小时 direct-fast 操作过快后的 reservationPlace 重试间隔，默认1.35秒",
     )
     parser.add_argument(
         "--booking-mode",
