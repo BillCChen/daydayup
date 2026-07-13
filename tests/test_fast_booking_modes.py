@@ -27,6 +27,8 @@ def make_args(**overrides):
         "window_seconds": 0.1,
         "poll_interval": 0.05,
         "direct_spec_adjacent_delay": smart.DEFAULT_DIRECT_SPEC_ADJACENT_DELAY,
+        "direct_max_inflight": smart.DEFAULT_DIRECT_MAX_INFLIGHT,
+        "direct_max_attempts": smart.DEFAULT_DIRECT_MAX_ATTEMPTS,
         "reservation_place_gap": smart.DEFAULT_RESERVATION_PLACE_GAP,
         "reservation_place_fast_retry_gap": smart.DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP,
         "booking_mode": smart.BOOKING_MODE_BALANCED,
@@ -57,9 +59,11 @@ class FastBookingModeTest(unittest.TestCase):
         self.assertEqual(command[command.index("--booking-mode") + 1], "guided-fast")
         self.assertEqual(command[command.index("--guide-interval") + 1], "0.5")
         self.assertEqual(command[command.index("--guide-max-inflight") + 1], "4")
-        self.assertEqual(command[command.index("--direct-spec-adjacent-delay") + 1], "0.2")
-        self.assertEqual(command[command.index("--reservation-place-gap") + 1], "0.85")
-        self.assertEqual(command[command.index("--reservation-place-fast-retry-gap") + 1], "1.35")
+        self.assertEqual(command[command.index("--direct-spec-adjacent-delay") + 1], "0")
+        self.assertEqual(command[command.index("--direct-max-inflight") + 1], "3")
+        self.assertEqual(command[command.index("--direct-max-attempts") + 1], "2")
+        self.assertEqual(command[command.index("--reservation-place-gap") + 1], "0.35")
+        self.assertEqual(command[command.index("--reservation-place-fast-retry-gap") + 1], "0.8")
         self.assertIn("mode=guided-fast", label)
 
     def test_booking_command_passes_direct_spec_adjacent_delay(self):
@@ -141,6 +145,15 @@ class FastBookingModeTest(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic() - started_at, 0.04)
         gate.record_response(first, "first", "failed")
 
+    def test_reservation_place_gate_deferred_fast_retry_has_no_owner(self):
+        gate = smart.ReservationPlaceGate(0, 0.01)
+        first = {"hour": 18, "court_id": "ymq7"}
+
+        gate.record_response(first, "first", "fast_retry", fast_retry=True, defer_retry=True)
+
+        self.assertIsNone(gate.retry_owner_key)
+        self.assertGreater(gate.next_allowed_at, time.monotonic())
+
     def test_reservation_place_gate_prioritizes_fast_retry_owner(self):
         gate = smart.ReservationPlaceGate(0.01, 0.03)
         first = {"hour": 18, "court_id": "ymq7"}
@@ -178,6 +191,16 @@ class FastBookingModeTest(unittest.TestCase):
         self.assertTrue(gate.wait_for_turn(adjacent, "adjacent"))
         gate.record_response(adjacent, "adjacent", "success")
         self.assertFalse(gate.wait_for_turn(late_candidate, "late"))
+
+    def test_reservation_place_gate_stops_single_hour_after_success(self):
+        gate = smart.ReservationPlaceGate(0, 0, required_hours=1)
+        first = {"hour": 18, "court_id": "ymq7"}
+        second = {"hour": 19, "court_id": "ymq8"}
+
+        gate.record_response(first, "first", "success")
+
+        self.assertEqual(gate.skip_reason(second), "single_hour_complete")
+        self.assertFalse(gate.wait_for_turn(second, "second"))
 
     def test_direct_candidates_follow_court_pool_without_wall_courts(self):
         bot = smart.SmartBookingBotV2(make_args())
@@ -313,13 +336,15 @@ class FastBookingModeTest(unittest.TestCase):
         self.assertTrue(any(label.startswith("direct_spec_") and hour in (18, 20) for label, hour in calls))
         self.assertEqual(results, ["failed"])
 
-    def test_direct_speculative_mode_attempts_three_center_courts_initially(self):
+    def test_direct_wave_prioritizes_distinct_hours_and_covers_full_pool(self):
         bot = smart.SmartBookingBotV2(
             make_args(
                 time="18-21",
                 booking_mode=smart.BOOKING_MODE_DIRECT_FAST,
                 dry_run=False,
                 step_sleep=0,
+                window_seconds=1,
+                poll_interval=0.001,
             )
         )
         calls = []
@@ -331,42 +356,34 @@ class FastBookingModeTest(unittest.TestCase):
         bot.attempt_single_hour_booking = fake_attempt
 
         self.assertEqual(bot.run_direct_mode(), "failed")
-        self.assertEqual(
-            [(hour, court_id) for label, hour, court_id in calls if label.startswith("direct_spec_center")],
-            [
-                (19, "ymq7"),
-                (19, "ymq8"),
-                (19, "ymq9"),
-            ],
-        )
+        self.assertEqual({hour for _label, hour, _court_id in calls[:3]}, {18, 19, 20})
+        self.assertEqual(len(calls), len(bot.generate_direct_first_candidates()))
+        self.assertIn(("direct_spec_center_19_ymq11_w9_a1", 19, "ymq11"), calls)
 
-    def test_direct_speculative_mode_uses_adjacent_success_as_anchor_when_center_fails(self):
+    def test_single_hour_direct_wave_stops_after_first_success(self):
         bot = smart.SmartBookingBotV2(
             make_args(
                 time="18-21",
+                duration=1,
                 booking_mode=smart.BOOKING_MODE_DIRECT_FAST,
                 dry_run=False,
                 step_sleep=0,
             )
         )
-        second_stage_anchors = []
+        calls = []
 
         def fake_attempt(candidate, label, round_index, candidate_index, candidate_total, client=None, failure_stats=None):
-            if label.startswith("direct_spec_left") and candidate["hour"] == 18 and candidate["court_id"] == "ymq7":
+            calls.append((candidate["hour"], candidate["court_id"]))
+            if candidate["hour"] == 19 and candidate["court_id"] == "ymq7":
                 return "success"
             return "business_fail"
 
-        def fake_second_stage(guide_state=None):
-            second_stage_anchors.append(bot.first_booking)
-            return "success"
-
         bot.attempt_single_hour_booking = fake_attempt
-        bot.run_direct_second_stage = fake_second_stage
 
         self.assertEqual(bot.run_direct_mode(), "success")
-        self.assertEqual(bot.first_booking["hour"], 18)
+        self.assertEqual(bot.first_booking["hour"], 19)
         self.assertEqual(bot.first_booking["court_id"], "ymq7")
-        self.assertEqual([item["hour"] for item in second_stage_anchors], [18])
+        self.assertLessEqual(len(calls), bot.args.direct_max_inflight)
 
     def test_direct_speculative_mode_finishes_when_initial_batch_has_contiguous_pair(self):
         bot = smart.SmartBookingBotV2(
@@ -463,6 +480,37 @@ class FastBookingModeTest(unittest.TestCase):
         self.assertEqual(result, "success")
         self.assertEqual(fake_client.reservation_attempts, 2)
         self.assertEqual(sleeps, [0.8])
+
+    def test_response_log_summary_does_not_render_structured_failure_data(self):
+        outcome, message, shape = smart.response_log_summary(
+            200,
+            {"msg": "fail", "data": {"token": "secret-token", "member": "private-name"}},
+        )
+
+        self.assertEqual(outcome, "business_error")
+        self.assertEqual(message, "fail")
+        self.assertEqual(shape, "dict:2")
+        self.assertNotIn("secret-token", message)
+
+    def test_booking_failure_data_does_not_render_structured_payload(self):
+        result = smart.HttpResult(
+            status=200,
+            text="",
+            elapsed=0.01,
+            json_data={"msg": "fail", "data": {"token": "secret-token", "member": "private-name"}},
+        )
+
+        self.assertEqual(smart.SmartBookingBotV2._failure_data(result), "fail")
+
+    def test_redact_text_covers_query_cookie_and_json_credentials(self):
+        redacted = smart.redact_text(
+            'token=abc&JSESSIONID=session {"cardIndex":"card-1","offerId":"offer-1"}'
+        )
+
+        self.assertNotIn("abc", redacted)
+        self.assertNotIn("session", redacted)
+        self.assertNotIn("card-1", redacted)
+        self.assertNotIn("offer-1", redacted)
 
     def test_guided_sort_uses_snapshot_and_failures(self):
         state = smart.GuidedBookingState({"ymq7": 0, "ymq8": 1})

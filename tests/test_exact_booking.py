@@ -1,6 +1,7 @@
 import unittest
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import web_console
 
@@ -61,6 +62,15 @@ class ExactBookingTest(unittest.TestCase):
         self.assertEqual(web_console.slot_pay_value("2026-05-18", "15:00"), 20.0)
         self.assertEqual(web_console.slot_pay_value("2026-05-18", "16:00"), 30.0)
         self.assertEqual(web_console.slot_pay_value("2026-05-23", "09:00"), 30.0)
+
+    def test_shared_redactor_covers_json_credentials(self):
+        redacted = web_console.redact_sensitive_text(
+            '{"token":"secret","cardIndex":"card-1","offerId":"offer-1"}'
+        )
+
+        self.assertNotIn("secret", redacted)
+        self.assertNotIn("card-1", redacted)
+        self.assertNotIn("offer-1", redacted)
 
     def test_availability_serializes_pay_fields(self):
         day = web_console.serialize_availability_day("2026-05-18", make_place())
@@ -135,6 +145,53 @@ class ExactBookingTest(unittest.TestCase):
         self.assertEqual(reservation[0], "place/reservationPlace")
         self.assertEqual(reservation[1]["oldTotal"], "80.00")
         self.assertEqual(reservation[1]["total"], "20.00")
+        self.assertEqual(
+            [item["stage"] for item in result["successes"][0]["trace"]],
+            ["canBook", "getOfferInfo", "getUseCardInfo", "reservationPlace"],
+        )
+
+    def test_exact_booking_retries_too_fast_and_keeps_trace(self):
+        console = web_console.WebConsole.__new__(web_console.WebConsole)
+        console.config = web_console.ServerConfig("1001", "https://example.invalid", 1.0)
+        console.users = FakeUserStore()
+        console.history = FakeHistory()
+        client = FakeClient()
+        reservation_attempts = 0
+        original_post = client.post
+
+        def post(endpoint, data=None):
+            nonlocal reservation_attempts
+            if endpoint == "place/reservationPlace":
+                reservation_attempts += 1
+                if reservation_attempts == 1:
+                    client.posts.append((endpoint, data))
+                    return {"msg": "fail", "data": "操作过快,请稍后重试。"}
+            return original_post(endpoint, data)
+
+        client.post = post
+        console.client = lambda user: client
+        console.resolve_booking_card = lambda user: {
+            "card_index_raw": "card-1",
+            "cash_balance_value": 50.0,
+            "card_index": "car...d-1",
+        }
+
+        with mock.patch("web_console.time.sleep"):
+            result = console.book_exact(
+                {
+                    "user_key": "user_1",
+                    "slots": [
+                        {"date": "2026-05-18", "start_time": "15:00", "end_time": "16:00", "id": "ymq7"}
+                    ],
+                }
+            )
+
+        trace = result["successes"][0]["trace"]
+        reservation_trace = [item for item in trace if item["stage"] == "reservationPlace"]
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(reservation_attempts, 2)
+        self.assertEqual([item["outcome"] for item in reservation_trace], ["too_fast", "success"])
+        self.assertEqual([item["attempt"] for item in reservation_trace], [1, 2])
 
     def test_exact_booking_history_keeps_failure_detail(self):
         console = web_console.WebConsole.__new__(web_console.WebConsole)

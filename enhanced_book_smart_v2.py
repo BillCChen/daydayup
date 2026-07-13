@@ -12,13 +12,15 @@ import json
 import logging
 import math
 import os
+import queue
+import re
 import ssl
 import sys
 import threading
 import time
 import traceback
 import urllib.parse
-from collections import Counter
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -40,13 +42,16 @@ BOOKING_MODE_BALANCED = "balanced"
 BOOKING_MODE_DIRECT_FAST = "direct-fast"
 BOOKING_MODE_GUIDED_FAST = "guided-fast"
 BOOKING_MODES = (BOOKING_MODE_BALANCED, BOOKING_MODE_DIRECT_FAST, BOOKING_MODE_GUIDED_FAST)
-PREWARM_SECONDS = 3.0
+BOOKING_ENGINE_VERSION = "3.5.0"
+PREWARM_SECONDS = 6.0
 BUSY_RETRY_TEXT = "当前排队人数较多"
 FAST_RETRY_TEXT = "操作过快"
 TAKEN_RETRY_TEXT = "下手太晚"
-DEFAULT_DIRECT_SPEC_ADJACENT_DELAY = 0.2
-DEFAULT_RESERVATION_PLACE_GAP = 0.85
-DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP = 1.35
+DEFAULT_DIRECT_SPEC_ADJACENT_DELAY = 0.0
+DEFAULT_DIRECT_MAX_INFLIGHT = 3
+DEFAULT_DIRECT_MAX_ATTEMPTS = 2
+DEFAULT_RESERVATION_PLACE_GAP = 0.35
+DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP = 0.8
 USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 16; V2366HA Build/BP2A.250605.031.A3; wv) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/146.0.7680.177 "
@@ -64,6 +69,13 @@ class HttpResult:
     elapsed: float
     json_data: dict | None = None
     json_error: bool = False
+
+
+@dataclass
+class DirectClientSlot:
+    slot_id: int
+    client: object
+    fail_stats: Counter
 
 
 class GuidedBookingState:
@@ -133,9 +145,10 @@ class GuidedBookingState:
 
 
 class ReservationPlaceGate:
-    def __init__(self, gap_seconds, fast_retry_gap_seconds, logger=None):
+    def __init__(self, gap_seconds, fast_retry_gap_seconds, logger=None, required_hours=2):
         self.gap_seconds = max(float(gap_seconds or 0), 0.0)
         self.fast_retry_gap_seconds = max(float(fast_retry_gap_seconds or 0), 0.0)
+        self.required_hours = 1 if int(required_hours or 1) <= 1 else 2
         self.logger = logger
         self.condition = threading.Condition()
         self.active_label = None
@@ -155,6 +168,8 @@ class ReservationPlaceGate:
         return any(right - left == 1 for left, right in zip(hours, hours[1:]))
 
     def _skip_reason_locked(self, candidate):
+        if self.required_hours == 1 and self.successes:
+            return "single_hour_complete"
         if self._has_contiguous_pair_locked():
             return "contiguous_pair_complete"
         success_hours = {item["hour"] for item in self.successes.values()}
@@ -177,7 +192,15 @@ class ReservationPlaceGate:
             self.retry_owner_label = None
             self.retry_owner_until = 0.0
 
-    def wait_for_turn(self, candidate, label, retry=False):
+    def skip_reason(self, candidate):
+        with self.condition:
+            return self._skip_reason_locked(candidate)
+
+    def successful_candidates(self):
+        with self.condition:
+            return list(self.successes.values())
+
+    def wait_for_turn(self, candidate, label, retry=False, deadline=None):
         logged_wait = False
         with self.condition:
             while True:
@@ -191,6 +214,13 @@ class ReservationPlaceGate:
                     return False
 
                 now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    if self.logger:
+                        self.logger.info(
+                            f"[reservation gate] skip label={label} reason=deadline_expired "
+                            f"hour={candidate['hour']} court={candidate['court_id']}"
+                        )
+                    return False
                 self._clear_expired_retry_owner_locked(now)
                 candidate_key = self._candidate_key(candidate)
                 retry_owner_wait = (
@@ -223,14 +253,16 @@ class ReservationPlaceGate:
                 wait_seconds = 0.02
                 if self.active_label is None and cooldown > 0:
                     wait_seconds = min(max(cooldown, 0.001), 0.05)
+                if deadline is not None:
+                    wait_seconds = min(wait_seconds, max(deadline - now, 0.001))
                 self.condition.wait(wait_seconds)
 
-    def record_response(self, candidate, label, result, fast_retry=False):
+    def record_response(self, candidate, label, result, fast_retry=False, defer_retry=False):
         with self.condition:
             candidate_key = self._candidate_key(candidate)
             if result == "success":
                 self.successes[candidate_key] = candidate
-            if fast_retry:
+            if fast_retry and not defer_retry:
                 self.retry_owner_key = candidate_key
                 self.retry_owner_label = label
                 self.retry_owner_until = time.monotonic() + self.fast_retry_gap_seconds + 2.0
@@ -251,7 +283,7 @@ class ReservationPlaceGate:
 
 
 class KeepAliveClient:
-    def __init__(self, base_url, headers, timeout, logger, fail_stats):
+    def __init__(self, base_url, headers, timeout, logger, fail_stats, event_callback=None):
         parsed = urllib.parse.urlsplit(base_url.rstrip("/"))
         if parsed.scheme not in ("http", "https"):
             raise ValueError("--base-url must start with http:// or https://")
@@ -264,6 +296,7 @@ class KeepAliveClient:
         self.timeout = timeout
         self.logger = logger
         self.fail_stats = fail_stats
+        self.event_callback = event_callback
         self.conn = None
 
     def close(self):
@@ -310,17 +343,37 @@ class KeepAliveClient:
                 elapsed = time.perf_counter() - start
                 self.fail_stats[f"{label}_exception"] += 1
                 self.logger.error(
-                    f"[HTTP] label={label} method={method} exception={repr(exc)} elapsed={elapsed:.3f}s"
+                    f"[HTTP] label={label} method={method} exception={redact_text(repr(exc))} "
+                    f"elapsed={elapsed:.3f}s outcome=exception"
                 )
-                self.logger.error(traceback.format_exc())
+                self.logger.error(redact_text(traceback.format_exc()))
+                if self.event_callback:
+                    self.event_callback(
+                        label=label,
+                        method=method,
+                        status=0,
+                        elapsed=elapsed,
+                        response_bytes=0,
+                        outcome="exception",
+                    )
                 return HttpResult(status=0, text="", elapsed=elapsed)
         except Exception as exc:
             elapsed = time.perf_counter() - start
             self.fail_stats[f"{label}_exception"] += 1
             self.logger.error(
-                f"[HTTP] label={label} method={method} exception={repr(exc)} elapsed={elapsed:.3f}s"
+                f"[HTTP] label={label} method={method} exception={redact_text(repr(exc))} "
+                f"elapsed={elapsed:.3f}s outcome=exception"
             )
-            self.logger.error(traceback.format_exc())
+            self.logger.error(redact_text(traceback.format_exc()))
+            if self.event_callback:
+                self.event_callback(
+                    label=label,
+                    method=method,
+                    status=0,
+                    elapsed=elapsed,
+                    response_bytes=0,
+                    outcome="exception",
+                )
             return HttpResult(status=0, text="", elapsed=elapsed)
 
     def _send_once(self, method, path, body, headers, label, start):
@@ -333,20 +386,32 @@ class KeepAliveClient:
         elapsed = time.perf_counter() - start
         encoding = self._response_encoding(resp)
         text = raw.decode(encoding, errors="replace")
-        preview = redact_text(text[:800].replace("\n", "\\n").replace("\r", ""))
-
-        self.logger.info(
-            f"[HTTP] label={label} method={method} status={resp.status} elapsed={elapsed:.3f}s"
-        )
-        self.logger.info(f"[HTTP] label={label} response_preview={preview}")
-
         try:
             json_data = json.loads(text)
-            return HttpResult(resp.status, text, elapsed, json_data=json_data)
+            json_error = False
         except Exception:
             self.fail_stats[f"{label}_json_decode_error"] += 1
+            json_data = None
+            json_error = True
+
+        outcome, message, data_shape = response_log_summary(resp.status, json_data, json_error)
+        self.logger.info(
+            f"[HTTP] label={label} method={method} status={resp.status} elapsed={elapsed:.3f}s "
+            f"bytes={len(raw)} outcome={outcome} data_shape={data_shape} message={message or '-'}"
+        )
+        if self.event_callback:
+            self.event_callback(
+                label=label,
+                method=method,
+                status=resp.status,
+                elapsed=elapsed,
+                response_bytes=len(raw),
+                outcome=outcome,
+            )
+        if json_error:
             self.logger.error(f"[HTTP] label={label} JSON解析失败")
             return HttpResult(resp.status, text, elapsed, json_error=True)
+        return HttpResult(resp.status, text, elapsed, json_data=json_data)
 
     def _build_path(self, endpoint, params):
         path = f"{self.base_path}/{endpoint.lstrip('/')}"
@@ -366,29 +431,59 @@ class KeepAliveClient:
 
 
 def redact_text(text):
-    replacements = [
-        ("token=", "&"),
-        ("cardIndex=", "&"),
-        ("offerId=", "&"),
-        ("masterCardNum=", "&"),
-    ]
-    redacted = text
-    for prefix, terminator in replacements:
-        start = 0
-        while True:
-            idx = redacted.find(prefix, start)
-            if idx < 0:
-                break
-            value_start = idx + len(prefix)
-            value_end = redacted.find(terminator, value_start)
-            if value_end < 0:
-                value_end = len(redacted)
-            redacted = redacted[:value_start] + "<redacted>" + redacted[value_end:]
-            start = value_start + len("<redacted>")
-
-    for key in ("cardindex", "cardIndex", "masterCardNum"):
-        redacted = redact_json_string_key(redacted, key)
+    redacted = str(text)
+    sensitive_keys = r"token|jsessionid|cardindex|offerid|mastercardnum"
+    redacted = re.sub(
+        rf"(?i)({sensitive_keys})(=|%3[dD])([^&\s'\"<>]+)",
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+        redacted,
+    )
+    redacted = re.sub(
+        rf'(?i)([\"\'](?:{sensitive_keys})[\"\']\s*:\s*[\"\'])[^\"\']*',
+        lambda match: f"{match.group(1)}<redacted>",
+        redacted,
+    )
     return redacted
+
+
+def response_log_summary(status, payload, json_error=False):
+    if json_error:
+        return "invalid_json", "", "invalid"
+    if not isinstance(payload, dict):
+        return "unexpected_json", "", type(payload).__name__
+
+    message = safe_response_message(payload) if payload.get("msg") != "success" else ""
+    message = " ".join(message.split())[:160]
+    data = payload.get("data")
+    if isinstance(data, list):
+        data_shape = f"list:{len(data)}"
+    elif isinstance(data, dict):
+        data_shape = f"dict:{len(data)}"
+    else:
+        data_shape = type(data).__name__
+
+    if payload.get("msg") == "success":
+        return "success", "", data_shape
+    if TAKEN_RETRY_TEXT in message:
+        return "taken", message, data_shape
+    if FAST_RETRY_TEXT in message:
+        return "too_fast", message, data_shape
+    if "数据错误" in message:
+        return "data_error", message, data_shape
+    if BUSY_RETRY_TEXT in message:
+        return "busy", message, data_shape
+    if status >= 500:
+        return "server_error", message, data_shape
+    return "business_error", message, data_shape
+
+
+def safe_response_message(payload):
+    if not isinstance(payload, dict):
+        return ""
+    raw_message = payload.get("data")
+    if not isinstance(raw_message, (str, int, float, bool)):
+        raw_message = payload.get("msg", "")
+    return " ".join(redact_text(str(raw_message)).split())[:160]
 
 
 def redact_json_string_key(text, key):
@@ -423,12 +518,24 @@ class SmartBookingBotV2:
             self.args.reservation_place_gap = DEFAULT_RESERVATION_PLACE_GAP
         if not hasattr(self.args, "reservation_place_fast_retry_gap"):
             self.args.reservation_place_fast_retry_gap = DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP
+        if not hasattr(self.args, "direct_max_inflight"):
+            self.args.direct_max_inflight = DEFAULT_DIRECT_MAX_INFLIGHT
+        if not hasattr(self.args, "direct_max_attempts"):
+            self.args.direct_max_attempts = DEFAULT_DIRECT_MAX_ATTEMPTS
         self.base_url = args.base_url.rstrip("/")
         self.origin = self._origin_from_base_url(self.base_url)
+        self.run_started_monotonic = time.monotonic()
+        self.run_id = f"{datetime.now().strftime('%Y%m%dT%H%M%S.%f')}-{os.getpid()}"
         self.fail_stats = Counter()
+        self.outcome_stats = Counter()
+        self.http_metrics = defaultdict(list)
+        self.metrics_lock = threading.Lock()
         self.first_booking = None
         self.second_booking = None
         self.reservation_place_gate = None
+        self.direct_deadline = None
+        self.direct_client_queue = queue.Queue()
+        self.direct_client_slots = []
         self.dry_run_candidate = None
         self.last_get_places_error = None
         self.last_get_places_message = ""
@@ -468,6 +575,7 @@ class SmartBookingBotV2:
             timeout=args.timeout,
             logger=self.logger,
             fail_stats=self.fail_stats,
+            event_callback=self._record_http_event,
         )
 
         self._log_config()
@@ -477,7 +585,7 @@ class SmartBookingBotV2:
         os.makedirs("logs", exist_ok=True)
         log_name = (
             f"booking_smart_v2_{self.target_date}_{self.range_start_h}-{self.range_end_h}"
-            f"_d{self.target_duration}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+            f"_d{self.target_duration}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{os.getpid()}.log"
         )
         self.log_path = os.path.join("logs", log_name)
         self.logger = logging.getLogger(f"smart_booking_bot_v2_{id(self)}")
@@ -507,6 +615,87 @@ class SmartBookingBotV2:
         self.logger.addHandler(console_handler)
         self.logger.addHandler(file_handler)
 
+    def log_event(self, event, **fields):
+        payload = {
+            "event": event,
+            "engine_version": BOOKING_ENGINE_VERSION,
+            "run_id": self.run_id,
+            "offset_ms": round((time.monotonic() - self.run_started_monotonic) * 1000),
+        }
+        payload.update(fields)
+        self.logger.info(f"[EVENT] {json.dumps(payload, ensure_ascii=False, sort_keys=True)}")
+
+    def _record_http_event(self, *, label, method, status, elapsed, response_bytes, outcome):
+        endpoint = next(
+            (
+                name
+                for name in (
+                    "reservationPlace",
+                    "getUseCardInfo",
+                    "getOfferInfo",
+                    "canBook",
+                    "get_places",
+                    "getPlaceType",
+                    "getPenaltyRules",
+                )
+                if name in label
+            ),
+            "other",
+        )
+        with self.metrics_lock:
+            self.http_metrics[endpoint].append(float(elapsed))
+            self.outcome_stats[f"{endpoint}:{outcome}"] += 1
+        self.log_event(
+            "http_response",
+            label=label,
+            endpoint=endpoint,
+            method=method,
+            status=status,
+            elapsed_ms=round(elapsed * 1000),
+            response_bytes=response_bytes,
+            outcome=outcome,
+        )
+
+    def _prepare_direct_clients(self, *, prewarm=False):
+        if self.direct_client_slots:
+            return
+        for slot_id in range(1, self.args.direct_max_inflight + 1):
+            fail_stats = Counter()
+            client = KeepAliveClient(
+                self.base_url,
+                self._headers(),
+                timeout=self.args.timeout,
+                logger=self.logger,
+                fail_stats=fail_stats,
+                event_callback=self._record_http_event,
+            )
+            slot = DirectClientSlot(slot_id=slot_id, client=client, fail_stats=fail_stats)
+            self.direct_client_slots.append(slot)
+            if prewarm:
+                result = client.request(
+                    "GET",
+                    "/place/getPlaceType",
+                    params={"token": self.args.token, "shopNum": SHOP_NUM},
+                    label=f"prewarm_worker_{slot_id}_getPlaceType",
+                )
+                self.log_event(
+                    "worker_client_prewarm",
+                    client_slot=slot_id,
+                    ok=int(self._response_success(result)),
+                    elapsed_ms=round(result.elapsed * 1000),
+                )
+            self.direct_client_queue.put(slot)
+
+    def _close_direct_clients(self):
+        for slot in self.direct_client_slots:
+            slot.client.close()
+        self.direct_client_slots.clear()
+        while not self.direct_client_queue.empty():
+            try:
+                self.direct_client_queue.get_nowait()
+            except queue.Empty:
+                break
+
     def _headers(self):
         headers = {
             "Connection": "keep-alive",
@@ -525,7 +714,9 @@ class SmartBookingBotV2:
 
     def _log_config(self):
         self.logger.info("=" * 110)
-        self.logger.info(f"羽毛球场地预约脚本启动（v2 mode={self.args.booking_mode}）")
+        self.logger.info(
+            f"羽毛球场地预约脚本启动（engine={BOOKING_ENGINE_VERSION} mode={self.args.booking_mode} run_id={self.run_id}）"
+        )
         self.logger.info(
             f"[配置] 日期={self.target_date} ({self._weekday_name()}) | "
             f"目标范围={self.range_start_h}:00-{self.range_end_h}:00 | "
@@ -539,9 +730,11 @@ class SmartBookingBotV2:
             f"[配置] rounds={self.args.rounds} | second_rounds={self.args.second_rounds} | "
             f"step_sleep={self.args.step_sleep}s"
         )
-        if self.args.booking_mode == BOOKING_MODE_DIRECT_FAST and self.target_duration == 2:
+        if self.args.booking_mode in (BOOKING_MODE_DIRECT_FAST, BOOKING_MODE_GUIDED_FAST):
             self.logger.info(
                 f"[配置] direct_spec_adjacent_delay={self.args.direct_spec_adjacent_delay}s | "
+                f"direct_max_inflight={self.args.direct_max_inflight} | "
+                f"direct_max_attempts={self.args.direct_max_attempts} | "
                 f"reservation_place_gap={self.args.reservation_place_gap}s | "
                 f"reservation_place_fast_retry_gap={self.args.reservation_place_fast_retry_gap}s"
             )
@@ -556,6 +749,20 @@ class SmartBookingBotV2:
         self.logger.info(
             f"[凭证] token={fingerprint(self.args.token)} | JSESSIONID={fingerprint(self.args.jsessionid)} | "
             f"card_index={fingerprint(self.args.card_index)}"
+        )
+        self.log_event(
+            "run_config",
+            mode=self.args.booking_mode,
+            target_date=self.target_date,
+            range_start=self.range_start_h,
+            range_end=self.range_end_h,
+            duration=self.target_duration,
+            window_seconds=self.args.window_seconds,
+            direct_max_inflight=self.args.direct_max_inflight,
+            direct_max_attempts=self.args.direct_max_attempts,
+            reservation_place_gap=self.args.reservation_place_gap,
+            reservation_place_fast_retry_gap=self.args.reservation_place_fast_retry_gap,
+            court_count=len(self.court_pool),
         )
         self.logger.info("=" * 110)
 
@@ -669,7 +876,7 @@ class SmartBookingBotV2:
         msg = result.json_data.get("msg")
         if msg == "success":
             return True, ""
-        data = str(result.json_data.get("data", ""))
+        data = safe_response_message(result.json_data)
         if any(word in data for word in ("登录", "session", "Session", "JSESSIONID", "无效", "过期")):
             return False, data
         return False, f"msg={msg} data={data}"
@@ -710,6 +917,10 @@ class SmartBookingBotV2:
             raise ValueError("--reservation-place-gap 不能小于0")
         if self.args.reservation_place_fast_retry_gap < 0:
             raise ValueError("--reservation-place-fast-retry-gap 不能小于0")
+        if self.args.direct_max_inflight <= 0:
+            raise ValueError("--direct-max-inflight 必须大于0")
+        if self.args.direct_max_attempts <= 0:
+            raise ValueError("--direct-max-attempts 必须大于0")
 
     def _weekday_name(self):
         return ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][self.weekday]
@@ -782,6 +993,12 @@ class SmartBookingBotV2:
             },
             label="prewarm_getPenaltyRules",
         )
+        if (
+            self.args.booking_mode in (BOOKING_MODE_DIRECT_FAST, BOOKING_MODE_GUIDED_FAST)
+            and not self.args.dry_run
+            and not self.args.check_session
+        ):
+            self._prepare_direct_clients(prewarm=True)
         self.logger.info("[预热] 结束")
 
     def get_places(self):
@@ -813,7 +1030,7 @@ class SmartBookingBotV2:
 
         msg = result.json_data.get("msg")
         if msg != "success":
-            message = str(result.json_data.get("data", ""))
+            message = safe_response_message(result.json_data)
             self.last_get_places_message = message
             if BUSY_RETRY_TEXT in message:
                 self.last_get_places_error = "busy"
@@ -1154,6 +1371,15 @@ class SmartBookingBotV2:
             f"[尝试] label={label} | 轮次={round_index} | 候选={candidate_index}/{candidate_total} | "
             f"时段={start_time}-{end_time} | 场地={court_name}({court_id})"
         )
+        self.log_event(
+            "candidate_attempt_start",
+            label=label,
+            round=round_index,
+            candidate_index=candidate_index,
+            candidate_total=candidate_total,
+            hour=hour,
+            court=court_id,
+        )
 
         canbook_fields = [
             {
@@ -1245,11 +1471,16 @@ class SmartBookingBotV2:
             "zengzhiMoney": "0",
         }
         reservation_label = f"{label}_reservationPlace"
-        max_reservation_attempts = 2
+        max_reservation_attempts = 1 if self.reservation_place_gate else 2
         for reservation_attempt in range(1, max_reservation_attempts + 1):
             active_gate = self.reservation_place_gate
             is_retry_attempt = reservation_attempt > 1
-            if active_gate and not active_gate.wait_for_turn(candidate, reservation_label, retry=is_retry_attempt):
+            if active_gate and not active_gate.wait_for_turn(
+                candidate,
+                reservation_label,
+                retry=is_retry_attempt,
+                deadline=self.direct_deadline,
+            ):
                 return "candidate_skipped"
 
             r3 = None
@@ -1262,18 +1493,18 @@ class SmartBookingBotV2:
                 )
             finally:
                 if active_gate:
-                    is_fast_retry = (
-                        reservation_attempt < max_reservation_attempts
-                        and r3 is not None
+                    is_fast_response = (
+                        r3 is not None
                         and not self._response_success(r3)
                         and self._failure_data(r3).find(FAST_RETRY_TEXT) >= 0
                     )
-                    gate_result = "success" if self._response_success(r3) else "fast_retry" if is_fast_retry else "failed"
+                    gate_result = "success" if self._response_success(r3) else "fast_retry" if is_fast_response else "failed"
                     active_gate.record_response(
                         candidate,
                         reservation_label,
                         gate_result,
-                        fast_retry=is_fast_retry,
+                        fast_retry=is_fast_response,
+                        defer_retry=max_reservation_attempts == 1,
                     )
 
             if self._response_success(r3):
@@ -1333,7 +1564,7 @@ class SmartBookingBotV2:
     @staticmethod
     def _failure_data(result):
         if result and result.json_data:
-            return str(result.json_data.get("data", ""))
+            return safe_response_message(result.json_data)
         return ""
 
     def _record_booking_failure(self, result, label, failure_stats=None):
@@ -1566,6 +1797,8 @@ class SmartBookingBotV2:
         self,
         candidate,
         label,
+        wave_index,
+        attempt_index,
         candidate_index,
         candidate_total,
         results,
@@ -1574,48 +1807,75 @@ class SmartBookingBotV2:
     ):
         delay_seconds = max(float(start_delay or 0), 0.0)
         if delay_seconds > 0:
-            self.logger.info(
-                f"[直抢投机] 相邻候选延迟启动 label={label} delay={delay_seconds:.3f}s"
+            self.log_event(
+                "candidate_start_delay",
+                label=label,
+                wave=wave_index,
+                delay_ms=round(delay_seconds * 1000),
             )
             time.sleep(delay_seconds)
-        local_stats = Counter()
-        client = KeepAliveClient(
-            self.base_url,
-            self._headers(),
-            timeout=self.args.timeout,
-            logger=self.logger,
-            fail_stats=local_stats,
-        )
+
         started_at = time.monotonic()
         result = "exception"
+        slot = None
         try:
+            remaining = None if self.direct_deadline is None else max(self.direct_deadline - time.monotonic(), 0.001)
+            slot = self.direct_client_queue.get(timeout=remaining)
+            slot.fail_stats.clear()
+            self.log_event(
+                "candidate_client_acquired",
+                label=label,
+                wave=wave_index,
+                attempt=attempt_index,
+                client_slot=slot.slot_id,
+                queue_wait_ms=round((time.monotonic() - started_at) * 1000),
+            )
             result = self.attempt_single_hour_booking(
                 candidate,
                 label,
-                1,
+                wave_index,
                 candidate_index,
                 candidate_total,
-                client=client,
-                failure_stats=local_stats,
+                client=slot.client,
+                failure_stats=slot.fail_stats,
             )
+        except queue.Empty:
+            result = "deadline_expired"
         except Exception as exc:
-            local_stats[f"{label}_exception"] += 1
+            if slot is not None:
+                slot.fail_stats[f"{label}_exception"] += 1
             self.logger.error(f"[直抢投机] worker exception label={label} error={repr(exc)}")
             self.logger.error(traceback.format_exc())
         finally:
             elapsed = time.monotonic() - started_at
-            client.close()
             with result_lock:
-                self.fail_stats.update(local_stats)
+                if slot is not None:
+                    self.fail_stats.update(slot.fail_stats)
                 results.append(
                     {
                         "candidate": candidate,
                         "label": label,
                         "result": result,
+                        "wave": wave_index,
+                        "attempt": attempt_index,
+                        "client_slot": slot.slot_id if slot is not None else 0,
                         "elapsed": elapsed,
                         "completed_at": time.monotonic(),
                     }
                 )
+            self.log_event(
+                "candidate_attempt_complete",
+                label=label,
+                wave=wave_index,
+                attempt=attempt_index,
+                hour=candidate["hour"],
+                court=candidate["court_id"],
+                result=result,
+                elapsed_ms=round(elapsed * 1000),
+                client_slot=slot.slot_id if slot is not None else 0,
+            )
+            if slot is not None:
+                self.direct_client_queue.put(slot)
 
     def _select_direct_speculative_pair(self, successful_candidates, center_hour):
         best = None
@@ -1642,111 +1902,240 @@ class SmartBookingBotV2:
             ),
         )
 
-    def _log_direct_speculative_results(self, results, successful_candidates):
+    def _log_direct_speculative_results(self, wave_index, results, successful_candidates):
         self.logger.info(
-            f"[直抢投机] 初始批次完成 | total={len(results)} | success={len(successful_candidates)} | "
+            f"[直抢波次] wave={wave_index} 完成 | total={len(results)} | success={len(successful_candidates)} | "
             f"failed={len(results) - len(successful_candidates)}"
         )
         for item in sorted(results, key=lambda result: result["completed_at"]):
             self.logger.info(
-                f"[直抢投机结果] label={item['label']} | result={item['result']} | "
+                f"[直抢波次结果] wave={wave_index} | label={item['label']} | result={item['result']} | "
                 f"elapsed={item['elapsed']:.3f}s | {self._booking_candidate_text(item['candidate'])}"
             )
 
-    def run_direct_speculative_mode(self):
+    @staticmethod
+    def _candidate_key(candidate):
+        return candidate["hour"], candidate["court_id"]
+
+    def _take_direct_wave(self, pending, attempt_counts):
+        eligible = []
+        while pending:
+            candidate = pending.popleft()
+            skip_reason = self.reservation_place_gate.skip_reason(candidate)
+            if skip_reason:
+                self.log_event(
+                    "candidate_scheduler_skip",
+                    hour=candidate["hour"],
+                    court=candidate["court_id"],
+                    reason=skip_reason,
+                )
+                continue
+            key = self._candidate_key(candidate)
+            if attempt_counts[key] < self.args.direct_max_attempts:
+                eligible.append(candidate)
+
+        selected = []
+        selected_keys = set()
+        selected_hours = set()
+        for candidate in eligible:
+            if len(selected) >= self.args.direct_max_inflight:
+                break
+            key = self._candidate_key(candidate)
+            if candidate["hour"] in selected_hours:
+                continue
+            selected.append(candidate)
+            selected_keys.add(key)
+            selected_hours.add(candidate["hour"])
+
+        for candidate in eligible:
+            if len(selected) >= self.args.direct_max_inflight:
+                break
+            key = self._candidate_key(candidate)
+            if key in selected_keys:
+                continue
+            selected.append(candidate)
+            selected_keys.add(key)
+
+        for candidate in eligible:
+            if self._candidate_key(candidate) not in selected_keys:
+                pending.append(candidate)
+        for candidate in selected:
+            attempt_counts[self._candidate_key(candidate)] += 1
+        return selected
+
+    def _apply_direct_successes(self, successful_candidates, center_hour):
+        if not successful_candidates:
+            return False
+        if self.target_duration == 1:
+            self.first_booking = successful_candidates[0]
+            return True
+
+        pair = self._select_direct_speculative_pair(successful_candidates, center_hour)
+        if pair:
+            self.first_booking = pair[0]
+            self.second_booking = pair[1]
+            return True
+
+        self.first_booking = self._select_direct_speculative_anchor(successful_candidates, center_hour)
+        return False
+
+    def run_direct_speculative_mode(self, guide_state=None):
         self.logger.info("-" * 110)
-        self.logger.info("[直抢投机] 两小时 direct-fast 启用：中间小时与相邻候选并发下单")
+        self.logger.info(
+            f"[直抢波次] direct-fast 启用：duration={self.target_duration} | "
+            f"max_inflight={self.args.direct_max_inflight} | max_attempts={self.args.direct_max_attempts}"
+        )
         candidates = self.generate_direct_first_candidates()
-        self.logger.info(f"[直抢投机] 直抢第一小时候选总数={len(candidates)}")
+        if guide_state:
+            candidates = guide_state.sort_candidates(candidates)
+        self.logger.info(f"[直抢波次] 完整候选总数={len(candidates)}")
         self.log_first_candidates(candidates)
         if not candidates:
-            self.logger.warning("[结束] 直抢投机未生成中间小时候选")
+            self.logger.warning("[结束] 直抢波次未生成候选")
             return "failed"
 
         center_candidate = candidates[0]
         center_hour = center_candidate["hour"]
-        center_candidates = self.generate_direct_speculative_center_candidates(
-            candidates,
-            center_hour,
-            per_hour_limit=3,
-        )
-        adjacent_candidates = self.generate_direct_speculative_adjacent_candidates(center_hour, per_hour_limit=3)
-        self.log_direct_speculative_candidates(center_candidates, adjacent_candidates)
 
         if self.args.dry_run:
-            self.attempt_single_hour_booking(center_candidate, "direct_spec_center", 1, 1, 1)
+            self.attempt_single_hour_booking(center_candidate, "direct_spec_center", 1, 1, len(candidates))
             return "dry_run"
 
-        initial_candidates = center_candidates + adjacent_candidates
-        candidate_total = len(initial_candidates)
-        results = []
-        result_lock = threading.Lock()
-        threads = []
+        self._prepare_direct_clients(prewarm=False)
+        pending = deque(candidates)
+        attempt_counts = Counter()
+        candidate_total = len(candidates)
+        observed_successes = []
+        wave_index = 0
+        final_status = "failed"
         previous_gate = self.reservation_place_gate
+        previous_deadline = self.direct_deadline
+        self.direct_deadline = time.monotonic() + self.args.window_seconds
         self.reservation_place_gate = ReservationPlaceGate(
             self.args.reservation_place_gap,
             self.args.reservation_place_fast_retry_gap,
             logger=self.logger,
+            required_hours=self.target_duration,
+        )
+        self.log_event(
+            "direct_scheduler_start",
+            candidate_total=candidate_total,
+            max_inflight=self.args.direct_max_inflight,
+            max_attempts=self.args.direct_max_attempts,
+            deadline_ms=round(self.args.window_seconds * 1000),
+            center_hour=center_hour,
         )
 
         try:
-            self.logger.info(
-                f"[直抢投机] 启动初始批次 | center={len(center_candidates)} | "
-                f"adjacent={len(adjacent_candidates)} | total={candidate_total} | "
-                f"adjacent_delay={self.args.direct_spec_adjacent_delay}s"
-            )
-            for idx, candidate in enumerate(initial_candidates, start=1):
-                label = self._direct_speculative_label(center_hour, candidate)
-                start_delay = 0.0 if candidate["hour"] == center_hour else self.args.direct_spec_adjacent_delay
-                thread = threading.Thread(
-                    target=self._direct_speculative_booking_worker,
-                    args=(candidate, label, idx, candidate_total, results, result_lock, start_delay),
+            while pending and time.monotonic() < self.direct_deadline:
+                wave_candidates = self._take_direct_wave(pending, attempt_counts)
+
+                if not wave_candidates:
+                    continue
+
+                wave_index += 1
+                results = []
+                result_lock = threading.Lock()
+                threads = []
+                self.log_event(
+                    "direct_wave_start",
+                    wave=wave_index,
+                    wave_size=len(wave_candidates),
+                    pending=len(pending),
+                    remaining_ms=max(round((self.direct_deadline - time.monotonic()) * 1000), 0),
+                    candidates=[f"{item['hour']}:{item['court_id']}" for item in wave_candidates],
                 )
-                thread.start()
-                threads.append(thread)
-                if idx == len(center_candidates) and len(adjacent_candidates) > 0:
-                    self.logger.info("[直抢投机] 中间小时候选已启动，相邻候选按配置延迟进入下单链路")
 
-            for thread in threads:
-                thread.join()
+                for idx, candidate in enumerate(wave_candidates, start=1):
+                    attempt_index = attempt_counts[self._candidate_key(candidate)]
+                    label = (
+                        f"{self._direct_speculative_label(center_hour, candidate)}"
+                        f"_w{wave_index}_a{attempt_index}"
+                    )
+                    start_delay = (
+                        self.args.direct_spec_adjacent_delay
+                        if candidate["hour"] != center_hour
+                        else 0.0
+                    )
+                    thread = threading.Thread(
+                        target=self._direct_speculative_booking_worker,
+                        args=(
+                            candidate,
+                            label,
+                            wave_index,
+                            attempt_index,
+                            idx,
+                            candidate_total,
+                            results,
+                            result_lock,
+                            start_delay,
+                        ),
+                    )
+                    thread.start()
+                    threads.append(thread)
 
-            successful_candidates = [item["candidate"] for item in results if item["result"] == "success"]
-            self._log_direct_speculative_results(results, successful_candidates)
-            if not successful_candidates:
-                self.logger.warning("[结束] 直抢投机初始批次未抢到任何一个小时")
-                return "failed"
+                for thread in threads:
+                    thread.join()
 
-            pair = self._select_direct_speculative_pair(successful_candidates, center_hour)
-            if pair:
-                self.first_booking = pair[0]
-                self.second_booking = pair[1]
-                self.logger.info(
-                    f"[完成] 直抢投机初始批次已形成连续两小时："
-                    f"{pair[0]['hour']}:00-{pair[1]['hour'] + 1}:00"
+                wave_successes = [item["candidate"] for item in results if item["result"] == "success"]
+                self._log_direct_speculative_results(wave_index, results, wave_successes)
+                for candidate in wave_successes:
+                    if self._candidate_key(candidate) not in {
+                        self._candidate_key(item) for item in observed_successes
+                    }:
+                        observed_successes.append(candidate)
+                successful_candidates = self.reservation_place_gate.successful_candidates() or observed_successes
+                if self._apply_direct_successes(successful_candidates, center_hour):
+                    final_status = "success"
+                    break
+
+                transient_candidates = []
+                for item in results:
+                    if item["result"] in ("retry_delay", "server_retry", "exception"):
+                        key = self._candidate_key(item["candidate"])
+                        if attempt_counts[key] < self.args.direct_max_attempts:
+                            transient_candidates.append(item["candidate"])
+                    if guide_state:
+                        guide_state.record_attempt_result(item["candidate"], item["result"])
+                pending.extend(transient_candidates)
+
+                self.log_event(
+                    "direct_wave_complete",
+                    wave=wave_index,
+                    success_count=len(successful_candidates),
+                    transient_requeued=len(transient_candidates),
+                    pending=len(pending),
+                    results=Counter(item["result"] for item in results),
                 )
-                extra_successes = len(successful_candidates) - 2
-                if extra_successes > 0:
-                    self.logger.info(f"[直抢投机] 初始批次额外成功小时数={extra_successes}")
-                return "success"
+                if pending and time.monotonic() < self.direct_deadline:
+                    self._sleep_for(self.args.poll_interval, self.direct_deadline)
 
-            anchor = self._select_direct_speculative_anchor(successful_candidates, center_hour)
-            self.first_booking = anchor
-            self.logger.info(
-                f"[直抢投机] 初始批次已有单小时成功，选择锚点继续相邻补抢："
-                f"{self._booking_candidate_text(anchor)}"
+            successful_candidates = self.reservation_place_gate.successful_candidates() or observed_successes
+            self._apply_direct_successes(successful_candidates, center_hour)
+            reason = "target_complete" if final_status == "success" else "window_expired" if time.monotonic() >= self.direct_deadline else "candidate_exhausted"
+            self.log_event(
+                "direct_scheduler_complete",
+                status=final_status,
+                reason=reason,
+                waves=wave_index,
+                attempted_candidates=len(attempt_counts),
+                total_attempts=sum(attempt_counts.values()),
+                success_hours=sorted({item["hour"] for item in successful_candidates}),
             )
-            second_status = self.run_direct_second_stage()
-            if second_status != "success":
-                self.logger.warning("[结束] 直抢投机已有单小时成功，但相邻补抢未完成")
-                return "failed"
-            self.logger.info("[完成] 直抢投机批次加相邻补抢已完成连续两小时")
-            return "success"
+            if final_status == "success":
+                self.logger.info("[完成] 直抢波次已达成目标")
+            elif self.first_booking:
+                self.logger.warning("[结束] 直抢波次已抢到一个小时，但未完成连续两小时")
+            else:
+                self.logger.warning(f"[结束] 直抢波次未抢到任何一个小时 | reason={reason}")
+            return final_status
         finally:
             self.reservation_place_gate = previous_gate
+            self.direct_deadline = previous_deadline
 
     def run_direct_mode(self, guide_state=None):
-        if self.args.booking_mode == BOOKING_MODE_DIRECT_FAST and self.target_duration == 2:
-            return self.run_direct_speculative_mode()
+        if self.args.booking_mode in (BOOKING_MODE_DIRECT_FAST, BOOKING_MODE_GUIDED_FAST):
+            return self.run_direct_speculative_mode(guide_state)
 
         first_status = self.run_direct_first_stage(guide_state)
         if first_status == "dry_run":
@@ -1856,7 +2245,7 @@ class SmartBookingBotV2:
             self.logger.warning(f"[引导采集] tick={probe_index} 返回不是有效 JSON")
             return None
         if result.json_data.get("msg") != "success":
-            message = str(result.json_data.get("data", ""))
+            message = safe_response_message(result.json_data)
             key = "busy" if BUSY_RETRY_TEXT in message else "business"
             self.fail_stats[f"guided_get_places_{key}"] += 1
             self.logger.warning(f"[引导采集] tick={probe_index} msg={result.json_data.get('msg')} data={message}")
@@ -1914,6 +2303,7 @@ class SmartBookingBotV2:
             else:
                 self.logger.info("[汇总] dry-run 未发现候选")
             self.logger.info(f"[汇总] 失败统计：{dict(self.fail_stats)}")
+            self._log_http_metrics_summary()
             self.logger.info("=" * 110)
             return
 
@@ -1946,7 +2336,38 @@ class SmartBookingBotV2:
             self.logger.info("[汇总] 已完成单小时预约目标")
 
         self.logger.info(f"[汇总] 失败统计：{dict(self.fail_stats)}")
+        self._log_http_metrics_summary()
         self.logger.info("=" * 110)
+
+    def _log_http_metrics_summary(self):
+        metrics_summary = {}
+        with self.metrics_lock:
+            metrics_snapshot = {key: list(values) for key, values in self.http_metrics.items()}
+            outcome_snapshot = dict(self.outcome_stats)
+        for endpoint, values in sorted(metrics_snapshot.items()):
+            ordered = sorted(values)
+            if not ordered:
+                continue
+            p50 = ordered[min(math.ceil(len(ordered) * 0.50) - 1, len(ordered) - 1)]
+            p90 = ordered[min(math.ceil(len(ordered) * 0.90) - 1, len(ordered) - 1)]
+            summary = {
+                "count": len(ordered),
+                "p50_ms": round(p50 * 1000),
+                "p90_ms": round(p90 * 1000),
+                "max_ms": round(max(ordered) * 1000),
+            }
+            metrics_summary[endpoint] = summary
+            self.logger.info(
+                f"[汇总] HTTP {endpoint}: count={summary['count']} p50={summary['p50_ms']}ms "
+                f"p90={summary['p90_ms']}ms max={summary['max_ms']}ms"
+            )
+        self.log_event(
+            "run_summary",
+            http_metrics=metrics_summary,
+            outcomes=outcome_snapshot,
+            failures=dict(self.fail_stats),
+            completed_hours=int(bool(self.first_booking)) + int(bool(self.second_booking)),
+        )
 
     def run(self):
         try:
@@ -1993,12 +2414,13 @@ class SmartBookingBotV2:
             self.logger.info("[完成] 两阶段均成功")
             self.print_summary()
         finally:
+            self._close_direct_clients()
             self.client.close()
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="羽毛球场地预约 - v2 均衡模式",
+        description=f"羽毛球场地预约 - engine {BOOKING_ENGINE_VERSION}",
         epilog="""
 Examples:
   python enhanced_book_smart_v2.py -t 17-21 --duration 2
@@ -2035,19 +2457,31 @@ Examples:
         "--direct-spec-adjacent-delay",
         type=float,
         default=DEFAULT_DIRECT_SPEC_ADJACENT_DELAY,
-        help="两小时 direct-fast 相邻小时候选启动延迟，默认0.2秒",
+        help="direct-fast 相邻小时候选启动延迟，默认0秒",
+    )
+    parser.add_argument(
+        "--direct-max-inflight",
+        type=int,
+        default=DEFAULT_DIRECT_MAX_INFLIGHT,
+        help="direct-fast 每波最大并发候选数，默认3",
+    )
+    parser.add_argument(
+        "--direct-max-attempts",
+        type=int,
+        default=DEFAULT_DIRECT_MAX_ATTEMPTS,
+        help="direct-fast 每个候选的最大尝试次数，默认2",
     )
     parser.add_argument(
         "--reservation-place-gap",
         type=float,
         default=DEFAULT_RESERVATION_PLACE_GAP,
-        help="两小时 direct-fast reservationPlace 响应后的最小间隔，默认0.85秒",
+        help="direct-fast reservationPlace 响应后的最小间隔，默认0.35秒",
     )
     parser.add_argument(
         "--reservation-place-fast-retry-gap",
         type=float,
         default=DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP,
-        help="两小时 direct-fast 操作过快后的 reservationPlace 重试间隔，默认1.35秒",
+        help="direct-fast 操作过快后的 reservationPlace 重试间隔，默认0.8秒",
     )
     parser.add_argument(
         "--booking-mode",

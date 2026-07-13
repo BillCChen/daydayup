@@ -2145,7 +2145,7 @@ function buildViewModeDetailGroups() {
   const modeValue = formValue(bookingForm, "booking_mode", "balanced");
   const windowSeconds = formValue(bookingForm, "window_seconds", "30");
   const pollInterval = formValue(bookingForm, "poll_interval", "0.05");
-  const adjacentDelay = formValue(bookingForm, "direct_spec_adjacent_delay", "0.2");
+  const adjacentDelay = formValue(bookingForm, "direct_spec_adjacent_delay", "0");
   const priority = formValue(bookingForm, "priority", "").trim();
   const backup = formValue(bookingForm, "backup", "").trim();
   const courtPool = [priority, backup].filter(Boolean).join(" + ") || "-";
@@ -2196,12 +2196,14 @@ function buildViewModeDetailGroups() {
         ["window_seconds", `${windowSeconds}s`],
         ["poll_interval", secondsToMsText(pollInterval)],
         ["direct_spec_adjacent_delay", secondsToMsText(adjacentDelay)],
+        ["direct_max_inflight", "3"],
+        ["direct_max_attempts", "2"],
         ["step_sleep", "30ms"],
         ["guide_interval", modeValue === "guided-fast" ? "500ms" : "-"],
         ["guide_max_inflight", modeValue === "guided-fast" ? "4" : "-"],
         ["场地池", courtPool],
       ],
-      behavior: "balanced 先查询再排序下单；direct-fast 跳过 get_places 连续直抢；guided-fast 用直抢 worker 和 collector 探测共同更新排序。",
+      behavior: "balanced 先查询再排序下单；direct-fast 使用最多 3 个预热连接分波覆盖完整候选池；guided-fast 额外用实时探测更新候选排序。",
     },
     {
       title: "日志",
@@ -2354,7 +2356,7 @@ function setupAdjacentDelaySlider() {
     renderViewModeDetails();
   };
   els.adjacentDelaySlider.addEventListener("input", sync);
-  els.adjacentDelaySlider.value = "0.2";
+  els.adjacentDelaySlider.value = "0";
   sync();
 }
 

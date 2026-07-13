@@ -68,6 +68,7 @@ DEFAULT_OAUTH_REDIRECT_URL = "https://www.147soft.cn/easyserp/index.html"
 PROJECT_TYPE = "3"
 BOOKING_ITEM_TYPE = "羽毛球"
 BOOKING_CALL_DELAY_SECONDS = 0.03
+EXACT_BOOKING_FAST_RETRY_SECONDS = 0.8
 BOOKING_MODES = {"balanced", "direct-fast", "guided-fast"}
 SCAN_MIN_INTERVAL_MINUTES = 5
 SCAN_MAX_INTERVAL_MINUTES = 1440
@@ -78,6 +79,12 @@ SCAN_SUMMARY_TIME = datetime_time(22, 0)
 LOG_WINDOW_CHOICES_HOURS = {6, 12, 24, 168}
 LOG_DEFAULT_WINDOW_HOURS = 6
 LOG_RETENTION_SECONDS = 7 * 24 * 60 * 60
+
+
+class ExactBookingError(EasySerpError):
+    def __init__(self, message: str, trace: list[dict[str, Any]]):
+        super().__init__(message)
+        self.trace = list(trace)
 
 
 @dataclass
@@ -441,7 +448,7 @@ class JobManager:
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             for job in self.jobs.values():
-                self._poll_locked(job)
+                self._poll_locked(job, finalize_history=True)
             self._trim_locked()
             jobs = sorted(self.jobs.values(), key=lambda item: item.id)
             active_jobs = [job for job in jobs if job.status in {"running", "stopping"}]
@@ -502,7 +509,7 @@ class JobManager:
     def active_job_ids(self) -> set[int]:
         with self.lock:
             for job in self.jobs.values():
-                self._poll_locked(job)
+                self._poll_locked(job, finalize_history=True)
             return {job.id for job in self.jobs.values() if job.status in {"running", "stopping"}}
 
 
@@ -1041,9 +1048,11 @@ def build_booking_command(payload: dict[str, Any]) -> tuple[list[str], str]:
     for cli_name, payload_key, default_value in (
         ("--window-seconds", "window_seconds", "60"),
         ("--poll-interval", "poll_interval", "0.08"),
-        ("--direct-spec-adjacent-delay", "direct_spec_adjacent_delay", "0.2"),
-        ("--reservation-place-gap", "reservation_place_gap", "0.85"),
-        ("--reservation-place-fast-retry-gap", "reservation_place_fast_retry_gap", "1.35"),
+        ("--direct-spec-adjacent-delay", "direct_spec_adjacent_delay", "0"),
+        ("--direct-max-inflight", "direct_max_inflight", "3"),
+        ("--direct-max-attempts", "direct_max_attempts", "2"),
+        ("--reservation-place-gap", "reservation_place_gap", "0.35"),
+        ("--reservation-place-fast-retry-gap", "reservation_place_fast_retry_gap", "0.8"),
         ("--guide-interval", "guide_interval", "0.5"),
         ("--guide-max-inflight", "guide_max_inflight", "4"),
         ("--error-backoff", "error_backoff", "0.25"),
@@ -1892,7 +1901,7 @@ class WebConsole:
                 successes.append({"slot": public_exact_slot(current), "dry_run": True})
                 continue
             try:
-                self._reserve_exact_slot(client, user, card["card_index_raw"], current)
+                trace = self._reserve_exact_slot(client, user, card["card_index_raw"], current)
                 success_slot = public_exact_slot(current)
                 try:
                     booking = self._find_recent_booking_for_slot(user, success_slot)
@@ -1901,7 +1910,15 @@ class WebConsole:
                         success_slot["booking"] = booking
                 except EasySerpError as exc:
                     success_slot["booking_match_error"] = redact_sensitive_text(exc)
-                successes.append({"slot": success_slot})
+                successes.append({"slot": success_slot, "trace": trace})
+            except ExactBookingError as exc:
+                failures.append(
+                    {
+                        "slot": public_exact_slot(current),
+                        "error": redact_sensitive_text(exc),
+                        "trace": exc.trace,
+                    }
+                )
             except EasySerpError as exc:
                 failures.append({"slot": public_exact_slot(current), "error": redact_sensitive_text(exc)})
 
@@ -1986,7 +2003,33 @@ class WebConsole:
         user: UserAccount,
         card_index: str,
         slot: dict[str, Any],
-    ) -> None:
+    ) -> list[dict[str, Any]]:
+        trace: list[dict[str, Any]] = []
+
+        def call_stage(stage: str, request: Any, attempt: int = 1) -> None:
+            started_at = time.perf_counter()
+            try:
+                require_success(request(), stage)
+            except EasySerpError as exc:
+                error_text = redact_sensitive_text(exc)
+                trace.append(
+                    {
+                        "stage": stage,
+                        "attempt": attempt,
+                        "elapsed_ms": round((time.perf_counter() - started_at) * 1000),
+                        "outcome": exact_booking_outcome(error_text),
+                    }
+                )
+                raise ExactBookingError(error_text, trace) from exc
+            trace.append(
+                {
+                    "stage": stage,
+                    "attempt": attempt,
+                    "elapsed_ms": round((time.perf_counter() - started_at) * 1000),
+                    "outcome": "success",
+                }
+            )
+
         canbook_fields = [
             {
                 "day": slot["date"],
@@ -2006,8 +2049,9 @@ class WebConsole:
             }
         ]
         field_info = json.dumps(field_info_full, ensure_ascii=False)
-        require_success(
-            client.post(
+        call_stage(
+            "canBook",
+            lambda: client.post(
                 "place/canBook",
                 data={
                     "fieldinfo": json.dumps(canbook_fields, ensure_ascii=False),
@@ -2015,11 +2059,11 @@ class WebConsole:
                     "token": user.token,
                 },
             ),
-            "canBook",
         )
         time.sleep(BOOKING_CALL_DELAY_SECONDS)
-        require_success(
-            client.post(
+        call_stage(
+            "getOfferInfo",
+            lambda: client.post(
                 "common/getOfferInfo",
                 data={
                     "token": user.token,
@@ -2029,11 +2073,11 @@ class WebConsole:
                     "projectInfo": field_info,
                 },
             ),
-            "getOfferInfo",
         )
         time.sleep(BOOKING_CALL_DELAY_SECONDS)
-        require_success(
-            client.post(
+        call_stage(
+            "getUseCardInfo",
+            lambda: client.post(
                 "common/getUseCardInfo",
                 data={
                     "token": user.token,
@@ -2042,30 +2086,37 @@ class WebConsole:
                     "projectInfo": field_info,
                 },
             ),
-            "getUseCardInfo",
         )
         time.sleep(BOOKING_CALL_DELAY_SECONDS)
-        require_success(
-            client.post(
-                "place/reservationPlace",
-                data={
-                    "token": user.token,
-                    "shopNum": self.config.shop_num,
-                    "fieldinfo": field_info,
-                    "oldTotal": format_amount(slot["price_value"]),
-                    "cardPayType": "0",
-                    "type": BOOKING_ITEM_TYPE,
-                    "offerId": card_index,
-                    "offerType": PROJECT_TYPE,
-                    "total": format_amount(slot["pay_value"]),
-                    "premerother": "",
-                    "cardIndex": card_index,
-                    "masterCardNum": "",
-                    "zengzhiMoney": "0",
-                },
-            ),
-            "reservationPlace",
-        )
+        reservation_data = {
+            "token": user.token,
+            "shopNum": self.config.shop_num,
+            "fieldinfo": field_info,
+            "oldTotal": format_amount(slot["price_value"]),
+            "cardPayType": "0",
+            "type": BOOKING_ITEM_TYPE,
+            "offerId": card_index,
+            "offerType": PROJECT_TYPE,
+            "total": format_amount(slot["pay_value"]),
+            "premerother": "",
+            "cardIndex": card_index,
+            "masterCardNum": "",
+            "zengzhiMoney": "0",
+        }
+        for attempt in (1, 2):
+            try:
+                call_stage(
+                    "reservationPlace",
+                    lambda: client.post("place/reservationPlace", data=reservation_data),
+                    attempt=attempt,
+                )
+                break
+            except ExactBookingError as exc:
+                if attempt == 1 and exact_booking_outcome(str(exc)) == "too_fast":
+                    time.sleep(EXACT_BOOKING_FAST_RETRY_SECONDS)
+                    continue
+                raise
+        return trace
 
     def _find_recent_order(self, bill_num: str, user: UserAccount) -> dict[str, Any] | None:
         orders = fetch_orders(
@@ -2403,6 +2454,7 @@ def exact_history_detail(result: dict[str, Any]) -> dict[str, Any]:
             {
                 "slot": public_history_slot(item.get("slot")),
                 "bill_num": clean_string((item.get("slot") or {}).get("bill_num")) if isinstance(item, dict) else "",
+                "trace": public_exact_trace(item.get("trace")),
             }
             for item in result.get("successes") or []
             if isinstance(item, dict)
@@ -2411,11 +2463,45 @@ def exact_history_detail(result: dict[str, Any]) -> dict[str, Any]:
             {
                 "slot": public_history_slot(item.get("slot")),
                 "error": clean_string(item.get("error")) if isinstance(item, dict) else "",
+                "trace": public_exact_trace(item.get("trace")),
             }
             for item in result.get("failures") or []
             if isinstance(item, dict)
         ],
     }
+
+
+def exact_booking_outcome(error: Any) -> str:
+    text = clean_string(error)
+    if "操作过快" in text:
+        return "too_fast"
+    if "下手太晚" in text or "no longer bookable" in text:
+        return "taken"
+    if "数据错误" in text:
+        return "data_error"
+    if "server error" in text or "HTTP 5" in text:
+        return "server_error"
+    if "request failed" in text or "timeout" in text.lower():
+        return "transport_error"
+    return "business_error"
+
+
+def public_exact_trace(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    result = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        result.append(
+            {
+                "stage": clean_string(item.get("stage")),
+                "attempt": max(int_or_default(item.get("attempt"), 1), 1),
+                "elapsed_ms": max(int_or_default(item.get("elapsed_ms"), 0), 0),
+                "outcome": clean_string(item.get("outcome")),
+            }
+        )
+    return result
 
 
 def public_history_slot(value: Any) -> dict[str, Any]:

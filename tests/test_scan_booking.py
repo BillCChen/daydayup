@@ -477,6 +477,31 @@ class JobManagerTests(unittest.TestCase):
             self.assertEqual(records["lost"]["result"], "已失联")
             self.assertTrue(records["lost"].get("finished_at"))
 
+    def test_active_job_ids_finalizes_completed_process_before_orphan_sweep(self):
+        class CompletedProcess(FakeBookingProcess):
+            def poll(self):
+                return 0
+
+        class RecordingHistory:
+            def __init__(self):
+                self.finished = []
+
+            def finish(self, job):
+                self.finished.append(job.id)
+
+        history = RecordingHistory()
+        manager = web_console.JobManager(
+            web_console.ServerConfig("1", "https://example.invalid/easyserpClient", 10),
+            history,
+        )
+        job = web_console.BookingJob(1, CompletedProcess(), time.time(), "test", "history-1")
+        manager.jobs[job.id] = job
+
+        self.assertEqual(manager.active_job_ids(), set())
+        self.assertEqual(job.status, "completed")
+        self.assertTrue(job.history_finalized)
+        self.assertEqual(history.finished, [1])
+
 
 if __name__ == "__main__":
     unittest.main()
