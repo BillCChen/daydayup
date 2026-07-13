@@ -88,3 +88,10 @@ Never log raw tokens, cookies, card indices, offer IDs, member names, card balan
 - `tests/test_fast_booking_modes.py`: current direct/guided mode coverage.
 - `/opt/huairou/daydayup/state/logs`: production booking evidence.
 - `/opt/huairou/daydayup/docker-compose.yml`: production service definition.
+
+## Deployment Findings
+
+- The production containers belong to Compose project `daydayup-prod`; invoking Compose without `-p daydayup-prod` would target a different project and risk duplicate services.
+- The production image contains the runtime while the repository is mounted into the containers, so a source fast-forward plus service recreation activates the new code; rebuilding preserves the established deployment workflow.
+- Aliyun-origin public HTTPS verification is authoritative for this deployment because the local resolver returned a synthetic `198.18.2.185` address. The server-origin public route returned `200`, and TLS verification succeeded there.
+- No real booking or cancellation was used as a smoke test. Reliability improvement remains a high-confidence engineering inference until the next competitive release window supplies v3.5 event evidence.

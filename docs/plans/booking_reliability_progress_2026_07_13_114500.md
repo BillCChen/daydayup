@@ -46,7 +46,11 @@
 
 ### Phase 5: Version, publish, and deploy
 
-- **Status:** in_progress
+- **Status:** complete
+- Committed release code as `8199435f6d721cd506dc2905f82210ef8ea7eaaa` and published the annotated v3.5 tag.
+- Created and checksum-verified an Aliyun state/deployment backup at `/opt/huairou/daydayup/backups/20260713_122200_v3_5_0`.
+- Fast-forwarded the Aliyun checkout, rebuilt the shared runtime image, and recreated only the existing `daydayup-prod` Web and scan services.
+- Verified engine version, repository identity, Web/API status codes, process commands, zero restarts, state preservation, public HTTPS routing, v3.5 UI markers, and zero recent error-pattern matches.
 
 ## Test Results
 
@@ -59,6 +63,9 @@
 | Second v3.5 regression run | Updated behavior and new coverage pass | 67/67 passed | Passed |
 | Final v3.5 regression run | Hardening and release candidate pass | 70/70 passed | Passed |
 | Static source checks | Python and JavaScript parse cleanly | 18 Python sources compiled in memory; `node --check web/app.js` passed | Passed |
+| Aliyun deployment identity | Server runs the pushed release commit and tag | Repo, `origin/main`, and tag matched `8199435f`; engine reported `3.5.0` | Passed |
+| Aliyun service smoke | No booking/cancellation; Web and scan stay healthy | Local/public Web `200`, unauthenticated API `401`, both containers running with zero restarts | Passed |
+| State and rollback artifacts | State preserved and backup readable | 22 state files remained; archive checksum passed; prior commit/image metadata saved | Passed |
 
 ## Error Log
 
@@ -68,6 +75,8 @@
 | 2026-07-13 12:13 | Test shell cleanup used reserved zsh variable `status`, masking the unittest exit code after output already showed six failures | 1 | Future test wrapper uses `test_rc`; the failed assertions are being replaced before rerun |
 | 2026-07-13 12:15 | Wave-selection helper was initially inserted into `ReservationPlaceGate` because the patch matched the first `_candidate_key` method | 1 | Moved the helper to `SmartBookingBotV2`; four targeted tests and the full suite then passed |
 | 2026-07-13 12:20 | A shell inspection loop used zsh's reserved `path` variable and lost command lookup within that subprocess | 1 | Reran with a safe variable name and absolute commands; confirmed all fragment/cache directories predate this session |
+| 2026-07-13 12:22 | A process-command probe used malformed `tr` quoting and stopped the first verification script after the already-passed HTTP/container checks | 1 | Replaced it with `docker top`; process, backup, state, Nginx, and log checks passed |
+| 2026-07-13 12:23 | Local macOS `curl` hit a synthetic `198.18.2.185` resolver path and failed its TLS data exchange | 1 | OpenSSL verified the certificate locally; an Aliyun-origin public HTTPS probe returned `200/401` and served the v3.5 JavaScript markers |
 
 ## Files Created or Modified
 
@@ -88,8 +97,8 @@
 
 | Question | Answer |
 |---|---|
-| Where am I? | Phase 5, version, publish, and deploy |
-| Where am I going? | Commit/tag/push the verified release, then deploy and run non-booking production probes |
+| Where am I? | Complete |
+| Where am I going? | Observe the next real release-time run before further concurrency tuning |
 | What's the goal? | Improve booking reliability and observability while preserving the verified API contract |
 | What have I learned? | See `booking_reliability_findings_2026_07_13_114500.md` |
-| What have I done? | Implementation and review are complete; 70 tests and static checks pass, with no session-created fragment directories in the workspace |
+| What have I done? | v3.5 is tested, tagged, published, backed up, deployed, and verified without a real booking or cancellation |

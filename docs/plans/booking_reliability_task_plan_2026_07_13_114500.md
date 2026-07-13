@@ -6,7 +6,7 @@ Release and deploy a versioned booking-engine update that improves the probabili
 
 ## Current Phase
 
-Phase 5
+Complete
 
 ## Confirmed Baseline
 
@@ -85,13 +85,13 @@ Phase 5
 
 ### Phase 5: Version, publish, and deploy
 
-- [ ] Commit the verified scope and create a v3.5 release tag.
-- [ ] Push the exact commit and tag to GitHub.
-- [ ] Back up Aliyun state and deployment metadata without copying secrets into Git.
-- [ ] Fast-forward the Aliyun repo to the exact pushed commit and rebuild/restart only Daydayup services.
-- [ ] Verify code identity, container status, Web HTTP path, scan worker, and redacted logs.
-- [ ] Confirm rollback command points to `a502ea6` and the previous image/build path remains recoverable.
-- **Status:** in_progress
+- [x] Commit the verified scope and create a v3.5 release tag.
+- [x] Push the exact commit and tag to GitHub.
+- [x] Back up Aliyun state and deployment metadata without copying secrets into Git.
+- [x] Fast-forward the Aliyun repo to the exact pushed commit and rebuild/restart only Daydayup services.
+- [x] Verify code identity, container status, Web HTTP path, scan worker, and redacted logs.
+- [x] Confirm rollback command points to `a502ea6` and the previous image/build path remains recoverable.
+- **Status:** complete
 
 ## Acceptance Criteria
 
@@ -121,3 +121,21 @@ Phase 5
 ## Review Boundary
 
 No independent agent review is available in this task. A separate self-review pass will inspect the diff against the invariants above, followed by deterministic tests and a production smoke check that does not book or cancel.
+
+## Deployment Result
+
+- Release commit: `8199435f6d721cd506dc2905f82210ef8ea7eaaa`.
+- Release tag: `v3.5-booking-reliability-observability`.
+- Aliyun backup: `/opt/huairou/daydayup/backups/20260713_122200_v3_5_0`.
+- Compose project: `daydayup-prod`; only `web` and `scan` were recreated.
+- Container engine version: `3.5.0`.
+- Local upstream Web probe returned `200`; the unauthenticated API probe returned the expected `401`.
+- The server-side public HTTPS probe returned `200`, the unauthenticated public API probe returned `401`, and the public JavaScript contained both v3.5 markers.
+- Both containers were running with zero restarts and zero recent error-pattern log matches.
+- The state archive checksum passed after deployment.
+
+Rollback remains a deliberate operation, not an automatic action: restore the saved Compose/state artifacts if needed, check out `a502ea62f217ddaff288d30f93a49db0ea8b2da6`, rebuild the `web` image, and recreate the same `daydayup-prod` services.
+
+## Convergence Decision
+
+Further pre-release work would not materially improve the core result without evidence from a real 12:00 competition window. The single highest-value next investment is to compare the next release run's structured wave, gate, and endpoint-latency events against the v3.4 production baseline before changing concurrency again.
