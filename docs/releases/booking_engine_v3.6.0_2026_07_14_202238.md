@@ -1,6 +1,6 @@
 # Booking engine v3.6.0
 
-As of: 2026-07-14 20:24 CST
+As of: 2026-07-14 20:37 CST
 
 ## Purpose
 
@@ -41,5 +41,5 @@ The operator is not expected to tune these values.
 - Focused safety and reconciliation tests: passed.
 - Full project regression: 83 tests passed.
 - Python compilation, JavaScript syntax, whitespace, version/default, and durable-artifact secret-pattern checks: passed.
-- Deployment verification: pending.
+- Deployment verification: passed on Aliyun. Both services run engine 3.6.0 with zero restarts; Web/API/default/state/read-only-order/log checks passed.
 - No real booking or cancellation is used for smoke testing.
