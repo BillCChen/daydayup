@@ -1,7 +1,9 @@
+import logging
 import threading
 import time
 import unittest
 from argparse import Namespace
+from collections import Counter
 
 import enhanced_book_smart_v2 as smart
 import web_console
@@ -26,6 +28,12 @@ def make_args(**overrides):
         "base_url": "https://example.invalid/easyserpClient",
         "window_seconds": 0.1,
         "poll_interval": 0.05,
+        "direct_spec_adjacent_delay": smart.DEFAULT_DIRECT_SPEC_ADJACENT_DELAY,
+        "direct_max_inflight": smart.DEFAULT_DIRECT_MAX_INFLIGHT,
+        "direct_max_attempts": smart.DEFAULT_DIRECT_MAX_ATTEMPTS,
+        "reservation_place_gap": smart.DEFAULT_RESERVATION_PLACE_GAP,
+        "reservation_place_fast_retry_gap": smart.DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP,
+        "reservation_place_timeout": smart.DEFAULT_RESERVATION_PLACE_TIMEOUT,
         "booking_mode": smart.BOOKING_MODE_BALANCED,
         "guide_interval": 0.01,
         "guide_max_inflight": 4,
@@ -54,11 +62,214 @@ class FastBookingModeTest(unittest.TestCase):
         self.assertEqual(command[command.index("--booking-mode") + 1], "guided-fast")
         self.assertEqual(command[command.index("--guide-interval") + 1], "0.5")
         self.assertEqual(command[command.index("--guide-max-inflight") + 1], "4")
+        self.assertEqual(command[command.index("--direct-spec-adjacent-delay") + 1], "0")
+        self.assertEqual(command[command.index("--direct-max-inflight") + 1], "3")
+        self.assertEqual(command[command.index("--direct-max-attempts") + 1], "2")
+        self.assertEqual(command[command.index("--reservation-place-gap") + 1], "0.35")
+        self.assertEqual(command[command.index("--reservation-place-fast-retry-gap") + 1], "1.2")
+        self.assertEqual(command[command.index("--reservation-place-timeout") + 1], "2.5")
         self.assertIn("mode=guided-fast", label)
+
+    def test_booking_command_passes_direct_spec_adjacent_delay(self):
+        command, _label = web_console.build_booking_command(
+            {
+                "date": "2026-05-22",
+                "time": "17-21",
+                "duration": "2",
+                "booking_mode": "direct-fast",
+                "direct_spec_adjacent_delay": "0.35",
+            }
+        )
+
+        self.assertIn("--direct-spec-adjacent-delay", command)
+        self.assertEqual(command[command.index("--direct-spec-adjacent-delay") + 1], "0.35")
+
+    def test_booking_command_accepts_reservation_place_gate_tuning(self):
+        command, _label = web_console.build_booking_command(
+            {
+                "date": "2026-05-22",
+                "time": "17-21",
+                "duration": "2",
+                "booking_mode": "direct-fast",
+                "reservation_place_gap": "0.72",
+                "reservation_place_fast_retry_gap": "1.45",
+            }
+        )
+
+        self.assertEqual(command[command.index("--reservation-place-gap") + 1], "0.72")
+        self.assertEqual(command[command.index("--reservation-place-fast-retry-gap") + 1], "1.45")
 
     def test_booking_command_rejects_invalid_mode(self):
         with self.assertRaises(web_console.EasySerpError):
             web_console.build_booking_command({"booking_mode": "fastest"})
+
+    def test_reservation_place_gate_waits_after_response(self):
+        gate = smart.ReservationPlaceGate(0.04, 0.08)
+        first = {"hour": 18, "court_id": "ymq7"}
+        second = {"hour": 19, "court_id": "ymq7"}
+
+        self.assertTrue(gate.wait_for_turn(first, "first"))
+        gate.record_response(first, "first", "failed")
+        started_at = time.monotonic()
+
+        self.assertTrue(gate.wait_for_turn(second, "second"))
+
+        self.assertGreaterEqual(time.monotonic() - started_at, 0.03)
+
+    def test_reservation_place_gate_allows_one_active_submitter(self):
+        gate = smart.ReservationPlaceGate(0, 0)
+        first = {"hour": 18, "court_id": "ymq7"}
+        second = {"hour": 19, "court_id": "ymq7"}
+        second_allowed = threading.Event()
+
+        self.assertTrue(gate.wait_for_turn(first, "first"))
+        thread = threading.Thread(
+            target=lambda: second_allowed.set() if gate.wait_for_turn(second, "second") else None
+        )
+        thread.start()
+        time.sleep(0.03)
+
+        self.assertFalse(second_allowed.is_set())
+        gate.record_response(first, "first", "failed")
+        thread.join(timeout=0.3)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(second_allowed.is_set())
+        gate.record_response(second, "second", "failed")
+
+    def test_reservation_place_gate_uses_fast_retry_gap(self):
+        gate = smart.ReservationPlaceGate(0.01, 0.05)
+        first = {"hour": 18, "court_id": "ymq7"}
+
+        self.assertTrue(gate.wait_for_turn(first, "first"))
+        gate.record_response(first, "first", "fast_retry", fast_retry=True)
+        started_at = time.monotonic()
+
+        self.assertTrue(gate.wait_for_turn(first, "first", retry=True))
+
+        self.assertGreaterEqual(time.monotonic() - started_at, 0.04)
+        gate.record_response(first, "first", "failed")
+
+    def test_reservation_place_gate_adapts_repeated_fast_retry_gap(self):
+        gate = smart.ReservationPlaceGate(0.01, 0.05, max_fast_retry_gap_seconds=0.1)
+        candidate = {"hour": 18, "court_id": "ymq7"}
+
+        gate.record_response(candidate, "first", "fast_retry", fast_retry=True, defer_retry=True)
+        first_gap = gate.last_cooldown_seconds
+        gate.record_response(candidate, "second", "fast_retry", fast_retry=True, defer_retry=True)
+        second_gap = gate.last_cooldown_seconds
+        gate.record_response(candidate, "third", "fast_retry", fast_retry=True, defer_retry=True)
+
+        self.assertAlmostEqual(first_gap, 0.05)
+        self.assertAlmostEqual(second_gap, 0.075)
+        self.assertAlmostEqual(gate.last_cooldown_seconds, 0.1)
+        self.assertEqual(gate.fast_retry_streak, 3)
+        self.assertEqual(gate.last_cooldown_reason, "too_fast")
+
+    def test_reservation_place_gate_uses_fast_gap_after_success(self):
+        gate = smart.ReservationPlaceGate(0.01, 0.05)
+        candidate = {"hour": 18, "court_id": "ymq7"}
+
+        gate.record_response(candidate, "first", "success")
+
+        self.assertAlmostEqual(gate.last_cooldown_seconds, 0.05)
+        self.assertEqual(gate.fast_retry_streak, 0)
+        self.assertEqual(gate.last_cooldown_reason, "success")
+
+    def test_reservation_place_gate_skips_submit_without_deadline_budget(self):
+        gate = smart.ReservationPlaceGate(0, 0)
+        candidate = {"hour": 18, "court_id": "ymq7"}
+
+        allowed = gate.wait_for_turn(
+            candidate,
+            "late",
+            deadline=time.monotonic() + 0.01,
+            min_remaining_seconds=0.05,
+        )
+
+        self.assertFalse(allowed)
+        self.assertIsNone(gate.active_label)
+
+    def test_reservation_place_gate_deferred_fast_retry_has_no_owner(self):
+        gate = smart.ReservationPlaceGate(0, 0.01)
+        first = {"hour": 18, "court_id": "ymq7"}
+
+        gate.record_response(first, "first", "fast_retry", fast_retry=True, defer_retry=True)
+
+        self.assertIsNone(gate.retry_owner_key)
+        self.assertGreater(gate.next_allowed_at, time.monotonic())
+
+    def test_reservation_place_gate_prioritizes_fast_retry_owner(self):
+        gate = smart.ReservationPlaceGate(0.01, 0.03)
+        first = {"hour": 18, "court_id": "ymq7"}
+        second = {"hour": 19, "court_id": "ymq7"}
+        second_allowed = threading.Event()
+
+        self.assertTrue(gate.wait_for_turn(first, "first"))
+        gate.record_response(first, "first", "fast_retry", fast_retry=True)
+        thread = threading.Thread(
+            target=lambda: second_allowed.set() if gate.wait_for_turn(second, "second") else None
+        )
+        thread.start()
+        time.sleep(0.05)
+
+        self.assertFalse(second_allowed.is_set())
+        self.assertTrue(gate.wait_for_turn(first, "first", retry=True))
+        gate.record_response(first, "first", "failed")
+        thread.join(timeout=0.3)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(second_allowed.is_set())
+        gate.record_response(second, "second", "failed")
+
+    def test_reservation_place_gate_skips_non_pair_candidates_after_success(self):
+        gate = smart.ReservationPlaceGate(0, 0)
+        first = {"hour": 18, "court_id": "ymq7"}
+        same_hour = {"hour": 18, "court_id": "ymq8"}
+        non_adjacent = {"hour": 20, "court_id": "ymq7"}
+        adjacent = {"hour": 19, "court_id": "ymq7"}
+        late_candidate = {"hour": 17, "court_id": "ymq7"}
+
+        gate.record_response(first, "first", "success")
+
+        self.assertFalse(gate.wait_for_turn(same_hour, "same_hour"))
+        self.assertFalse(gate.wait_for_turn(non_adjacent, "non_adjacent"))
+        self.assertTrue(gate.wait_for_turn(adjacent, "adjacent"))
+        gate.record_response(adjacent, "adjacent", "success")
+        self.assertFalse(gate.wait_for_turn(late_candidate, "late"))
+
+    def test_reservation_place_gate_stops_single_hour_after_success(self):
+        gate = smart.ReservationPlaceGate(0, 0, required_hours=1)
+        first = {"hour": 18, "court_id": "ymq7"}
+        second = {"hour": 19, "court_id": "ymq8"}
+
+        gate.record_response(first, "first", "success")
+
+        self.assertEqual(gate.skip_reason(second), "single_hour_complete")
+        self.assertFalse(gate.wait_for_turn(second, "second"))
+
+    def test_reservation_place_gate_stops_single_hour_after_unknown_outcome(self):
+        gate = smart.ReservationPlaceGate(0, 0, required_hours=1)
+        first = {"hour": 18, "court_id": "ymq7"}
+        second = {"hour": 19, "court_id": "ymq8"}
+
+        gate.record_response(first, "first", "unknown_outcome")
+
+        self.assertEqual(gate.unknown_candidates(), [first])
+        self.assertEqual(gate.skip_reason(second), "single_hour_unknown")
+        self.assertFalse(gate.wait_for_turn(second, "second"))
+
+    def test_reservation_place_gate_allows_only_adjacent_hour_after_unknown(self):
+        gate = smart.ReservationPlaceGate(0, 0, required_hours=2)
+        unknown = {"hour": 18, "court_id": "ymq7"}
+        adjacent = {"hour": 19, "court_id": "ymq8"}
+        non_adjacent = {"hour": 20, "court_id": "ymq9"}
+
+        gate.record_response(unknown, "unknown", "unknown_outcome")
+
+        self.assertEqual(gate.skip_reason(adjacent), "")
+        self.assertEqual(gate.skip_reason(non_adjacent), "not_adjacent_to_committed_or_unknown")
+        gate.record_response(adjacent, "adjacent", "success")
+        self.assertTrue(gate.goal_saturated())
+        self.assertEqual(gate.skip_reason(non_adjacent), "contiguous_pair_unknown")
 
     def test_direct_candidates_follow_court_pool_without_wall_courts(self):
         bot = smart.SmartBookingBotV2(make_args())
@@ -145,23 +356,31 @@ class FastBookingModeTest(unittest.TestCase):
                 booking_mode=smart.BOOKING_MODE_DIRECT_FAST,
                 dry_run=False,
                 step_sleep=0,
+                direct_spec_adjacent_delay=0.03,
             )
         )
         center_started = threading.Event()
         center_released = threading.Event()
         center_finished = threading.Event()
         adjacent_started_before_center_finished = threading.Event()
+        first_center_start = []
+        first_adjacent_start = []
         calls = []
         calls_lock = threading.Lock()
 
         def fake_attempt(candidate, label, round_index, candidate_index, candidate_total, client=None, failure_stats=None):
+            now = time.monotonic()
             with calls_lock:
                 calls.append((label, candidate["hour"]))
             if label.startswith("direct_spec_center"):
+                if not first_center_start:
+                    first_center_start.append(now)
                 center_started.set()
                 center_released.wait(1.0)
                 center_finished.set()
                 return "success"
+            if not first_adjacent_start:
+                first_adjacent_start.append(now)
             if center_started.is_set() and not center_finished.is_set():
                 adjacent_started_before_center_finished.set()
             return "business_fail"
@@ -173,23 +392,28 @@ class FastBookingModeTest(unittest.TestCase):
         thread.start()
 
         self.assertTrue(center_started.wait(0.2))
-        self.assertTrue(adjacent_started_before_center_finished.wait(0.2))
+        self.assertTrue(adjacent_started_before_center_finished.wait(0.4))
         self.assertFalse(center_finished.is_set())
         center_released.set()
         thread.join(timeout=1.0)
 
         self.assertFalse(thread.is_alive())
+        self.assertTrue(first_center_start)
+        self.assertTrue(first_adjacent_start)
+        self.assertGreaterEqual(first_adjacent_start[0] - first_center_start[0], 0.02)
         self.assertTrue(any(label.startswith("direct_spec_center") and hour == 19 for label, hour in calls))
         self.assertTrue(any(label.startswith("direct_spec_") and hour in (18, 20) for label, hour in calls))
         self.assertEqual(results, ["failed"])
 
-    def test_direct_speculative_mode_attempts_three_center_courts_initially(self):
+    def test_direct_wave_prioritizes_distinct_hours_and_covers_full_pool(self):
         bot = smart.SmartBookingBotV2(
             make_args(
                 time="18-21",
                 booking_mode=smart.BOOKING_MODE_DIRECT_FAST,
                 dry_run=False,
                 step_sleep=0,
+                window_seconds=1,
+                poll_interval=0.001,
             )
         )
         calls = []
@@ -201,42 +425,34 @@ class FastBookingModeTest(unittest.TestCase):
         bot.attempt_single_hour_booking = fake_attempt
 
         self.assertEqual(bot.run_direct_mode(), "failed")
-        self.assertEqual(
-            [(hour, court_id) for label, hour, court_id in calls if label.startswith("direct_spec_center")],
-            [
-                (19, "ymq7"),
-                (19, "ymq8"),
-                (19, "ymq9"),
-            ],
-        )
+        self.assertEqual({hour for _label, hour, _court_id in calls[:3]}, {18, 19, 20})
+        self.assertEqual(len(calls), len(bot.generate_direct_first_candidates()))
+        self.assertIn(("direct_spec_center_19_ymq11_w9_a1", 19, "ymq11"), calls)
 
-    def test_direct_speculative_mode_uses_adjacent_success_as_anchor_when_center_fails(self):
+    def test_single_hour_direct_wave_stops_after_first_success(self):
         bot = smart.SmartBookingBotV2(
             make_args(
                 time="18-21",
+                duration=1,
                 booking_mode=smart.BOOKING_MODE_DIRECT_FAST,
                 dry_run=False,
                 step_sleep=0,
             )
         )
-        second_stage_anchors = []
+        calls = []
 
         def fake_attempt(candidate, label, round_index, candidate_index, candidate_total, client=None, failure_stats=None):
-            if label.startswith("direct_spec_left") and candidate["hour"] == 18 and candidate["court_id"] == "ymq7":
+            calls.append((candidate["hour"], candidate["court_id"]))
+            if candidate["hour"] == 19 and candidate["court_id"] == "ymq7":
                 return "success"
             return "business_fail"
 
-        def fake_second_stage(guide_state=None):
-            second_stage_anchors.append(bot.first_booking)
-            return "success"
-
         bot.attempt_single_hour_booking = fake_attempt
-        bot.run_direct_second_stage = fake_second_stage
 
         self.assertEqual(bot.run_direct_mode(), "success")
-        self.assertEqual(bot.first_booking["hour"], 18)
+        self.assertEqual(bot.first_booking["hour"], 19)
         self.assertEqual(bot.first_booking["court_id"], "ymq7")
-        self.assertEqual([item["hour"] for item in second_stage_anchors], [18])
+        self.assertLessEqual(len(calls), bot.args.direct_max_inflight)
 
     def test_direct_speculative_mode_finishes_when_initial_batch_has_contiguous_pair(self):
         bot = smart.SmartBookingBotV2(
@@ -301,7 +517,17 @@ class FastBookingModeTest(unittest.TestCase):
             def __init__(self):
                 self.reservation_attempts = 0
 
-            def request(self, method, endpoint, *, params=None, data=None, timeout=None, label=""):
+            def request(
+                self,
+                method,
+                endpoint,
+                *,
+                params=None,
+                data=None,
+                timeout=None,
+                label="",
+                retry_transport=True,
+            ):
                 if endpoint == "/place/reservationPlace":
                     self.reservation_attempts += 1
                     if self.reservation_attempts == 1:
@@ -333,6 +559,247 @@ class FastBookingModeTest(unittest.TestCase):
         self.assertEqual(result, "success")
         self.assertEqual(fake_client.reservation_attempts, 2)
         self.assertEqual(sleeps, [0.8])
+
+    def test_keep_alive_client_does_not_replay_non_idempotent_request(self):
+        logger = logging.getLogger("test_no_reservation_replay")
+        logger.handlers = [logging.NullHandler()]
+        client = smart.KeepAliveClient(
+            "https://example.invalid/easyserpClient",
+            {},
+            timeout=5,
+            logger=logger,
+            fail_stats=Counter(),
+        )
+        attempts = []
+
+        def fail_once(*_args, **_kwargs):
+            attempts.append(1)
+            raise TimeoutError("timed out")
+
+        client._send_once = fail_once
+        result = client.request(
+            "POST",
+            "/place/reservationPlace",
+            retry_transport=False,
+            label="reservationPlace",
+        )
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(result.status, 0)
+        self.assertEqual(result.error_kind, "timeout")
+
+    def test_keep_alive_client_can_retry_prerequisite_transport_failure(self):
+        logger = logging.getLogger("test_prerequisite_retry")
+        logger.handlers = [logging.NullHandler()]
+        client = smart.KeepAliveClient(
+            "https://example.invalid/easyserpClient",
+            {},
+            timeout=5,
+            logger=logger,
+            fail_stats=Counter(),
+        )
+        attempts = []
+
+        def fail_twice(*_args, **_kwargs):
+            attempts.append(1)
+            raise TimeoutError("timed out")
+
+        client._send_once = fail_twice
+        result = client.request("POST", "/place/canBook", label="canBook")
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(result.error_kind, "timeout")
+
+    def test_keep_alive_client_does_not_retry_after_timeout_budget_is_consumed(self):
+        logger = logging.getLogger("test_consumed_timeout_budget")
+        logger.handlers = [logging.NullHandler()]
+        client = smart.KeepAliveClient(
+            "https://example.invalid/easyserpClient",
+            {},
+            timeout=0.01,
+            logger=logger,
+            fail_stats=Counter(),
+        )
+        attempts = []
+
+        def consume_timeout(*_args, **_kwargs):
+            attempts.append(1)
+            time.sleep(0.02)
+            raise TimeoutError("timed out")
+
+        client._send_once = consume_timeout
+        result = client.request("POST", "/place/canBook", label="canBook")
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(result.error_kind, "timeout")
+
+    def test_keep_alive_client_resets_default_timeout_after_override(self):
+        logger = logging.getLogger("test_timeout_reset")
+        logger.handlers = [logging.NullHandler()]
+        client = smart.KeepAliveClient(
+            "https://example.invalid/easyserpClient",
+            {},
+            timeout=5,
+            logger=logger,
+            fail_stats=Counter(),
+        )
+        observed_timeouts = []
+
+        def capture_timeout(_method, _path, _body, _headers, _label, _start, timeout):
+            observed_timeouts.append(timeout)
+            return smart.HttpResult(200, "", 0.01, json_data={"msg": "success", "data": ""})
+
+        client._send_once = capture_timeout
+        client.request("GET", "/first", timeout=1.25)
+        client.request("GET", "/second")
+
+        self.assertEqual(observed_timeouts, [1.25, 5])
+
+    def test_keep_alive_client_applies_request_timeout_to_open_connection(self):
+        class FakeSocket:
+            def __init__(self):
+                self.timeout = None
+
+            def settimeout(self, value):
+                self.timeout = value
+
+        class FakeConnection:
+            def __init__(self):
+                self.timeout = 5
+                self.sock = FakeSocket()
+
+        logger = logging.getLogger("test_request_timeout")
+        logger.handlers = [logging.NullHandler()]
+        client = smart.KeepAliveClient(
+            "https://example.invalid/easyserpClient",
+            {},
+            timeout=5,
+            logger=logger,
+            fail_stats=Counter(),
+        )
+        client.conn = FakeConnection()
+
+        client._apply_timeout(1.25)
+
+        self.assertEqual(client.conn.timeout, 1.25)
+        self.assertEqual(client.conn.sock.timeout, 1.25)
+
+    def test_reconciliation_http_metric_is_not_counted_as_reservation_submit(self):
+        bot = smart.SmartBookingBotV2(make_args())
+
+        bot._record_http_event(
+            label="direct_reservationPlace_reconcile_getPlaceOrder",
+            method="GET",
+            status=200,
+            elapsed=0.05,
+            response_bytes=10,
+            outcome="success",
+        )
+
+        self.assertEqual(bot.http_metrics["getPlaceOrder"], [0.05])
+        self.assertNotIn("reservationPlace", bot.http_metrics)
+
+    def test_reservation_timeout_reconciliation_confirms_exact_order(self):
+        bot = smart.SmartBookingBotV2(
+            make_args(booking_mode=smart.BOOKING_MODE_DIRECT_FAST, dry_run=False, step_sleep=0)
+        )
+        candidate = bot._synthetic_candidate(19, "ymq7")
+
+        class FakeClient:
+            def __init__(self):
+                self.reservation_attempts = 0
+                self.order_queries = 0
+
+            def request(self, method, endpoint, **kwargs):
+                if endpoint == "/place/reservationPlace":
+                    self.reservation_attempts += 1
+                    self.reservation_kwargs = kwargs
+                    return smart.HttpResult(0, "", 2.5, error_kind="timeout")
+                if endpoint == "/place/getPlaceOrder":
+                    self.order_queries += 1
+                    return smart.HttpResult(
+                        200,
+                        "",
+                        0.05,
+                        json_data={
+                            "msg": "success",
+                            "data": [
+                                {
+                                    "readydate": bot.target_date,
+                                    "readystarttime": "19:00:00",
+                                    "readyendtime": "20:00:00",
+                                    "stagenum": "羽毛球7",
+                                    "prestatus": "等待",
+                                }
+                            ],
+                        },
+                    )
+                return smart.HttpResult(200, "", 0.01, json_data={"msg": "success", "data": ""})
+
+        fake_client = FakeClient()
+        bot._sleep_before_reconciliation = lambda: True
+
+        result = bot.attempt_single_hour_booking(candidate, "direct", 1, 1, 1, client=fake_client)
+
+        self.assertEqual(result, "success")
+        self.assertEqual(fake_client.reservation_attempts, 1)
+        self.assertEqual(fake_client.order_queries, 1)
+        self.assertFalse(fake_client.reservation_kwargs["retry_transport"])
+        self.assertEqual(fake_client.reservation_kwargs["timeout"], 2.5)
+
+    def test_reservation_timeout_without_order_match_stays_unknown(self):
+        bot = smart.SmartBookingBotV2(
+            make_args(booking_mode=smart.BOOKING_MODE_DIRECT_FAST, dry_run=False, step_sleep=0)
+        )
+        candidate = bot._synthetic_candidate(19, "ymq7")
+        bot.reservation_place_gate = smart.ReservationPlaceGate(0, 0, required_hours=1)
+
+        class FakeClient:
+            def request(self, method, endpoint, **_kwargs):
+                if endpoint == "/place/reservationPlace":
+                    return smart.HttpResult(0, "", 2.5, error_kind="timeout")
+                if endpoint == "/place/getPlaceOrder":
+                    return smart.HttpResult(200, "", 0.05, json_data={"msg": "success", "data": []})
+                return smart.HttpResult(200, "", 0.01, json_data={"msg": "success", "data": ""})
+
+        bot._sleep_before_reconciliation = lambda: True
+
+        result = bot.attempt_single_hour_booking(candidate, "direct", 1, 1, 1, client=FakeClient())
+
+        self.assertEqual(result, "unknown_outcome")
+        self.assertEqual(bot.reservation_place_gate.unknown_candidates(), [candidate])
+        self.assertEqual(bot.reservation_place_gate.skip_reason(candidate), "single_hour_unknown")
+
+    def test_response_log_summary_does_not_render_structured_failure_data(self):
+        outcome, message, shape = smart.response_log_summary(
+            200,
+            {"msg": "fail", "data": {"token": "secret-token", "member": "private-name"}},
+        )
+
+        self.assertEqual(outcome, "business_error")
+        self.assertEqual(message, "fail")
+        self.assertEqual(shape, "dict:2")
+        self.assertNotIn("secret-token", message)
+
+    def test_booking_failure_data_does_not_render_structured_payload(self):
+        result = smart.HttpResult(
+            status=200,
+            text="",
+            elapsed=0.01,
+            json_data={"msg": "fail", "data": {"token": "secret-token", "member": "private-name"}},
+        )
+
+        self.assertEqual(smart.SmartBookingBotV2._failure_data(result), "fail")
+
+    def test_redact_text_covers_query_cookie_and_json_credentials(self):
+        redacted = smart.redact_text(
+            'token=abc&JSESSIONID=session {"cardIndex":"card-1","offerId":"offer-1"}'
+        )
+
+        self.assertNotIn("abc", redacted)
+        self.assertNotIn("session", redacted)
+        self.assertNotIn("card-1", redacted)
+        self.assertNotIn("offer-1", redacted)
 
     def test_guided_sort_uses_snapshot_and_failures(self):
         state = smart.GuidedBookingState({"ymq7": 0, "ymq8": 1})

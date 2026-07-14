@@ -46,11 +46,17 @@ class EasySerpError(RuntimeError):
 
 def redact_sensitive_text(text: Any) -> str:
     value = str(text)
-    value = re.sub(r"(token=)[^&\s]+", r"\1<redacted>", value, flags=re.IGNORECASE)
-    value = re.sub(r"(JSESSIONID=)[^;\s]+", r"\1<redacted>", value, flags=re.IGNORECASE)
-    value = re.sub(r"(cardIndex=)[^&\s]+", r"\1<redacted>", value, flags=re.IGNORECASE)
-    value = re.sub(r"(masterCardNum=)[^&\s]+", r"\1<redacted>", value, flags=re.IGNORECASE)
-    value = re.sub(r"(offerId=)[^&\s]+", r"\1<redacted>", value, flags=re.IGNORECASE)
+    sensitive_keys = r"token|jsessionid|cardindex|offerid|mastercardnum"
+    value = re.sub(
+        rf"(?i)({sensitive_keys})(=|%3[dD])([^&\s'\"<>]+)",
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+        value,
+    )
+    value = re.sub(
+        rf'(?i)([\"\'](?:{sensitive_keys})[\"\']\s*:\s*[\"\'])[^\"\']*',
+        lambda match: f"{match.group(1)}<redacted>",
+        value,
+    )
     return value
 
 

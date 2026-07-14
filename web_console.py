@@ -996,6 +996,12 @@ def build_booking_command(payload: dict[str, Any]) -> tuple[list[str], str]:
     for cli_name, payload_key, default_value in (
         ("--window-seconds", "window_seconds", "60"),
         ("--poll-interval", "poll_interval", "0.08"),
+        ("--direct-spec-adjacent-delay", "direct_spec_adjacent_delay", "0"),
+        ("--direct-max-inflight", "direct_max_inflight", "3"),
+        ("--direct-max-attempts", "direct_max_attempts", "2"),
+        ("--reservation-place-gap", "reservation_place_gap", "0.35"),
+        ("--reservation-place-fast-retry-gap", "reservation_place_fast_retry_gap", "1.2"),
+        ("--reservation-place-timeout", "reservation_place_timeout", "2.5"),
         ("--guide-interval", "guide_interval", "0.5"),
         ("--guide-max-inflight", "guide_max_inflight", "4"),
         ("--error-backoff", "error_backoff", "0.25"),

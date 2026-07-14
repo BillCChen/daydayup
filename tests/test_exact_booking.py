@@ -60,6 +60,15 @@ class ExactBookingTest(unittest.TestCase):
         self.assertEqual(web_console.slot_pay_value("2026-05-18", "16:00"), 30.0)
         self.assertEqual(web_console.slot_pay_value("2026-05-23", "09:00"), 30.0)
 
+    def test_shared_redactor_covers_json_and_encoded_credentials(self):
+        redacted = web_console.redact_sensitive_text(
+            '{"token":"secret","cardIndex":"card-1","offerId":"offer-1"} '
+            "JSESSIONID%3Dsession-1"
+        )
+
+        for secret in ("secret", "card-1", "offer-1", "session-1"):
+            self.assertNotIn(secret, redacted)
+
     def test_availability_serializes_pay_fields(self):
         day = web_console.serialize_availability_day("2026-05-18", make_place())
         courts = [court for hour in day["hours"] for court in hour["courts"]]
