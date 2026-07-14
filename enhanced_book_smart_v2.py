@@ -42,7 +42,7 @@ BOOKING_MODE_BALANCED = "balanced"
 BOOKING_MODE_DIRECT_FAST = "direct-fast"
 BOOKING_MODE_GUIDED_FAST = "guided-fast"
 BOOKING_MODES = (BOOKING_MODE_BALANCED, BOOKING_MODE_DIRECT_FAST, BOOKING_MODE_GUIDED_FAST)
-BOOKING_ENGINE_VERSION = "3.5.0"
+BOOKING_ENGINE_VERSION = "3.6.0"
 PREWARM_SECONDS = 6.0
 BUSY_RETRY_TEXT = "当前排队人数较多"
 FAST_RETRY_TEXT = "操作过快"
@@ -51,7 +51,13 @@ DEFAULT_DIRECT_SPEC_ADJACENT_DELAY = 0.0
 DEFAULT_DIRECT_MAX_INFLIGHT = 3
 DEFAULT_DIRECT_MAX_ATTEMPTS = 2
 DEFAULT_RESERVATION_PLACE_GAP = 0.35
-DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP = 0.8
+DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP = 1.2
+DEFAULT_RESERVATION_PLACE_TIMEOUT = 2.5
+DEFAULT_RESERVATION_PLACE_MIN_BUDGET = 0.75
+DEFAULT_RESERVATION_RECONCILE_DELAY = 0.25
+DEFAULT_RESERVATION_RECONCILE_TIMEOUT = 1.5
+DEFAULT_RESERVATION_PLACE_MAX_FAST_RETRY_GAP = 3.0
+RESERVATION_PLACE_FAST_RETRY_FACTOR = 1.5
 USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 16; V2366HA Build/BP2A.250605.031.A3; wv) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/146.0.7680.177 "
@@ -69,6 +75,7 @@ class HttpResult:
     elapsed: float
     json_data: dict | None = None
     json_error: bool = False
+    error_kind: str = ""
 
 
 @dataclass
@@ -133,6 +140,7 @@ class GuidedBookingState:
                 + failures[(item["court_id"], item["hour"], "business_fail")] * 120
                 + failures[(item["court_id"], item["hour"], "retry_delay")] * 40
                 + failures[(item["court_id"], item["hour"], "server_retry")] * 20
+                + failures[(item["court_id"], item["hour"], "transport_error")] * 20
             )
             return (
                 -(state_score - failure_penalty),
@@ -145,19 +153,34 @@ class GuidedBookingState:
 
 
 class ReservationPlaceGate:
-    def __init__(self, gap_seconds, fast_retry_gap_seconds, logger=None, required_hours=2):
+    def __init__(
+        self,
+        gap_seconds,
+        fast_retry_gap_seconds,
+        logger=None,
+        required_hours=2,
+        max_fast_retry_gap_seconds=DEFAULT_RESERVATION_PLACE_MAX_FAST_RETRY_GAP,
+    ):
         self.gap_seconds = max(float(gap_seconds or 0), 0.0)
         self.fast_retry_gap_seconds = max(float(fast_retry_gap_seconds or 0), 0.0)
+        self.max_fast_retry_gap_seconds = max(
+            float(max_fast_retry_gap_seconds or 0),
+            self.fast_retry_gap_seconds,
+        )
         self.required_hours = 1 if int(required_hours or 1) <= 1 else 2
         self.logger = logger
         self.condition = threading.Condition()
         self.active_label = None
         self.next_allowed_at = 0.0
         self.successes = {}
+        self.unknowns = {}
         self.submit_sequence = 0
         self.retry_owner_key = None
         self.retry_owner_label = None
         self.retry_owner_until = 0.0
+        self.fast_retry_streak = 0
+        self.last_cooldown_seconds = 0.0
+        self.last_cooldown_reason = "initial"
 
     @staticmethod
     def _candidate_key(candidate):
@@ -167,19 +190,33 @@ class ReservationPlaceGate:
         hours = sorted({candidate["hour"] for candidate in self.successes.values()})
         return any(right - left == 1 for left, right in zip(hours, hours[1:]))
 
+    def _goal_hours_locked(self):
+        candidates = list(self.successes.values()) + list(self.unknowns.values())
+        return sorted({candidate["hour"] for candidate in candidates})
+
+    def _has_saturated_goal_locked(self):
+        hours = self._goal_hours_locked()
+        if self.required_hours == 1:
+            return bool(hours)
+        return any(right - left == 1 for left, right in zip(hours, hours[1:]))
+
     def _skip_reason_locked(self, candidate):
         if self.required_hours == 1 and self.successes:
             return "single_hour_complete"
+        if self.required_hours == 1 and self.unknowns:
+            return "single_hour_unknown"
         if self._has_contiguous_pair_locked():
             return "contiguous_pair_complete"
-        success_hours = {item["hour"] for item in self.successes.values()}
-        if not success_hours:
+        if self.unknowns and self._has_saturated_goal_locked():
+            return "contiguous_pair_unknown"
+        goal_hours = set(self._goal_hours_locked())
+        if not goal_hours:
             return ""
         hour = candidate["hour"]
-        if hour in success_hours:
-            return "hour_already_booked"
-        if not any(abs(hour - success_hour) == 1 for success_hour in success_hours):
-            return "not_adjacent_to_success"
+        if hour in goal_hours:
+            return "hour_already_committed_or_unknown"
+        if not any(abs(hour - goal_hour) == 1 for goal_hour in goal_hours):
+            return "not_adjacent_to_committed_or_unknown"
         return ""
 
     def _clear_expired_retry_owner_locked(self, now):
@@ -200,7 +237,22 @@ class ReservationPlaceGate:
         with self.condition:
             return list(self.successes.values())
 
-    def wait_for_turn(self, candidate, label, retry=False, deadline=None):
+    def unknown_candidates(self):
+        with self.condition:
+            return list(self.unknowns.values())
+
+    def goal_saturated(self):
+        with self.condition:
+            return self._has_saturated_goal_locked()
+
+    def wait_for_turn(
+        self,
+        candidate,
+        label,
+        retry=False,
+        deadline=None,
+        min_remaining_seconds=0.0,
+    ):
         logged_wait = False
         with self.condition:
             while True:
@@ -218,6 +270,15 @@ class ReservationPlaceGate:
                     if self.logger:
                         self.logger.info(
                             f"[reservation gate] skip label={label} reason=deadline_expired "
+                            f"hour={candidate['hour']} court={candidate['court_id']}"
+                        )
+                    return False
+                if deadline is not None and deadline - now < max(float(min_remaining_seconds or 0), 0.0):
+                    if self.logger:
+                        self.logger.info(
+                            f"[reservation gate] skip label={label} reason=insufficient_deadline_budget "
+                            f"remaining={max(deadline - now, 0.0):.3f}s "
+                            f"required={max(float(min_remaining_seconds or 0), 0.0):.3f}s "
                             f"hour={candidate['hour']} court={candidate['court_id']}"
                         )
                     return False
@@ -262,6 +323,9 @@ class ReservationPlaceGate:
             candidate_key = self._candidate_key(candidate)
             if result == "success":
                 self.successes[candidate_key] = candidate
+                self.unknowns.pop(candidate_key, None)
+            elif result == "unknown_outcome" and candidate_key not in self.successes:
+                self.unknowns[candidate_key] = candidate
             if fast_retry and not defer_retry:
                 self.retry_owner_key = candidate_key
                 self.retry_owner_label = label
@@ -270,14 +334,37 @@ class ReservationPlaceGate:
                 self.retry_owner_key = None
                 self.retry_owner_label = None
                 self.retry_owner_until = 0.0
-            gap = self.fast_retry_gap_seconds if fast_retry else self.gap_seconds
+            if fast_retry:
+                self.fast_retry_streak += 1
+                gap = min(
+                    self.fast_retry_gap_seconds
+                    * (RESERVATION_PLACE_FAST_RETRY_FACTOR ** (self.fast_retry_streak - 1)),
+                    self.max_fast_retry_gap_seconds,
+                )
+                cooldown_reason = "too_fast"
+            elif result == "success":
+                self.fast_retry_streak = 0
+                gap = max(self.gap_seconds, self.fast_retry_gap_seconds)
+                cooldown_reason = "success"
+            elif result == "unknown_outcome":
+                self.fast_retry_streak = 0
+                gap = max(self.gap_seconds, self.fast_retry_gap_seconds)
+                cooldown_reason = "unknown_outcome"
+            else:
+                self.fast_retry_streak = 0
+                gap = self.gap_seconds
+                cooldown_reason = result or "failed"
+            self.last_cooldown_seconds = gap
+            self.last_cooldown_reason = cooldown_reason
             self.next_allowed_at = time.monotonic() + gap
             self.active_label = None
             if self.logger:
                 success_hours = sorted({item["hour"] for item in self.successes.values()})
                 self.logger.info(
                     f"[reservation gate] release label={label} result={result} "
-                    f"next_gap={gap:.3f}s success_hours={success_hours}"
+                    f"next_gap={gap:.3f}s cooldown_reason={cooldown_reason} "
+                    f"fast_retry_streak={self.fast_retry_streak} success_hours={success_hours} "
+                    f"unknown_hours={sorted({item['hour'] for item in self.unknowns.values()})}"
                 )
             self.condition.notify_all()
 
@@ -307,23 +394,34 @@ class KeepAliveClient:
                 pass
         self.conn = None
 
-    def _open(self):
+    def _open(self, timeout=None):
+        effective_timeout = self.timeout if timeout is None else max(float(timeout), 0.001)
         if self.scheme == "https":
             context = ssl.create_default_context()
             self.conn = http.client.HTTPSConnection(
                 self.host,
                 self.port,
-                timeout=self.timeout,
+                timeout=effective_timeout,
                 context=context,
             )
         else:
             self.conn = http.client.HTTPConnection(
                 self.host,
                 self.port,
-                timeout=self.timeout,
+                timeout=effective_timeout,
             )
 
-    def request(self, method, endpoint, *, params=None, data=None, timeout=None, label=""):
+    def request(
+        self,
+        method,
+        endpoint,
+        *,
+        params=None,
+        data=None,
+        timeout=None,
+        label="",
+        retry_transport=True,
+    ):
         path = self._build_path(endpoint, params)
         body = None
         headers = dict(self.headers)
@@ -332,53 +430,65 @@ class KeepAliveClient:
             body = urllib.parse.urlencode(data).encode("utf-8")
             headers["Content-Type"] = "application/x-www-form-urlencoded"
 
+        effective_timeout = self.timeout if timeout is None else max(float(timeout), 0.001)
         start = time.perf_counter()
         try:
-            return self._send_once(method, path, body, headers, label, start)
-        except (OSError, http.client.HTTPException):
+            return self._send_once(method, path, body, headers, label, start, effective_timeout)
+        except (OSError, http.client.HTTPException) as first_exc:
             self.close()
-            try:
-                return self._send_once(method, path, body, headers, label, start)
-            except Exception as exc:
-                elapsed = time.perf_counter() - start
-                self.fail_stats[f"{label}_exception"] += 1
-                self.logger.error(
-                    f"[HTTP] label={label} method={method} exception={redact_text(repr(exc))} "
-                    f"elapsed={elapsed:.3f}s outcome=exception"
-                )
-                self.logger.error(redact_text(traceback.format_exc()))
-                if self.event_callback:
-                    self.event_callback(
-                        label=label,
-                        method=method,
-                        status=0,
-                        elapsed=elapsed,
-                        response_bytes=0,
-                        outcome="exception",
-                    )
-                return HttpResult(status=0, text="", elapsed=elapsed)
-        except Exception as exc:
-            elapsed = time.perf_counter() - start
-            self.fail_stats[f"{label}_exception"] += 1
-            self.logger.error(
-                f"[HTTP] label={label} method={method} exception={redact_text(repr(exc))} "
-                f"elapsed={elapsed:.3f}s outcome=exception"
+            retry_timeout = effective_timeout - (time.perf_counter() - start)
+            if not retry_transport or retry_timeout <= 0.05:
+                return self._transport_failure(method, label, start, first_exc)
+            self.logger.warning(
+                f"[HTTP] label={label} method={method} outcome=transport_retry "
+                f"error_kind={self._transport_error_kind(first_exc)} "
+                f"retry_timeout={retry_timeout:.3f}s"
             )
-            self.logger.error(redact_text(traceback.format_exc()))
-            if self.event_callback:
-                self.event_callback(
-                    label=label,
-                    method=method,
-                    status=0,
-                    elapsed=elapsed,
-                    response_bytes=0,
-                    outcome="exception",
-                )
-            return HttpResult(status=0, text="", elapsed=elapsed)
+            try:
+                return self._send_once(method, path, body, headers, label, start, retry_timeout)
+            except Exception as exc:
+                return self._transport_failure(method, label, start, exc)
+        except Exception as exc:
+            return self._transport_failure(method, label, start, exc)
 
-    def _send_once(self, method, path, body, headers, label, start):
+    def _transport_failure(self, method, label, start, exc):
+        self.close()
+        elapsed = time.perf_counter() - start
+        error_kind = self._transport_error_kind(exc)
+        self.fail_stats[f"{label}_{error_kind}"] += 1
+        self.logger.error(
+            f"[HTTP] label={label} method={method} exception={redact_text(repr(exc))} "
+            f"elapsed={elapsed:.3f}s outcome={error_kind}"
+        )
+        if self.event_callback:
+            self.event_callback(
+                label=label,
+                method=method,
+                status=0,
+                elapsed=elapsed,
+                response_bytes=0,
+                outcome=error_kind,
+            )
+        return HttpResult(status=0, text="", elapsed=elapsed, error_kind=error_kind)
+
+    @staticmethod
+    def _transport_error_kind(exc):
+        text = repr(exc).lower()
+        return "timeout" if isinstance(exc, TimeoutError) or "timed out" in text else "transport_error"
+
+    def _apply_timeout(self, timeout):
+        if self.conn is None or timeout is None:
+            return
+        effective_timeout = max(float(timeout), 0.001)
+        self.conn.timeout = effective_timeout
+        if getattr(self.conn, "sock", None) is not None:
+            self.conn.sock.settimeout(effective_timeout)
+
+    def _send_once(self, method, path, body, headers, label, start, timeout=None):
         if self.conn is None:
-            self._open()
+            self._open(timeout)
+        else:
+            self._apply_timeout(timeout)
 
         self.conn.request(method, path, body=body, headers=headers)
         resp = self.conn.getresponse()
@@ -518,6 +628,8 @@ class SmartBookingBotV2:
             self.args.reservation_place_gap = DEFAULT_RESERVATION_PLACE_GAP
         if not hasattr(self.args, "reservation_place_fast_retry_gap"):
             self.args.reservation_place_fast_retry_gap = DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP
+        if not hasattr(self.args, "reservation_place_timeout"):
+            self.args.reservation_place_timeout = DEFAULT_RESERVATION_PLACE_TIMEOUT
         if not hasattr(self.args, "direct_max_inflight"):
             self.args.direct_max_inflight = DEFAULT_DIRECT_MAX_INFLIGHT
         if not hasattr(self.args, "direct_max_attempts"):
@@ -532,6 +644,7 @@ class SmartBookingBotV2:
         self.metrics_lock = threading.Lock()
         self.first_booking = None
         self.second_booking = None
+        self.last_unknown_candidates = []
         self.reservation_place_gate = None
         self.direct_deadline = None
         self.direct_client_queue = queue.Queue()
@@ -630,6 +743,7 @@ class SmartBookingBotV2:
             (
                 name
                 for name in (
+                    "getPlaceOrder",
                     "reservationPlace",
                     "getUseCardInfo",
                     "getOfferInfo",
@@ -736,7 +850,9 @@ class SmartBookingBotV2:
                 f"direct_max_inflight={self.args.direct_max_inflight} | "
                 f"direct_max_attempts={self.args.direct_max_attempts} | "
                 f"reservation_place_gap={self.args.reservation_place_gap}s | "
-                f"reservation_place_fast_retry_gap={self.args.reservation_place_fast_retry_gap}s"
+                f"reservation_place_fast_retry_gap={self.args.reservation_place_fast_retry_gap}s | "
+                f"reservation_place_timeout={self.args.reservation_place_timeout}s | "
+                f"reservation_place_min_budget={DEFAULT_RESERVATION_PLACE_MIN_BUDGET}s"
             )
         if self.args.booking_mode == BOOKING_MODE_GUIDED_FAST:
             self.logger.info(
@@ -762,6 +878,8 @@ class SmartBookingBotV2:
             direct_max_attempts=self.args.direct_max_attempts,
             reservation_place_gap=self.args.reservation_place_gap,
             reservation_place_fast_retry_gap=self.args.reservation_place_fast_retry_gap,
+            reservation_place_timeout=self.args.reservation_place_timeout,
+            reservation_place_min_budget=DEFAULT_RESERVATION_PLACE_MIN_BUDGET,
             court_count=len(self.court_pool),
         )
         self.logger.info("=" * 110)
@@ -917,6 +1035,8 @@ class SmartBookingBotV2:
             raise ValueError("--reservation-place-gap 不能小于0")
         if self.args.reservation_place_fast_retry_gap < 0:
             raise ValueError("--reservation-place-fast-retry-gap 不能小于0")
+        if self.args.reservation_place_timeout <= 0:
+            raise ValueError("--reservation-place-timeout 必须大于0")
         if self.args.direct_max_inflight <= 0:
             raise ValueError("--direct-max-inflight 必须大于0")
         if self.args.direct_max_attempts <= 0:
@@ -1475,22 +1595,55 @@ class SmartBookingBotV2:
         for reservation_attempt in range(1, max_reservation_attempts + 1):
             active_gate = self.reservation_place_gate
             is_retry_attempt = reservation_attempt > 1
+            remaining_budget = self._remaining_direct_budget()
+            if (
+                remaining_budget is not None
+                and remaining_budget < DEFAULT_RESERVATION_PLACE_MIN_BUDGET
+            ):
+                self.log_event(
+                    "reservation_submit_skipped",
+                    label=reservation_label,
+                    hour=hour,
+                    court=court_id,
+                    reason="insufficient_deadline_budget",
+                    remaining_ms=max(round(remaining_budget * 1000), 0),
+                    required_ms=round(DEFAULT_RESERVATION_PLACE_MIN_BUDGET * 1000),
+                )
+                return "deadline_expired"
             if active_gate and not active_gate.wait_for_turn(
                 candidate,
                 reservation_label,
                 retry=is_retry_attempt,
                 deadline=self.direct_deadline,
+                min_remaining_seconds=DEFAULT_RESERVATION_PLACE_MIN_BUDGET,
             ):
                 return "candidate_skipped"
 
             r3 = None
+            reservation_outcome = "failed"
+            success_source = "reservation_response"
             try:
                 r3 = request_client.request(
                     "POST",
                     "/place/reservationPlace",
                     data=reservation_data,
+                    timeout=self._reservation_request_timeout(),
                     label=reservation_label,
+                    retry_transport=False,
                 )
+                if self._response_success(r3):
+                    reservation_outcome = "success"
+                elif r3 is not None and r3.status == 0:
+                    reconciliation = self._reconcile_reservation_outcome(
+                        request_client,
+                        candidate,
+                        reservation_label,
+                    )
+                    if reconciliation == "confirmed":
+                        reservation_outcome = "success"
+                        success_source = "order_reconciliation"
+                    else:
+                        reservation_outcome = "unknown_outcome"
             finally:
                 if active_gate:
                     is_fast_response = (
@@ -1498,7 +1651,13 @@ class SmartBookingBotV2:
                         and not self._response_success(r3)
                         and self._failure_data(r3).find(FAST_RETRY_TEXT) >= 0
                     )
-                    gate_result = "success" if self._response_success(r3) else "fast_retry" if is_fast_response else "failed"
+                    gate_result = (
+                        reservation_outcome
+                        if reservation_outcome in ("success", "unknown_outcome")
+                        else "fast_retry"
+                        if is_fast_response
+                        else "failed"
+                    )
                     active_gate.record_response(
                         candidate,
                         reservation_label,
@@ -1507,12 +1666,36 @@ class SmartBookingBotV2:
                         defer_retry=max_reservation_attempts == 1,
                     )
 
-            if self._response_success(r3):
+            if reservation_outcome == "success":
                 self.logger.info(
                     f"[成功] label={label} 预约成功 | 日期={self.target_date} | "
-                    f"时段={start_time}-{end_time} | 场地={court_name}({court_id})"
+                    f"时段={start_time}-{end_time} | 场地={court_name}({court_id}) | "
+                    f"source={success_source}"
+                )
+                self.log_event(
+                    "reservation_confirmed",
+                    label=reservation_label,
+                    hour=hour,
+                    court=court_id,
+                    source=success_source,
                 )
                 return "success"
+
+            if reservation_outcome == "unknown_outcome":
+                stats = failure_stats if failure_stats is not None else self.fail_stats
+                stats[f"{reservation_label}_unknown_outcome"] += 1
+                self.logger.warning(
+                    f"[未知结果] label={reservation_label} 最终提交无明确响应且订单未确认；"
+                    f"不重试同一目标 | hour={hour} court={court_id}"
+                )
+                self.log_event(
+                    "reservation_unknown_outcome",
+                    label=reservation_label,
+                    hour=hour,
+                    court=court_id,
+                    transport_error=r3.error_kind if r3 else "no_result",
+                )
+                return "unknown_outcome"
 
             if (
                 reservation_attempt < max_reservation_attempts
@@ -1567,6 +1750,128 @@ class SmartBookingBotV2:
             return safe_response_message(result.json_data)
         return ""
 
+    def _remaining_direct_budget(self):
+        if self.direct_deadline is None:
+            return None
+        return max(self.direct_deadline - time.monotonic(), 0.0)
+
+    def _reservation_request_timeout(self):
+        timeout = self.args.reservation_place_timeout
+        remaining = self._remaining_direct_budget()
+        if remaining is not None:
+            timeout = min(timeout, remaining)
+        return max(float(timeout), 0.001)
+
+    def _sleep_before_reconciliation(self):
+        delay = DEFAULT_RESERVATION_RECONCILE_DELAY
+        remaining = self._remaining_direct_budget()
+        if remaining is not None:
+            if remaining <= 0:
+                return False
+            delay = min(delay, remaining)
+        if delay > 0:
+            time.sleep(delay)
+        return self.direct_deadline is None or time.monotonic() < self.direct_deadline
+
+    def _reconcile_reservation_outcome(self, request_client, candidate, reservation_label):
+        self.log_event(
+            "reservation_reconcile_start",
+            label=reservation_label,
+            hour=candidate["hour"],
+            court=candidate["court_id"],
+            delay_ms=round(DEFAULT_RESERVATION_RECONCILE_DELAY * 1000),
+        )
+        if not self._sleep_before_reconciliation():
+            outcome = "deadline_expired"
+            self.log_event(
+                "reservation_reconcile_result",
+                label=reservation_label,
+                hour=candidate["hour"],
+                court=candidate["court_id"],
+                outcome=outcome,
+                order_count=0,
+            )
+            return outcome
+
+        query_timeout = DEFAULT_RESERVATION_RECONCILE_TIMEOUT
+        remaining = self._remaining_direct_budget()
+        if remaining is not None:
+            query_timeout = min(query_timeout, remaining)
+        if query_timeout <= 0:
+            return "deadline_expired"
+
+        result = request_client.request(
+            "GET",
+            "/place/getPlaceOrder",
+            params={
+                "pageNo": 0,
+                "pageSize": 20,
+                "shopNum": SHOP_NUM,
+                "token": self.args.token,
+                "startTime": self.target_date,
+                "endTime": self.target_date,
+            },
+            timeout=query_timeout,
+            label=f"{reservation_label}_reconcile_getPlaceOrder",
+            retry_transport=False,
+        )
+        orders = result.json_data.get("data") if self._response_success(result) else None
+        if not isinstance(orders, list):
+            outcome = "query_failed"
+            order_count = 0
+        else:
+            order_count = len(orders)
+            outcome = (
+                "confirmed"
+                if any(self._order_matches_candidate(order, candidate) for order in orders)
+                else "not_found"
+            )
+        self.log_event(
+            "reservation_reconcile_result",
+            label=reservation_label,
+            hour=candidate["hour"],
+            court=candidate["court_id"],
+            outcome=outcome,
+            order_count=order_count,
+        )
+        return outcome
+
+    def _order_matches_candidate(self, order, candidate):
+        if not isinstance(order, dict) or "取消" in str(order.get("prestatus") or ""):
+            return False
+        slots = order.get("jsonArray") or []
+        slot = slots[0] if slots and isinstance(slots[0], dict) else {}
+        order_date = str(order.get("readydate") or slot.get("reversionDate") or "")
+        start = str(order.get("readystarttime") or slot.get("start") or "")[:5]
+        end = str(order.get("readyendtime") or slot.get("end") or "")[:5]
+        candidate_slot = candidate["slot"]
+        if order_date != self.target_date:
+            return False
+        if start != candidate_slot["starttime"][:5] or end != candidate_slot["endtime"][:5]:
+            return False
+        order_court = " ".join(
+            str(value or "")
+            for value in (
+                order.get("stagenum"),
+                slot.get("siteName"),
+                order.get("itemorgoodname"),
+                order.get("itemorgoodshortname"),
+            )
+        )
+        candidate_number = self._court_number(candidate.get("court_id"))
+        order_number = self._court_number(order_court)
+        if candidate_number is not None and order_number is not None:
+            return candidate_number == order_number
+        return (
+            candidate.get("court_id", "") in order_court
+            or candidate.get("court_name", "") == order_court.strip()
+        )
+
+    @staticmethod
+    def _court_number(value):
+        matches = re.findall(r"\d+", str(value or ""))
+        return int(matches[-1]) if matches else None
+
     def _record_booking_failure(self, result, label, failure_stats=None):
         stats = failure_stats if failure_stats is not None else self.fail_stats
         stats[f"{label}_not_success"] += 1
@@ -1584,10 +1889,12 @@ class SmartBookingBotV2:
             return "retry_delay"
         if result and result.status >= 500:
             return "server_retry"
+        if result and result.status == 0:
+            return "transport_error"
         return "business_fail"
 
     def _sleep_after_fast_retry(self):
-        time.sleep(0.8)
+        time.sleep(self.args.reservation_place_fast_retry_gap)
 
     def _sleep_between_booking_calls(self):
         if self.args.step_sleep > 0:
@@ -2088,10 +2395,16 @@ class SmartBookingBotV2:
                 if self._apply_direct_successes(successful_candidates, center_hour):
                     final_status = "success"
                     break
+                if (
+                    self.reservation_place_gate.unknown_candidates()
+                    and self.reservation_place_gate.goal_saturated()
+                ):
+                    final_status = "unknown"
+                    break
 
                 transient_candidates = []
                 for item in results:
-                    if item["result"] in ("retry_delay", "server_retry", "exception"):
+                    if item["result"] in ("retry_delay", "server_retry", "transport_error", "exception"):
                         key = self._candidate_key(item["candidate"])
                         if attempt_counts[key] < self.args.direct_max_attempts:
                             transient_candidates.append(item["candidate"])
@@ -2111,8 +2424,20 @@ class SmartBookingBotV2:
                     self._sleep_for(self.args.poll_interval, self.direct_deadline)
 
             successful_candidates = self.reservation_place_gate.successful_candidates() or observed_successes
+            unknown_candidates = self.reservation_place_gate.unknown_candidates()
+            self.last_unknown_candidates = unknown_candidates
             self._apply_direct_successes(successful_candidates, center_hour)
-            reason = "target_complete" if final_status == "success" else "window_expired" if time.monotonic() >= self.direct_deadline else "candidate_exhausted"
+            if final_status != "success" and unknown_candidates:
+                final_status = "unknown"
+            reason = (
+                "target_complete"
+                if final_status == "success"
+                else "unresolved_outcome"
+                if unknown_candidates
+                else "window_expired"
+                if time.monotonic() >= self.direct_deadline
+                else "candidate_exhausted"
+            )
             self.log_event(
                 "direct_scheduler_complete",
                 status=final_status,
@@ -2121,9 +2446,16 @@ class SmartBookingBotV2:
                 attempted_candidates=len(attempt_counts),
                 total_attempts=sum(attempt_counts.values()),
                 success_hours=sorted({item["hour"] for item in successful_candidates}),
+                unknown_hours=sorted({item["hour"] for item in unknown_candidates}),
             )
             if final_status == "success":
                 self.logger.info("[完成] 直抢波次已达成目标")
+            elif unknown_candidates:
+                self.logger.warning(
+                    f"[结束] 最终提交结果待确认；为避免重复下单已停止 | "
+                    f"confirmed_hours={sorted({item['hour'] for item in successful_candidates})} | "
+                    f"unknown_hours={sorted({item['hour'] for item in unknown_candidates})}"
+                )
             elif self.first_booking:
                 self.logger.warning("[结束] 直抢波次已抢到一个小时，但未完成连续两小时")
             else:
@@ -2336,6 +2668,11 @@ class SmartBookingBotV2:
             self.logger.info("[汇总] 已完成单小时预约目标")
 
         self.logger.info(f"[汇总] 失败统计：{dict(self.fail_stats)}")
+        if self.last_unknown_candidates:
+            self.logger.warning(
+                f"[汇总] 待确认小时：{sorted({item['hour'] for item in self.last_unknown_candidates})}；"
+                "程序未将其计为失败，也未盲目重试"
+            )
         self._log_http_metrics_summary()
         self.logger.info("=" * 110)
 
@@ -2367,6 +2704,7 @@ class SmartBookingBotV2:
             outcomes=outcome_snapshot,
             failures=dict(self.fail_stats),
             completed_hours=int(bool(self.first_booking)) + int(bool(self.second_booking)),
+            unknown_hours=sorted({item["hour"] for item in self.last_unknown_candidates}),
         )
 
     def run(self):
@@ -2481,7 +2819,13 @@ Examples:
         "--reservation-place-fast-retry-gap",
         type=float,
         default=DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP,
-        help="direct-fast 操作过快后的 reservationPlace 重试间隔，默认0.8秒",
+        help="direct-fast 操作过快后的 reservationPlace 自适应退避基值，默认1.2秒",
+    )
+    parser.add_argument(
+        "--reservation-place-timeout",
+        type=float,
+        default=DEFAULT_RESERVATION_PLACE_TIMEOUT,
+        help="reservationPlace 单次提交超时，默认2.5秒；超时后只查订单，不盲目重发",
     )
     parser.add_argument(
         "--booking-mode",
