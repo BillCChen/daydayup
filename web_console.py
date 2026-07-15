@@ -40,7 +40,7 @@ from easyserp_client import (
     format_amount,
     is_cancelled,
     mask_card,
-    redact_sensitive_text,
+    redact_sensitive_text as _redact_sensitive_text,
     require_success,
     summarize_order,
     trim_time,
@@ -70,6 +70,8 @@ BOOKING_ITEM_TYPE = "羽毛球"
 BOOKING_CALL_DELAY_SECONDS = 0.03
 EXACT_BOOKING_FAST_RETRY_SECONDS = 0.8
 BOOKING_MODES = {"balanced", "direct-fast", "guided-fast"}
+MULTI_POOL_BOOKING_MODES = {"direct-fast", "guided-fast"}
+MULTI_POOL_MODES = {"off", "dry_run", "live"}
 SCAN_MIN_INTERVAL_MINUTES = 5
 SCAN_MAX_INTERVAL_MINUTES = 1440
 SCAN_DEFAULT_INTERVAL_MINUTES = 30
@@ -115,6 +117,27 @@ class BookingJob:
     status: str = "running"
     returncode: int | None = None
     history_finalized: bool = False
+    participant_users: list[dict[str, str]] = field(default_factory=list)
+
+
+def redact_sensitive_text(text: Any) -> str:
+    value = _redact_sensitive_text(text)
+    sensitive_keys = r"username|password|admin_password"
+    value = re.sub(
+        rf"(?i)({sensitive_keys})(=|%3[dD])([^&\s'\"<>]+)",
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+        value,
+    )
+    return re.sub(
+        rf'(?i)([\"\'](?:{sensitive_keys})[\"\']\s*:\s*[\"\'])[^\"\']*',
+        lambda match: f"{match.group(1)}<redacted>",
+        value,
+    )
+
+
+def configured_multi_pool_mode() -> str:
+    mode = clean_string(os.getenv("DAYDAYUP_MULTI_POOL_MODE", "off")).lower()
+    return mode if mode in MULTI_POOL_MODES else "off"
 
 
 class UserStore:
@@ -128,6 +151,7 @@ class UserStore:
     def ensure_exists(self) -> None:
         with self.lock:
             if self.path.exists():
+                os.chmod(self.path, 0o600)
                 return
             rows = [
                 {
@@ -193,6 +217,23 @@ class UserStore:
             if user.key == user_key:
                 return user
         raise EasySerpError("selected user is not available")
+
+    def get_users(self, user_keys: Any) -> list[UserAccount]:
+        if not isinstance(user_keys, list):
+            raise EasySerpError("user_keys must be a list")
+        ordered_keys: list[str] = []
+        for value in user_keys:
+            key = clean_string(value)
+            if key and key not in ordered_keys:
+                ordered_keys.append(key)
+        available = {user.key: user for user in self.enabled_users()}
+        users: list[UserAccount] = []
+        for key in ordered_keys:
+            user = available.get(key)
+            if user is None:
+                raise EasySerpError("selected user is not available")
+            users.append(user)
+        return users
 
     def upsert_user(self, payload: dict[str, Any]) -> UserAccount:
         key = clean_user_key(payload.get("key"))
@@ -265,11 +306,13 @@ class UserStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.path.with_suffix(".tmp")
         with tmp_path.open("w", encoding="utf-8", newline="") as handle:
+            os.chmod(tmp_path, 0o600)
             writer = csv.DictWriter(handle, fieldnames=USER_FIELDS)
             writer.writeheader()
             for row in rows:
                 writer.writerow({field: row.get(field, "") for field in USER_FIELDS})
         tmp_path.replace(self.path)
+        os.chmod(self.path, 0o600)
 
     @staticmethod
     def _row_to_account(row: dict[str, str]) -> UserAccount:
@@ -301,7 +344,14 @@ class BookingHistoryStore:
         records.sort(key=lambda item: item.get("requested_ts", 0), reverse=True)
         return records[:limit]
 
-    def create(self, payload: dict[str, Any], job_id: int, command_label: str, user: UserAccount) -> str:
+    def create(
+        self,
+        payload: dict[str, Any],
+        job_id: int,
+        command_label: str,
+        user: UserAccount,
+        participant_users: list[dict[str, str]] | None = None,
+    ) -> str:
         now = time.time()
         record_id = f"{int(now * 1000)}-{job_id}"
         record = {
@@ -318,6 +368,9 @@ class BookingHistoryStore:
             "status": "running",
             "command_label": command_label,
         }
+        if participant_users:
+            record["participant_users"] = participant_users
+            record["combination_summary"] = "双账号组合预约"
         with self.lock:
             records = self._read_unlocked()
             records.append(record)
@@ -422,6 +475,7 @@ class JobManager:
 
     def start(self, payload: dict[str, Any], user: UserAccount, card_index: str) -> BookingJob:
         with self.lock:
+            self._reject_if_multi_pool_active_locked()
             command, command_label = build_booking_command(payload)
             env = os.environ.copy()
             env["DAYDAYUP_TOKEN"] = user.token
@@ -444,6 +498,103 @@ class JobManager:
             self._trim_locked()
             threading.Thread(target=self._read_output, args=(job,), daemon=True).start()
             return job
+
+    def start_pool(
+        self,
+        payload: dict[str, Any],
+        accounts: list[tuple[UserAccount, str]],
+    ) -> BookingJob:
+        with self.lock:
+            self._reject_if_any_booking_active_locked()
+            command, command_label = build_booking_command(payload)
+            command.append("--account-pool-stdin")
+            command_label = f"{command_label} account_mode=multi_pool"
+            env = os.environ.copy()
+            env["DAYDAYUP_MULTI_POOL_MODE"] = configured_multi_pool_mode()
+            for key in ("DAYDAYUP_TOKEN", "DAYDAYUP_JSESSIONID", "DAYDAYUP_CARD_INDEX"):
+                env.pop(key, None)
+            participant_users = [
+                {"slot": f"pool_{index}", "user_key": user.key, "user_label": user.label}
+                for index, (user, _card_index) in enumerate(accounts, start=1)
+            ]
+            account_payload = {
+                "accounts": [
+                    {
+                        "slot": f"pool_{index}",
+                        "user_key": user.key,
+                        "token": user.token,
+                        "jsessionid": user.jsessionid,
+                        "card_index": card_index,
+                    }
+                    for index, (user, card_index) in enumerate(accounts, start=1)
+                ]
+            }
+            process = subprocess.Popen(
+                command,
+                cwd=ROOT,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            try:
+                if process.stdin is None:
+                    raise EasySerpError("booking process stdin is unavailable")
+                process.stdin.write(json.dumps(account_payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+                process.stdin.close()
+            except Exception:
+                if process.poll() is None:
+                    process.terminate()
+                raise
+
+            job = BookingJob(
+                self.next_id,
+                process,
+                time.time(),
+                command_label,
+                "",
+                participant_users=participant_users,
+            )
+            try:
+                job.history_id = self.history.create(
+                    payload,
+                    job.id,
+                    command_label,
+                    accounts[0][0],
+                    participant_users=participant_users,
+                )
+            except Exception:
+                if process.poll() is None:
+                    process.terminate()
+                raise
+            self.next_id += 1
+            self.jobs[job.id] = job
+            self._trim_locked()
+            threading.Thread(target=self._read_output, args=(job,), daemon=True).start()
+            return job
+
+    def _active_jobs_locked(self) -> list[BookingJob]:
+        for job in self.jobs.values():
+            self._poll_locked(job, finalize_history=True)
+        return [
+            job
+            for job in self.jobs.values()
+            if job.status in {"running", "stopping"}
+        ]
+
+    def _reject_if_any_booking_active_locked(self) -> None:
+        if self._active_jobs_locked():
+            raise EasySerpError(
+                "multi-pool booking requires exclusive access; stop active booking jobs first"
+            )
+
+    def _reject_if_multi_pool_active_locked(self) -> None:
+        if any(job.participant_users for job in self._active_jobs_locked()):
+            raise EasySerpError(
+                "a multi-pool booking job is active; stop it before starting another booking"
+            )
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -1136,6 +1287,30 @@ def target_date_from_payload(payload: dict[str, Any]) -> str:
     return (date.today() + timedelta(days=offset)).strftime("%Y-%m-%d")
 
 
+def multi_pool_required_balance(payload: dict[str, Any]) -> float:
+    target_date = target_date_from_payload(payload)
+    start_text, end_text = split_time_range(clean_string(payload.get("time")) or "17-21")
+    start_hour = hour_from_time(start_text)
+    end_hour = hour_from_time(end_text)
+    if end_hour - start_hour < 2:
+        raise EasySerpError("multi-pool booking requires at least two adjacent hours")
+    return max(
+        slot_pay_value(target_date, f"{hour:02d}:00")
+        for hour in range(start_hour, end_hour)
+    )
+
+
+def booking_history_matches_user(record: dict[str, Any], user_key: str, default_key: str) -> bool:
+    if clean_string(record.get("user_key")) == user_key:
+        return True
+    participants = record.get("participant_users")
+    if isinstance(participants, list):
+        for participant in participants:
+            if isinstance(participant, dict) and clean_string(participant.get("user_key")) == user_key:
+                return True
+    return not clean_string(record.get("user_key")) and user_key == default_key
+
+
 def summarize_job_history(job: BookingJob) -> dict[str, Any]:
     success_targets = []
     for line in job.lines:
@@ -1146,18 +1321,44 @@ def summarize_job_history(job: BookingJob) -> dict[str, Any]:
         if target not in success_targets:
             success_targets.append(target)
 
+    pool_events = parse_multi_pool_events(job.lines, job.participant_users)
+    for item in pool_events["hour_ownership"]:
+        if item.get("status") != "confirmed":
+            continue
+        hour = int_or_default(item.get("hour"), -1)
+        end_hour = int_or_default(item.get("end_hour"), hour + 1)
+        court = clean_string(item.get("court")) or "场地"
+        target = f"{court} {hour:02d}:00-{end_hour:02d}:00"
+        if hour >= 0 and target not in success_targets:
+            success_targets.append(target)
+
     has_dry_run = any("[dry-run]" in line for line in job.lines)
+    has_pool_dry_run = any(
+        clean_string(item.get("source")) == "dry_run"
+        for item in pool_events["hour_ownership"]
+    )
     has_no_hit = any("[结束] 第一阶段未抢到" in line for line in job.lines)
     has_partial = any("[结束] 第一阶段成功，但第二阶段未抢到相邻小时" in line for line in job.lines)
 
+    pool_status = clean_string(pool_events.get("pool_summary", {}).get("status"))
     if job.status == "stopped":
         result = "已停止"
+    elif has_dry_run or has_pool_dry_run:
+        result = "演练完成"
+    elif pool_status == "dry_run":
+        result = "演练完成"
+    elif pool_status == "success":
+        result = "成功"
+    elif pool_status == "partial":
+        result = "部分成功"
+    elif pool_status == "unknown":
+        result = "结果未知"
+    elif pool_status == "failed":
+        result = "失败"
     elif success_targets and has_partial:
         result = "部分成功"
     elif success_targets:
         result = "成功"
-    elif has_dry_run:
-        result = "演练完成"
     elif has_no_hit:
         result = "未抢到"
     elif job.returncode == 0:
@@ -1165,13 +1366,76 @@ def summarize_job_history(job: BookingJob) -> dict[str, Any]:
     else:
         result = "失败"
 
-    return {
+    summary = {
         "result": result,
         "status": job.status,
         "returncode": job.returncode,
         "success_target": "；".join(success_targets),
         "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if job.participant_users:
+        summary["hour_ownership"] = pool_events["hour_ownership"]
+        summary["pool_summary"] = pool_events["pool_summary"]
+    return summary
+
+
+def parse_multi_pool_events(
+    lines: list[str],
+    participant_users: list[dict[str, str]],
+) -> dict[str, Any]:
+    participant_by_slot = {
+        clean_string(item.get("slot")): item
+        for item in participant_users
+        if isinstance(item, dict)
+    }
+    hour_ownership: list[dict[str, Any]] = []
+    pool_summary: dict[str, Any] = {}
+    for line in lines:
+        match = re.search(r"\[EVENT\]\s*(\{.*\})\s*$", line)
+        if not match:
+            continue
+        try:
+            event = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_name = clean_string(event.get("event"))
+        if event_name == "multi_pool_slot_result":
+            account_slot = clean_string(event.get("account_slot"))
+            participant = participant_by_slot.get(account_slot, {})
+            status = clean_string(event.get("status"))
+            if account_slot not in {"pool_1", "pool_2"} or status not in {
+                "confirmed",
+                "unknown",
+                "tombstoned",
+                "failed",
+                "dry_run",
+            }:
+                continue
+            item = {
+                "account_slot": account_slot,
+                "user_key": clean_string(participant.get("user_key")),
+                "user_label": clean_string(participant.get("user_label")),
+                "status": status,
+                "target_date": clean_string(event.get("target_date")),
+                "hour": int_or_default(event.get("hour"), -1),
+                "end_hour": int_or_default(event.get("end_hour"), -1),
+                "court": clean_string(event.get("court")),
+                "source": clean_string(event.get("source")),
+            }
+            hour_ownership.append(item)
+        elif event_name == "multi_pool_complete":
+            status = clean_string(event.get("status"))
+            if status not in {"success", "partial", "unknown", "failed", "dry_run"}:
+                continue
+            pool_summary = {
+                "status": status,
+                "confirmed_hours": parse_int_list(event.get("confirmed_hours")),
+                "unknown_hours": parse_int_list(event.get("unknown_hours")),
+                "tombstoned_hours": parse_int_list(event.get("tombstoned_hours")),
+            }
+    return {"hour_ownership": hour_ownership, "pool_summary": pool_summary}
 
 
 def normalize_scan_task(payload: dict[str, Any], user: UserAccount) -> dict[str, Any]:
@@ -1595,6 +1859,7 @@ class WebConsole:
         return {
             "users": [serialize_user(user) for user in users],
             "default_user_key": default_user.key,
+            "multi_pool_mode": configured_multi_pool_mode(),
             "updated_at": time.time(),
         }
 
@@ -1865,12 +2130,67 @@ class WebConsole:
         }
 
     def start_booking(self, payload: dict[str, Any]) -> dict[str, Any]:
+        account_mode = clean_string(payload.get("account_mode")) or "single"
+        if account_mode not in {"single", "multi_pool"}:
+            raise EasySerpError("invalid account mode")
+        if account_mode == "multi_pool":
+            return self._start_multi_pool_booking(payload)
+
         user = self.users.get_user(clean_string(payload.get("user_key")))
         if not user.token:
             raise EasySerpError("token is required for booking")
         card = self.resolve_booking_card(user)
         job = self.jobs.start(payload, user, card["card_index_raw"])
         return {"job": serialize_job(job), "user": serialize_user(user), "card": mask_booking_card(card)}
+
+    def _start_multi_pool_booking(self, payload: dict[str, Any]) -> dict[str, Any]:
+        runtime_mode = configured_multi_pool_mode()
+        if runtime_mode == "off":
+            raise EasySerpError("multi-pool booking is disabled")
+        if clean_string(payload.get("duration")) != "2":
+            raise EasySerpError("multi-pool booking requires duration=2")
+        booking_mode = clean_string(payload.get("booking_mode"))
+        if booking_mode not in MULTI_POOL_BOOKING_MODES:
+            raise EasySerpError("multi-pool booking requires direct-fast or guided-fast")
+
+        users = self.users.get_users(payload.get("user_keys"))
+        if len(users) != 2:
+            raise EasySerpError("multi-pool booking requires two different enabled users")
+        required_balance = multi_pool_required_balance(payload)
+        accounts: list[tuple[UserAccount, str]] = []
+        masked_cards: list[dict[str, Any]] = []
+        for user in users:
+            if not user.token:
+                raise EasySerpError("token is required for every multi-pool account")
+            card = self.resolve_booking_card(user)
+            card_index = clean_string(card.get("card_index_raw"))
+            if not card_index:
+                raise EasySerpError("every multi-pool account requires a booking card")
+            balance = float_or_zero(card.get("cash_balance_value"))
+            if balance < required_balance:
+                raise EasySerpError(
+                    f"every multi-pool account requires at least {required_balance:.2f} card balance"
+                )
+            accounts.append((user, card_index))
+            masked_cards.append(mask_booking_card(card))
+
+        effective_payload = dict(payload)
+        effective_payload["account_mode"] = "multi_pool"
+        effective_payload["user_key"] = users[0].key
+        if runtime_mode == "dry_run":
+            effective_payload["dry_run"] = True
+        job = self.jobs.start_pool(effective_payload, accounts)
+        return {
+            "job": serialize_job(job),
+            "user": serialize_user(users[0]),
+            "participant_users": [
+                {"slot": f"pool_{index}", "user": serialize_user(user)}
+                for index, user in enumerate(users, start=1)
+            ],
+            "cards": masked_cards,
+            "multi_pool_mode": runtime_mode,
+            "dry_run": bool(effective_payload.get("dry_run")),
+        }
 
     def book_exact(self, payload: dict[str, Any]) -> dict[str, Any]:
         user = self.users.get_user(clean_string(payload.get("user_key")))
@@ -1949,7 +2269,7 @@ class WebConsole:
             history = [
                 item
                 for item in history
-                if item.get("user_key") == user_key or (not item.get("user_key") and user_key == default_key)
+                if booking_history_matches_user(item, user_key, default_key)
             ]
         return {"history": history, "updated_at": time.time()}
 

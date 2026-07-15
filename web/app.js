@@ -16,6 +16,7 @@ const state = {
   scanTargetCounter: 0,
   scanTaskLoading: false,
   cancelDialogBill: "",
+  cancelDialogUserKey: "",
   cancelDialogPreview: null,
   cancelDialogError: "",
   cancelDialogLoading: false,
@@ -35,6 +36,8 @@ const state = {
   viewMode: "default",
   users: [],
   selectedUserKey: "",
+  multiPoolMode: "off",
+  secondaryUserKey: "",
   userManagementUnlocked: false,
   adminPassword: "",
 };
@@ -106,6 +109,10 @@ const els = {
   refreshBookingHistory: document.querySelector("#refreshBookingHistory"),
   bookingHistoryList: document.querySelector("#bookingHistoryList"),
   bookingForm: document.querySelector("#bookingForm"),
+  multiPoolOption: document.querySelector("#multiPoolOption"),
+  multiPoolEnabled: document.querySelector("#multiPoolEnabled"),
+  multiPoolSecondaryUser: document.querySelector("#multiPoolSecondaryUser"),
+  multiPoolWarning: document.querySelector("#multiPoolWarning"),
   timeStartValue: document.querySelector("#timeStartValue"),
   timeEndValue: document.querySelector("#timeEndValue"),
   timeRangeValue: document.querySelector("#timeRangeValue"),
@@ -492,6 +499,7 @@ function addUiLog(text, strong = false) {
 async function loadUsers() {
   const data = await api("/api/users");
   state.users = data.users || [];
+  state.multiPoolMode = ["off", "dry_run", "live"].includes(data.multi_pool_mode) ? data.multi_pool_mode : "off";
   const previousUserKey = state.selectedUserKey;
   if (!state.selectedUserKey || !state.users.some((user) => user.key === state.selectedUserKey)) {
     state.selectedUserKey = data.default_user_key || state.users[0]?.key || "";
@@ -511,7 +519,48 @@ function renderUsers() {
   `).join("");
   const current = currentUser();
   els.activeUserLabel.textContent = current ? current.label : "未选择";
+  renderMultiPoolControl();
   renderUserManagementLock();
+}
+
+function renderMultiPoolControl() {
+  if (!els.multiPoolOption) {
+    return;
+  }
+  const enabledUsers = state.users.filter((user) => user.enabled);
+  const secondaryUsers = enabledUsers.filter((user) => user.key !== state.selectedUserKey);
+  const primaryEnabled = enabledUsers.some((user) => user.key === state.selectedUserKey);
+  const durationSupported = formValue(els.bookingForm, "duration", "2") === "2";
+  const bookingMode = formValue(els.bookingForm, "booking_mode", "direct-fast");
+  const bookingModeSupported = ["direct-fast", "guided-fast"].includes(bookingMode);
+  const available = state.multiPoolMode !== "off"
+    && primaryEnabled
+    && enabledUsers.length >= 2
+    && durationSupported
+    && bookingModeSupported;
+  els.multiPoolOption.hidden = state.multiPoolMode === "off";
+  if (!secondaryUsers.some((user) => user.key === state.secondaryUserKey)) {
+    state.secondaryUserKey = secondaryUsers[0]?.key || "";
+  }
+  els.multiPoolSecondaryUser.innerHTML = secondaryUsers.map((user) => `
+    <option value="${escapeAttr(user.key)}" ${user.key === state.secondaryUserKey ? "selected" : ""}>
+      ${escapeHtml(user.label)}
+    </option>
+  `).join("");
+  els.multiPoolEnabled.disabled = !available;
+  if (!available) {
+    els.multiPoolEnabled.checked = false;
+  }
+  els.multiPoolSecondaryUser.disabled = !available || !els.multiPoolEnabled.checked;
+  if (!durationSupported || !bookingModeSupported) {
+    els.multiPoolWarning.textContent = "双账号组合预约只支持 2 小时快速直抢或快速引导。";
+  } else if (state.multiPoolMode === "dry_run") {
+    els.multiPoolWarning.textContent = "服务器当前为演练模式：两个账号只查询候选，不会提交订单。";
+  } else if (!available) {
+    els.multiPoolWarning.textContent = "需要至少两个已启用账号才能使用组合预约。";
+  } else {
+    els.multiPoolWarning.textContent = "两个账号分别支付一个相邻小时；部分成功不会自动退订。";
+  }
 }
 
 function currentUser() {
@@ -764,6 +813,7 @@ async function openCancelDialog(billNum) {
     return;
   }
   state.cancelDialogBill = billNum;
+  state.cancelDialogUserKey = state.selectedUserKey;
   state.cancelDialogPreview = null;
   state.cancelDialogError = "";
   state.cancelDialogLoading = true;
@@ -773,7 +823,7 @@ async function openCancelDialog(billNum) {
     addUiLog(`读取退款预览 ${billNum}`);
     state.cancelDialogPreview = await api("/api/cancel/preview", {
       method: "POST",
-      body: JSON.stringify({ bill_num: billNum, user_key: state.selectedUserKey }),
+      body: JSON.stringify({ bill_num: billNum, user_key: state.cancelDialogUserKey }),
     });
   } catch (error) {
     state.cancelDialogError = error.message;
@@ -793,6 +843,7 @@ function closeCancelDialog() {
   els.cancelDialog.classList.add("hidden");
   document.body.classList.remove("modal-open");
   state.cancelDialogBill = "";
+  state.cancelDialogUserKey = "";
   state.cancelDialogPreview = null;
   state.cancelDialogError = "";
   state.cancelDialogLoading = false;
@@ -842,7 +893,7 @@ function renderCancelDialog() {
   updateSubmit();
 }
 
-async function cancelBooking(billNum, confirmationValue = null) {
+async function cancelBooking(billNum, confirmationValue = null, userKey = "") {
   const confirmation = confirmationValue === null ? document.querySelector("#confirmText")?.value.trim() || "" : confirmationValue;
   if (confirmation !== "CANCEL") {
     addUiLog("取消被阻止: 二次确认文本不匹配", true);
@@ -853,7 +904,12 @@ async function cancelBooking(billNum, confirmationValue = null) {
     addUiLog(`开始取消 ${billNum}`, true);
     const result = await api("/api/cancel", {
       method: "POST",
-      body: JSON.stringify({ bill_num: billNum, confirmation, reason: "天气原因", user_key: state.selectedUserKey }),
+      body: JSON.stringify({
+        bill_num: billNum,
+        confirmation,
+        reason: "天气原因",
+        user_key: userKey || state.cancelDialogUserKey || state.selectedUserKey,
+      }),
     });
     addUiLog(result.confirmed ? "取消已确认，余额已刷新" : "取消接口返回后仍未确认状态", true);
     renderCards(result.cards || [], result.primary_card || null);
@@ -872,6 +928,11 @@ async function startBooking(event) {
   event.preventDefault();
   const form = new FormData(els.bookingForm);
   const targetDate = form.get("date") || dateInputValue(4);
+  const useMultiPool = Boolean(els.multiPoolEnabled?.checked);
+  if (useMultiPool && (String(form.get("duration")) !== "2" || !["direct-fast", "guided-fast"].includes(String(form.get("booking_mode"))))) {
+    addUiLog("双账号组合预约只支持 2 小时快速直抢或快速引导。", true);
+    return;
+  }
   const payload = {
     date: targetDate,
     time: form.get("time"),
@@ -886,7 +947,11 @@ async function startBooking(event) {
     dry_run: form.get("dry_run") === "on",
     all_court: form.get("all_court") === "on",
     user_key: state.selectedUserKey,
+    account_mode: useMultiPool ? "multi_pool" : "single",
   };
+  if (useMultiPool) {
+    payload.user_keys = [state.selectedUserKey, state.secondaryUserKey];
+  }
 
   try {
     const result = await api("/api/booking/start", {
@@ -896,7 +961,7 @@ async function startBooking(event) {
     state.jobLineCounts[result.job.id] = 0;
     setChip(els.jobState, "运行中", "warning");
     renderViewModeDetails();
-    addUiLog(`预约任务启动: ${result.job.command_label}`, true);
+    addUiLog(useMultiPool ? "双账号组合预约任务已启动" : `预约任务启动: ${result.job.command_label}`, true);
     await Promise.all([loadJob(), loadBookingHistory()]);
     startJobPolling();
   } catch (error) {
@@ -963,6 +1028,14 @@ function renderHistoryDetail(record) {
     ? successes.map((item) => historyDetailSuccessMarkup(item)).join("")
     : "";
   const noteMarkup = record.note ? `<div class="refund-box"><strong>说明</strong><p>${escapeHtml(record.note)}</p></div>` : "";
+  const participants = Array.isArray(record.participant_users) ? record.participant_users : [];
+  const ownership = Array.isArray(record.hour_ownership) ? record.hour_ownership : [];
+  const participantMarkup = participants.length
+    ? `<div class="refund-box"><strong>组合账号</strong><div class="refund-grid">${participants.map((item) => dataRow(item.slot || "账号", item.user_label || "-")).join("")}</div><p>两个账号分别扣除各自负责小时的费用；部分成功不会自动退订。</p></div>`
+    : "";
+  const ownershipMarkup = ownership.length
+    ? `<div class="refund-box"><strong>逐小时归属</strong><div class="refund-grid">${ownership.map((item) => dataRow(poolHourLabel(item), `${item.user_label || item.account_slot || "-"} · ${poolStatusLabel(item.status)}`)).join("")}</div></div>`
+    : "";
 
   els.historyDetailBody.innerHTML = `
     <div class="warning-box">
@@ -978,10 +1051,31 @@ function renderHistoryDetail(record) {
         ${dataRow("结束", record.finished_at || "-")}
       </div>
     </div>
+    ${participantMarkup}
+    ${ownershipMarkup}
     ${successMarkup}
     ${failureMarkup}
     ${noteMarkup}
   `;
+}
+
+function poolHourLabel(item) {
+  const hour = Number(item.hour);
+  const endHour = Number(item.end_hour);
+  const time = Number.isFinite(hour) && hour >= 0
+    ? `${String(hour).padStart(2, "0")}:00-${String(Number.isFinite(endHour) && endHour >= 0 ? endHour : hour + 1).padStart(2, "0")}:00`
+    : "未知小时";
+  return [time, item.court].filter(Boolean).join(" · ");
+}
+
+function poolStatusLabel(status) {
+  return {
+    confirmed: "已确认",
+    unknown: "结果未知",
+    tombstoned: "已封存",
+    failed: "失败",
+    dry_run: "演练",
+  }[String(status || "")] || "未知";
 }
 
 function historyDetailFailureMarkup(item) {
@@ -1016,10 +1110,10 @@ function compactHistorySummary(item) {
   const successSource = item.success_target || "";
   const timeSource = successSource || item.target_time || "";
   const timeMatch = String(timeSource).match(/(\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2})/);
-  const courtMatch = String(successSource).match(/(?:羽毛球|球|场地)\s*(\d{1,2})\b/);
+  const courtMatch = String(successSource).match(/(?:羽毛球|球|场地|ymq)\s*(\d{1,2})\b/i);
   return {
     time: timeMatch ? timeMatch[1].replace(/\s+/g, "") : compactHourRange(item.target_time),
-    court: courtMatch ? `球${courtMatch[1]}` : "-",
+    court: courtMatch ? `球${courtMatch[1]}` : item.combination_summary || "-",
   };
 }
 
@@ -1973,6 +2067,7 @@ async function exchangeUserToken() {
     setTokenHelperMessage(`兑换失败: ${error.message}`, "danger-text");
     addUiLog(`Token 兑换失败: ${error.message}`, true);
   } finally {
+    els.userForm.elements.token_password.value = "";
     els.exchangeToken.disabled = false;
   }
 }
@@ -2143,6 +2238,7 @@ function buildViewModeDetailGroups() {
   const scanTargets = scanTargetsFromForm();
   const successSelect = scanForm.elements.success_mode;
   const modeValue = formValue(bookingForm, "booking_mode", "balanced");
+  const accountMode = els.multiPoolEnabled?.checked ? "multi_pool" : "single";
   const windowSeconds = formValue(bookingForm, "window_seconds", "30");
   const pollInterval = formValue(bookingForm, "poll_interval", "0.05");
   const adjacentDelay = formValue(bookingForm, "direct_spec_adjacent_delay", "0");
@@ -2192,6 +2288,8 @@ function buildViewModeDetailGroups() {
     {
       title: "提交预约",
       rows: [
+        ["account_mode", accountMode],
+        ["multi_pool_runtime", state.multiPoolMode],
         ["booking_mode", modeValue],
         ["window_seconds", `${windowSeconds}s`],
         ["poll_interval", secondsToMsText(pollInterval)],
@@ -2300,6 +2398,7 @@ function renderTimeControl() {
   els.timeRangeValue.textContent = `${start}-${end}`;
   els.bookingForm.elements.time.value = `${state.startHour}-${state.endHour}`;
   els.bookingForm.elements.duration.value = String(durationHours);
+  renderMultiPoolControl();
 
   const disabled = {
     "start-down": state.startHour <= MIN_HOUR,
@@ -2515,6 +2614,13 @@ els.bookingHistoryList.addEventListener("click", (event) => {
 els.bookingForm.addEventListener("submit", startBooking);
 els.bookingForm.addEventListener("input", renderViewModeDetails);
 els.bookingForm.addEventListener("change", renderViewModeDetails);
+els.multiPoolEnabled?.addEventListener("change", () => {
+  renderMultiPoolControl();
+  renderViewModeDetails();
+});
+els.multiPoolSecondaryUser?.addEventListener("change", () => {
+  state.secondaryUserKey = els.multiPoolSecondaryUser.value;
+});
 els.stopJob.addEventListener("click", stopJob);
 els.closeCancelDialog.addEventListener("click", closeCancelDialog);
 els.cancelDialogBack.addEventListener("click", closeCancelDialog);
@@ -2535,7 +2641,7 @@ els.cancelDialogSubmit.addEventListener("click", () => {
   if (!state.cancelDialogBill) {
     return;
   }
-  cancelBooking(state.cancelDialogBill, confirmation);
+  cancelBooking(state.cancelDialogBill, confirmation, state.cancelDialogUserKey);
 });
 window.addEventListener("beforeunload", () => {
   clearAlignedRefresh();
