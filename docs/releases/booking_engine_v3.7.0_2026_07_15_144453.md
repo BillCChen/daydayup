@@ -1,6 +1,6 @@
 # Booking Engine v3.7.0
 
-As of: 2026-07-15 14:44 CST
+As of: 2026-07-15 14:53 CST
 
 ## Purpose
 
@@ -37,4 +37,20 @@ Structured events now record:
 
 ## Deployment status
 
-Production deployment and read-only runtime verification are pending.
+Deployed to Alibaba Cloud from commit `2488a7e8a1f3ede6a1e6728b235db3a3fc8d4242`.
+
+- Release tag: `v3.7-booking-timeout-recovery`.
+- Rollback backup: `/opt/huairou/daydayup/backups/20260715_144810_v3_7_0`.
+- Production Web and scan containers were rebuilt/recreated and remained up with zero restarts.
+- Runtime imports in both containers reported engine 3.7.0.
+- Host-local HTTP and ECS-side public HTTPS returned 200.
+- Nginx configuration validation passed.
+- Production state remained mounted and readable: one user row, two configuration rows, and 24 state files.
+- A production read-only, unfiltered recent-order query succeeded with two active orders and one exact 2026-07-19 20:00–21:00 match.
+- No Web or scan error lines were found in the first ten minutes after deployment.
+
+The local Mac public-domain probe remained blocked by the current VPN/network path: DNS resolved to `198.18.1.60` and LibreSSL failed before HTTP. The ECS-side public-domain check succeeded, so this is recorded as a client-path verification limitation rather than a production service failure.
+
+## Residual validation
+
+The next real 12:00 booking run is still required to measure conversion under live contention. The most important log signals are `reservation_reconcile_snapshot`, `reservation_reconcile_result`, `reservation_not_confirmed`, and the gate's cooldown reason and streak.
