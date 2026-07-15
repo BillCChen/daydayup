@@ -1,6 +1,6 @@
 # Booking Engine v3.8.0
 
-As of: 2026-07-15 18:37 CST
+As of: 2026-07-15 18:45 CST
 
 ## Release scope
 
@@ -46,3 +46,10 @@ This release adds an opt-in two-account coordinator for manual two-hour `direct-
 - Production is initially deployed with `DAYDAYUP_MULTI_POOL_MODE=dry_run`.
 - Live enablement requires password rotation, second-account Web OAuth onboarding, and read-only verification of both account sessions, cards, balances, and order visibility.
 - The feature reduces account-level throttling and session-failure concentration, but cannot eliminate public-IP, network, or upstream service failures.
+
+## Deployment result
+
+- GitHub release commit and `v3.8-multi-pool` tag target: `9850e07992e89627b3ac1c096bfe9c74270004ef`.
+- Alibaba Cloud backup and dry-run deployment completed. Web and scan run engine `3.8.0`; only Web receives `DAYDAYUP_MULTI_POOL_MODE=dry_run`.
+- The production container passed 37 focused tests and an isolated fake-credential dry-run with adjacent, distinct slot ownership and zero final-submit HTTP events.
+- Live remains disabled until the disclosed password is rotated and the intended second account is onboarded and preflighted through the Web flow.
