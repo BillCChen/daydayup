@@ -46,7 +46,10 @@ class EasySerpError(RuntimeError):
 
 def redact_sensitive_text(text: Any) -> str:
     value = str(text)
-    sensitive_keys = r"token|jsessionid|cardindex|offerid|mastercardnum"
+    sensitive_keys = (
+        r"token|jsessionid|cardindex|offerid|mastercardnum|"
+        r"username|userName|password|passWord|admin_password"
+    )
     value = re.sub(
         rf"(?i)({sensitive_keys})(=|%3[dD])([^&\s'\"<>]+)",
         lambda match: f"{match.group(1)}{match.group(2)}<redacted>",

@@ -6,7 +6,6 @@ Badminton court booking script with balanced retry behavior.
 """
 
 import argparse
-import hashlib
 import http.client
 import json
 import logging
@@ -21,7 +20,7 @@ import time
 import traceback
 import urllib.parse
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 
@@ -42,7 +41,7 @@ BOOKING_MODE_BALANCED = "balanced"
 BOOKING_MODE_DIRECT_FAST = "direct-fast"
 BOOKING_MODE_GUIDED_FAST = "guided-fast"
 BOOKING_MODES = (BOOKING_MODE_BALANCED, BOOKING_MODE_DIRECT_FAST, BOOKING_MODE_GUIDED_FAST)
-BOOKING_ENGINE_VERSION = "3.7.0"
+BOOKING_ENGINE_VERSION = "3.8.0"
 PREWARM_SECONDS = 6.0
 BUSY_RETRY_TEXT = "当前排队人数较多"
 FAST_RETRY_TEXT = "操作过快"
@@ -59,6 +58,8 @@ DEFAULT_RESERVATION_RECONCILE_DELAYS = (0.25, 1.0, 2.5)
 DEFAULT_RESERVATION_RECONCILE_TIMEOUT = 1.5
 DEFAULT_RESERVATION_PLACE_MAX_FAST_RETRY_GAP = 3.0
 RESERVATION_PLACE_FAST_RETRY_FACTOR = 1.5
+DEFAULT_MULTI_POOL_SECOND_ACCOUNT_DELAY = 0.35
+MULTI_POOL_SLOTS = ("pool_1", "pool_2")
 USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 16; V2366HA Build/BP2A.250605.031.A3; wv) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/146.0.7680.177 "
@@ -84,6 +85,222 @@ class DirectClientSlot:
     slot_id: int
     client: object
     fail_stats: Counter
+
+
+@dataclass
+class BookingAccountContext:
+    slot: str
+    user_key: str = field(repr=False)
+    token: str = field(repr=False)
+    jsessionid: str = field(repr=False)
+    card_index: str = field(repr=False)
+    client: object | None = field(default=None, repr=False)
+    fail_stats: Counter = field(default_factory=Counter, repr=False)
+    reservation_gate: object | None = field(default=None, repr=False)
+
+
+def load_booking_account_pool(stream):
+    line = stream.readline()
+    if not line:
+        raise ValueError("--account-pool-stdin requires one JSON line on stdin")
+    try:
+        payload = json.loads(line)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("--account-pool-stdin received invalid JSON") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("accounts"), list):
+        raise ValueError("account pool payload must contain an accounts list")
+    raw_accounts = payload["accounts"]
+    if len(raw_accounts) != 2:
+        raise ValueError("account pool requires exactly two accounts")
+
+    contexts = []
+    for raw in raw_accounts:
+        if not isinstance(raw, dict):
+            raise ValueError("each account pool entry must be an object")
+        slot = raw.get("slot")
+        if slot not in MULTI_POOL_SLOTS:
+            raise ValueError("account pool slots must be pool_1 and pool_2")
+        values = {}
+        for key in ("user_key", "token", "card_index"):
+            value = raw.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"account pool field {key} must be a non-empty string")
+            values[key] = value.strip()
+        jsessionid = raw.get("jsessionid", "")
+        if not isinstance(jsessionid, str):
+            raise ValueError("account pool field jsessionid must be a string")
+        values["jsessionid"] = jsessionid.strip()
+        contexts.append(BookingAccountContext(slot=slot, **values))
+        for key in ("user_key", "token", "jsessionid", "card_index"):
+            raw[key] = ""
+    payload.clear()
+
+    if {context.slot for context in contexts} != set(MULTI_POOL_SLOTS):
+        raise ValueError("account pool must contain one pool_1 and one pool_2 entry")
+    if len({context.user_key for context in contexts}) != 2:
+        raise ValueError("account pool users must be different")
+    return sorted(contexts, key=lambda context: context.slot)
+
+
+class MultiPoolCoordinator:
+    TERMINAL_STATES = {"confirmed", "unknown", "tombstoned"}
+
+    def __init__(
+        self,
+        target_hours,
+        fast_retry_gap_seconds,
+        logger=None,
+        event_callback=None,
+    ):
+        hours = self._normalize_target_hours(target_hours)
+        self.target_hours = hours
+        self.fast_retry_gap_seconds = max(float(fast_retry_gap_seconds or 0), 0.0)
+        self.logger = logger
+        self.event_callback = event_callback
+        self.condition = threading.Condition()
+        self.hour_states = {
+            hour: {"state": "available", "account_slot": None, "candidate": None}
+            for hour in hours
+        }
+        self.global_next_allowed_at = 0.0
+        self.global_fast_retry_streak = 0
+
+    def _emit(self, event, **fields):
+        if self.event_callback:
+            self.event_callback(event, **fields)
+
+    @staticmethod
+    def _normalize_target_hours(target_hours):
+        hours = tuple(sorted({int(hour) for hour in target_hours}))
+        if len(hours) != 2 or hours[1] - hours[0] != 1:
+            raise ValueError("multi_pool target hours must be one adjacent pair")
+        return hours
+
+    def set_target_hours(self, target_hours):
+        hours = self._normalize_target_hours(target_hours)
+        with self.condition:
+            if any(record["state"] == "in_flight" for record in self.hour_states.values()):
+                raise RuntimeError("cannot change target pair while a request is in flight")
+            self.target_hours = hours
+            for hour in hours:
+                self.hour_states.setdefault(
+                    hour,
+                    {"state": "available", "account_slot": None, "candidate": None},
+                )
+            self.condition.notify_all()
+
+    def try_acquire(self, hour, account_slot, candidate=None, now=None):
+        current = time.monotonic() if now is None else float(now)
+        with self.condition:
+            if account_slot not in MULTI_POOL_SLOTS:
+                return "invalid_account_slot"
+            if hour not in self.target_hours:
+                return "not_in_target_pair"
+            if current < self.global_next_allowed_at:
+                return "global_cooldown"
+            record = self.hour_states[hour]
+            if record["state"] == "in_flight":
+                return "hour_in_flight"
+            if any(
+                other_hour != hour
+                and other_record["state"] == "in_flight"
+                and other_record["account_slot"] == account_slot
+                for other_hour, other_record in self.hour_states.items()
+            ):
+                return "account_slot_in_flight"
+            if record["state"] in self.TERMINAL_STATES:
+                return f"hour_{record['state']}"
+            record.update(state="in_flight", account_slot=account_slot, candidate=candidate)
+            self._emit(
+                "multi_pool_lease_acquired",
+                account_slot=account_slot,
+                hour=hour,
+                state="in_flight",
+            )
+            return "acquired"
+
+    def acquire(self, hour, account_slot, candidate=None, deadline=None):
+        cooldown_logged = False
+        with self.condition:
+            while True:
+                now = time.monotonic()
+                result = self.try_acquire(hour, account_slot, candidate=candidate, now=now)
+                if result != "global_cooldown":
+                    return result
+                if not cooldown_logged:
+                    self._emit(
+                        "multi_pool_global_cooldown_wait",
+                        account_slot=account_slot,
+                        hour=hour,
+                        cooldown_ms=max(
+                            round((self.global_next_allowed_at - now) * 1000),
+                            0,
+                        ),
+                    )
+                    cooldown_logged = True
+                if deadline is not None and now >= deadline:
+                    return "deadline_expired"
+                wait_seconds = max(self.global_next_allowed_at - now, 0.001)
+                if deadline is not None:
+                    wait_seconds = min(wait_seconds, max(deadline - now, 0.001))
+                self.condition.wait(min(wait_seconds, 0.05))
+
+    def record(self, hour, account_slot, result, candidate=None, too_fast=False, now=None):
+        current = time.monotonic() if now is None else float(now)
+        with self.condition:
+            if hour not in self.hour_states:
+                raise ValueError("hour is outside the multi_pool target pair")
+            record = self.hour_states[hour]
+            if record["state"] != "in_flight" or record["account_slot"] != account_slot:
+                raise RuntimeError("multi_pool hour lease is not owned by this account slot")
+            if result not in ("confirmed", "unknown", "tombstoned", "failed"):
+                raise ValueError("invalid multi_pool result")
+            record.update(
+                state="available" if result == "failed" else result,
+                account_slot=None if result == "failed" else account_slot,
+                candidate=None if result == "failed" else candidate,
+            )
+            if too_fast:
+                self.global_fast_retry_streak += 1
+                gap = min(
+                    self.fast_retry_gap_seconds
+                    * (RESERVATION_PLACE_FAST_RETRY_FACTOR ** self.global_fast_retry_streak),
+                    DEFAULT_RESERVATION_PLACE_MAX_FAST_RETRY_GAP,
+                )
+                self.global_next_allowed_at = max(self.global_next_allowed_at, current + gap)
+                self._emit(
+                    "multi_pool_global_cooldown_set",
+                    account_slot=account_slot,
+                    hour=hour,
+                    cooldown_ms=round(gap * 1000),
+                    fast_retry_streak=self.global_fast_retry_streak,
+                )
+            elif result == "confirmed":
+                self.global_fast_retry_streak = 0
+            self._emit(
+                "multi_pool_lease_recorded",
+                account_slot=account_slot,
+                hour=hour,
+                state=record["state"],
+                too_fast=bool(too_fast),
+                global_cooldown_remaining_ms=max(
+                    round((self.global_next_allowed_at - current) * 1000),
+                    0,
+                ),
+            )
+            self.condition.notify_all()
+            return record["state"]
+
+    def snapshot(self):
+        with self.condition:
+            return {
+                hour: {
+                    "state": record["state"],
+                    "account_slot": record["account_slot"],
+                    "candidate": record["candidate"],
+                }
+                for hour, record in self.hour_states.items()
+            }
 
 
 class GuidedBookingState:
@@ -547,7 +764,10 @@ class KeepAliveClient:
 
 def redact_text(text):
     redacted = str(text)
-    sensitive_keys = r"token|jsessionid|cardindex|offerid|mastercardnum"
+    sensitive_keys = (
+        r"token|jsessionid|cardindex|offerid|mastercardnum|"
+        r"username|userName|password|passWord|admin_password"
+    )
     redacted = re.sub(
         rf"(?i)({sensitive_keys})(=|%3[dD])([^&\s'\"<>]+)",
         lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
@@ -617,16 +837,11 @@ def redact_json_string_key(text, key):
         start = value_start + len("<redacted>")
 
 
-def fingerprint(value):
-    if not value:
-        return "empty"
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
-    return f"len={len(value)} sha256_8={digest}"
-
-
 class SmartBookingBotV2:
     def __init__(self, args):
         self.args = args
+        self.account_pool = list(getattr(args, "account_pool", []) or [])
+        self.multi_pool_enabled = bool(getattr(args, "account_pool_stdin", False))
         if not hasattr(self.args, "direct_spec_adjacent_delay"):
             self.args.direct_spec_adjacent_delay = DEFAULT_DIRECT_SPEC_ADJACENT_DELAY
         if not hasattr(self.args, "reservation_place_gap"):
@@ -657,6 +872,7 @@ class SmartBookingBotV2:
         self.dry_run_candidate = None
         self.last_get_places_error = None
         self.last_get_places_message = ""
+        self.multi_pool_coordinator = None
 
         if args.date:
             self.target_date = args.date
@@ -687,14 +903,33 @@ class SmartBookingBotV2:
         self.excluded_courts = sorted(excluded_courts)
 
         self._setup_logger()
-        self.client = KeepAliveClient(
-            self.base_url,
-            self._headers(),
-            timeout=args.timeout,
-            logger=self.logger,
-            fail_stats=self.fail_stats,
-            event_callback=self._record_http_event,
-        )
+        if self.multi_pool_enabled:
+            for context in self.account_pool:
+                context.client = KeepAliveClient(
+                    self.base_url,
+                    self._headers(context),
+                    timeout=args.timeout,
+                    logger=self.logger,
+                    fail_stats=context.fail_stats,
+                    event_callback=self._record_http_event,
+                )
+                context.reservation_gate = ReservationPlaceGate(
+                    self.args.reservation_place_gap,
+                    self.args.reservation_place_fast_retry_gap,
+                    logger=self.logger,
+                    required_hours=1,
+                    success_gap_seconds=DEFAULT_RESERVATION_PLACE_SUCCESS_GAP,
+                )
+            self.client = self.account_pool[0].client
+        else:
+            self.client = KeepAliveClient(
+                self.base_url,
+                self._headers(),
+                timeout=args.timeout,
+                logger=self.logger,
+                fail_stats=self.fail_stats,
+                event_callback=self._record_http_event,
+            )
 
         self._log_config()
         self._warn_about_credentials()
@@ -776,6 +1011,8 @@ class SmartBookingBotV2:
         )
 
     def _prepare_direct_clients(self, *, prewarm=False):
+        if self.multi_pool_enabled:
+            return
         if self.direct_client_slots:
             return
         for slot_id in range(1, self.args.direct_max_inflight + 1):
@@ -815,7 +1052,9 @@ class SmartBookingBotV2:
             except queue.Empty:
                 break
 
-    def _headers(self):
+    def _headers(self, account_context=None):
+        token = account_context.token if account_context else self.args.token
+        jsessionid = account_context.jsessionid if account_context else self.args.jsessionid
         headers = {
             "Connection": "keep-alive",
             "User-Agent": USER_AGENT,
@@ -823,12 +1062,12 @@ class SmartBookingBotV2:
             "Content-Type": "application/x-www-form-urlencoded",
             "Origin": self.origin,
             "X-Requested-With": "com.tencent.mm",
-            "Referer": f"{self.origin}/easyserp/index.html?token={self.args.token}",
+            "Referer": f"{self.origin}/easyserp/index.html?token={token}",
             "Accept-Encoding": "identity",
             "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
         }
-        if self.args.jsessionid:
-            headers["Cookie"] = f"JSESSIONID={self.args.jsessionid}"
+        if jsessionid:
+            headers["Cookie"] = f"JSESSIONID={jsessionid}"
         return headers
 
     def _log_config(self):
@@ -869,10 +1108,10 @@ class SmartBookingBotV2:
         self.logger.info(f"[配置] 场地池={self.court_pool}")
         if self.excluded_courts:
             self.logger.info(f"[配置] 默认排除靠墙场地={self.excluded_courts}；使用 --all-court 可包含")
-        self.logger.info(
-            f"[凭证] token={fingerprint(self.args.token)} | JSESSIONID={fingerprint(self.args.jsessionid)} | "
-            f"card_index={fingerprint(self.args.card_index)}"
-        )
+        if self.multi_pool_enabled:
+            self.logger.info("[凭证] account_pool=pool_1,pool_2 | credentials=redacted")
+        else:
+            self.logger.info("[凭证] token/JSESSIONID/card_index 已加载，日志不记录凭据指纹")
         self.log_event(
             "run_config",
             mode=self.args.booking_mode,
@@ -890,10 +1129,22 @@ class SmartBookingBotV2:
             reservation_place_min_budget=DEFAULT_RESERVATION_PLACE_MIN_BUDGET,
             reservation_reconcile_delays=DEFAULT_RESERVATION_RECONCILE_DELAYS,
             court_count=len(self.court_pool),
+            account_mode="multi_pool" if self.multi_pool_enabled else "single",
         )
         self.logger.info("=" * 110)
 
     def _warn_about_credentials(self):
+        if self.multi_pool_enabled:
+            invalid_slots = [
+                context.slot
+                for context in self.account_pool
+                if context.jsessionid and len(context.jsessionid) != 32
+            ]
+            if invalid_slots:
+                self.logger.warning(
+                    f"[凭证] JSESSIONID 长度不是32，可能复制了多余字符 | account_slots={invalid_slots}"
+                )
+            return
         if self.args.jsessionid and len(self.args.jsessionid) != 32:
             self.logger.warning("[凭证] JSESSIONID 长度不是32，可能复制了多余字符；建议使用 -j 传入刚抓包的值")
 
@@ -1050,6 +1301,15 @@ class SmartBookingBotV2:
             raise ValueError("--direct-max-inflight 必须大于0")
         if self.args.direct_max_attempts <= 0:
             raise ValueError("--direct-max-attempts 必须大于0")
+        if self.multi_pool_enabled:
+            if len(self.account_pool) != 2:
+                raise ValueError("--account-pool-stdin requires exactly two validated accounts")
+            if self.target_duration != 2:
+                raise ValueError("multi_pool only supports --duration 2")
+            if self.args.booking_mode not in (BOOKING_MODE_DIRECT_FAST, BOOKING_MODE_GUIDED_FAST):
+                raise ValueError("multi_pool only supports direct-fast or guided-fast")
+            if self.args.check_session:
+                raise ValueError("multi_pool does not support --check-session")
 
     def _weekday_name(self):
         return ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][self.weekday]
@@ -1104,6 +1364,29 @@ class SmartBookingBotV2:
 
     def prewarm(self):
         self.logger.info("[预热] 开始预热 TLS/session")
+        if self.multi_pool_enabled:
+            for context in self.account_pool:
+                context.client.request(
+                    "GET",
+                    "/place/getPlaceType",
+                    params={"token": context.token, "shopNum": SHOP_NUM},
+                    label=f"prewarm_{context.slot}_getPlaceType",
+                )
+                context.client.request(
+                    "GET",
+                    "/place/getPenaltyRules",
+                    params={
+                        "stId": "1",
+                        "stShortName": SHORT_NAME,
+                        "token": context.token,
+                        "shopNum": SHOP_NUM,
+                        "systemDate": datetime.now().strftime("%Y-%m-%d"),
+                    },
+                    label=f"prewarm_{context.slot}_getPenaltyRules",
+                )
+                self.log_event("multi_pool_account_prewarm", account_slot=context.slot)
+            self.logger.info("[预热] 结束")
+            return
         self.client.request(
             "GET",
             "/place/getPlaceType",
@@ -1486,8 +1769,12 @@ class SmartBookingBotV2:
         candidate_total,
         client=None,
         failure_stats=None,
+        account_context=None,
+        multi_pool_coordinator=None,
     ):
-        request_client = client or self.client
+        request_client = client or (account_context.client if account_context else self.client)
+        token = account_context.token if account_context else self.args.token
+        card_index = account_context.card_index if account_context else self.args.card_index
         hour = candidate["hour"]
         court_id = candidate["court_id"]
         court_name = candidate["court_name"]
@@ -1545,7 +1832,7 @@ class SmartBookingBotV2:
             data={
                 "fieldinfo": json.dumps(canbook_fields, ensure_ascii=False),
                 "shopNum": SHOP_NUM,
-                "token": self.args.token,
+                "token": token,
             },
             label=f"{label}_canBook",
         )
@@ -1557,7 +1844,7 @@ class SmartBookingBotV2:
             "POST",
             "/common/getOfferInfo",
             data={
-                "token": self.args.token,
+                "token": token,
                 "payMoney": f"{old_total:.2f}",
                 "shopNum": SHOP_NUM,
                 "projectType": PROJECT_TYPE,
@@ -1573,7 +1860,7 @@ class SmartBookingBotV2:
             "POST",
             "/common/getUseCardInfo",
             data={
-                "token": self.args.token,
+                "token": token,
                 "shopNum": SHOP_NUM,
                 "projectType": PROJECT_TYPE,
                 "projectInfo": json.dumps(field_info_full, ensure_ascii=False),
@@ -1585,24 +1872,29 @@ class SmartBookingBotV2:
 
         self._sleep_between_booking_calls()
         reservation_data = {
-            "token": self.args.token,
+            "token": token,
             "shopNum": SHOP_NUM,
             "fieldinfo": json.dumps(field_info_full, ensure_ascii=False),
             "oldTotal": f"{old_total:.2f}",
             "cardPayType": "0",
             "type": "羽毛球",
-            "offerId": self.args.card_index,
+            "offerId": card_index,
             "offerType": PROJECT_TYPE,
             "total": f"{actual_total:.2f}",
             "premerother": "",
-            "cardIndex": self.args.card_index,
+            "cardIndex": card_index,
             "masterCardNum": "",
             "zengzhiMoney": "0",
         }
         reservation_label = f"{label}_reservationPlace"
-        max_reservation_attempts = 1 if self.reservation_place_gate else 2
+        account_gate = account_context.reservation_gate if account_context else None
+        max_reservation_attempts = 1 if (account_gate or self.reservation_place_gate) else 2
         for reservation_attempt in range(1, max_reservation_attempts + 1):
-            active_gate = self.reservation_place_gate
+            active_gate = (
+                account_context.reservation_gate
+                if account_context is not None
+                else self.reservation_place_gate
+            )
             is_retry_attempt = reservation_attempt > 1
             remaining_budget = self._remaining_direct_budget()
             if (
@@ -1628,6 +1920,31 @@ class SmartBookingBotV2:
             ):
                 return "candidate_skipped"
 
+            lease_acquired = False
+            if multi_pool_coordinator is not None:
+                lease_result = multi_pool_coordinator.acquire(
+                    hour,
+                    account_context.slot,
+                    candidate=candidate,
+                    deadline=self.direct_deadline,
+                )
+                if lease_result != "acquired":
+                    if active_gate:
+                        active_gate.record_response(
+                            candidate,
+                            reservation_label,
+                            "failed",
+                        )
+                    self.log_event(
+                        "multi_pool_lease_skip",
+                        account_slot=account_context.slot,
+                        hour=hour,
+                        court=court_id,
+                        reason=lease_result,
+                    )
+                    return "candidate_skipped"
+                lease_acquired = True
+
             r3 = None
             reservation_outcome = "failed"
             success_source = "reservation_response"
@@ -1647,6 +1964,7 @@ class SmartBookingBotV2:
                         request_client,
                         candidate,
                         reservation_label,
+                        account_context=account_context,
                     )
                     if reconciliation == "confirmed":
                         reservation_outcome = "success"
@@ -1676,6 +1994,45 @@ class SmartBookingBotV2:
                         fast_retry=is_fast_response,
                         defer_retry=max_reservation_attempts == 1,
                     )
+                    if account_context is not None:
+                        self.log_event(
+                            "multi_pool_account_cooldown",
+                            account_slot=account_context.slot,
+                            hour=hour,
+                            reason=active_gate.last_cooldown_reason,
+                            cooldown_ms=round(active_gate.last_cooldown_seconds * 1000),
+                            fast_retry_streak=active_gate.fast_retry_streak,
+                        )
+                if lease_acquired:
+                    if reservation_outcome == "success":
+                        coordinator_result = "confirmed"
+                    elif reservation_outcome == "unknown_outcome":
+                        coordinator_result = "unknown"
+                    elif reservation_outcome == "not_confirmed":
+                        coordinator_result = "tombstoned"
+                    else:
+                        coordinator_result = "failed"
+                    multi_pool_coordinator.record(
+                        hour,
+                        account_context.slot,
+                        coordinator_result,
+                        candidate=candidate,
+                        too_fast=is_fast_response,
+                    )
+                    if coordinator_result in MultiPoolCoordinator.TERMINAL_STATES:
+                        source = (
+                            success_source
+                            if coordinator_result == "confirmed"
+                            else "order_reconciliation_query_failed"
+                            if coordinator_result == "unknown"
+                            else "order_reconciliation_stable_not_found"
+                        )
+                        self._log_multi_pool_slot_result(
+                            account_context,
+                            candidate,
+                            coordinator_result,
+                            source,
+                        )
 
             if reservation_outcome == "success":
                 self.logger.info(
@@ -1801,7 +2158,13 @@ class SmartBookingBotV2:
             time.sleep(delay)
         return self.direct_deadline is None or time.monotonic() < self.direct_deadline
 
-    def _reconcile_reservation_outcome(self, request_client, candidate, reservation_label):
+    def _reconcile_reservation_outcome(
+        self,
+        request_client,
+        candidate,
+        reservation_label,
+        account_context=None,
+    ):
         started_at = time.monotonic()
         self.log_event(
             "reservation_reconcile_start",
@@ -1843,7 +2206,7 @@ class SmartBookingBotV2:
                     "pageNo": 0,
                     "pageSize": 20,
                     "shopNum": SHOP_NUM,
-                    "token": self.args.token,
+                    "token": account_context.token if account_context else self.args.token,
                 },
                 timeout=query_timeout,
                 label=f"{reservation_label}_reconcile_getPlaceOrder_{attempt}",
@@ -1948,6 +2311,18 @@ class SmartBookingBotV2:
         if result and result.status == 0:
             return "transport_error"
         return "business_fail"
+
+    def _log_multi_pool_slot_result(self, account_context, candidate, status, source):
+        self.log_event(
+            "multi_pool_slot_result",
+            account_slot=account_context.slot,
+            status=status,
+            target_date=self.target_date,
+            hour=candidate["hour"],
+            end_hour=candidate["hour"] + 1,
+            court=candidate["court_id"],
+            source=source,
+        )
 
     def _sleep_after_fast_retry(self):
         time.sleep(self.args.reservation_place_fast_retry_gap)
@@ -2543,6 +2918,286 @@ class SmartBookingBotV2:
         self.logger.info("[完成] 直抢两阶段均成功")
         return "success"
 
+    def _multi_pool_target_pairs(self):
+        pairs = [
+            (hour, hour + 1)
+            for hour in range(self.range_start_h, self.range_end_h - 1)
+        ]
+        if not pairs:
+            raise ValueError("multi_pool requires one adjacent pair in the target range")
+        range_center_twice = self.range_start_h + self.range_end_h
+        return sorted(
+            pairs,
+            key=lambda pair: (
+                abs((pair[0] + pair[1]) - range_center_twice),
+                pair[0],
+            ),
+        )
+
+    def _select_multi_pool_target_hours(self):
+        return self._multi_pool_target_pairs()[0]
+
+    @staticmethod
+    def _multi_pool_goal_saturated(snapshot):
+        anchor_hours = sorted(
+            hour
+            for hour, record in snapshot.items()
+            if record["state"] in ("confirmed", "unknown")
+        )
+        return any(right - left == 1 for left, right in zip(anchor_hours, anchor_hours[1:]))
+
+    def _next_multi_pool_pair(self, snapshot, attempted_pairs):
+        base_pairs = self._multi_pool_target_pairs()
+        rank = {pair: index for index, pair in enumerate(base_pairs)}
+        tombstoned = {
+            hour for hour, record in snapshot.items() if record["state"] == "tombstoned"
+        }
+        anchors = {
+            hour
+            for hour, record in snapshot.items()
+            if record["state"] in ("confirmed", "unknown")
+        }
+        if self._multi_pool_goal_saturated(snapshot):
+            return None
+        if anchors:
+            candidates = [
+                pair
+                for pair in base_pairs
+                if pair not in attempted_pairs
+                and any(hour in anchors for hour in pair)
+                and not any(hour in tombstoned for hour in pair)
+                and any(
+                    snapshot.get(hour, {}).get("state", "available") == "available"
+                    for hour in pair
+                )
+            ]
+        else:
+            candidates = [
+                pair
+                for pair in base_pairs
+                if pair not in attempted_pairs
+                and not any(hour in tombstoned for hour in pair)
+            ]
+        return min(candidates, key=lambda pair: rank[pair]) if candidates else None
+
+    def _run_multi_pool_account(
+        self,
+        account_context,
+        target_hour,
+        coordinator,
+        guide_state,
+        result_map,
+        result_lock,
+        start_delay,
+    ):
+        if start_delay > 0:
+            self.log_event(
+                "multi_pool_account_start_delay",
+                account_slot=account_context.slot,
+                delay_ms=round(start_delay * 1000),
+            )
+            time.sleep(start_delay)
+
+        candidates = [
+            self._synthetic_candidate(target_hour, court_id)
+            for court_id in self.court_pool
+        ]
+        if guide_state:
+            candidates = guide_state.sort_candidates(candidates)
+        pending = deque(candidates)
+        attempt_counts = Counter()
+        final_result = "failed"
+        last_candidate = candidates[0] if candidates else self._synthetic_candidate(target_hour, "ymq")
+        while pending and time.monotonic() < self.direct_deadline:
+            candidate = pending.popleft()
+            last_candidate = candidate
+            key = self._candidate_key(candidate)
+            attempt_counts[key] += 1
+            label = (
+                f"multi_pool_{account_context.slot}_h{target_hour}_"
+                f"{candidate['court_id']}_a{attempt_counts[key]}"
+            )
+            result = self.attempt_single_hour_booking(
+                candidate,
+                label,
+                1,
+                sum(attempt_counts.values()),
+                len(candidates) * self.args.direct_max_attempts,
+                client=account_context.client,
+                failure_stats=account_context.fail_stats,
+                account_context=account_context,
+                multi_pool_coordinator=coordinator,
+            )
+            if guide_state:
+                guide_state.record_attempt_result(candidate, result)
+            state = coordinator.snapshot()[target_hour]["state"]
+            if state in MultiPoolCoordinator.TERMINAL_STATES:
+                final_result = state
+                break
+            if result == "dry_run":
+                final_result = "dry_run"
+                break
+            if (
+                result in ("retry_delay", "server_retry", "transport_error", "exception")
+                and attempt_counts[key] < self.args.direct_max_attempts
+            ):
+                pending.append(candidate)
+
+        if final_result in ("failed", "dry_run"):
+            source = "dry_run" if self.args.dry_run else "candidate_exhausted"
+            self._log_multi_pool_slot_result(
+                account_context,
+                last_candidate,
+                final_result,
+                source,
+            )
+        with result_lock:
+            result_map[account_context.slot] = final_result
+
+    def run_multi_pool_mode(self):
+        contexts = sorted(self.account_pool, key=lambda context: context.slot)
+        target_pairs = self._multi_pool_target_pairs()
+        self.multi_pool_coordinator = MultiPoolCoordinator(
+            target_pairs[0],
+            self.args.reservation_place_fast_retry_gap,
+            logger=self.logger,
+            event_callback=self.log_event,
+        )
+        self.direct_deadline = time.monotonic() + self.args.window_seconds
+        self.log_event(
+            "multi_pool_start",
+            account_slots=list(MULTI_POOL_SLOTS),
+            target_pairs=[list(pair) for pair in target_pairs],
+            second_account_delay_ms=round(DEFAULT_MULTI_POOL_SECOND_ACCOUNT_DELAY * 1000),
+        )
+
+        guide_state = None
+        stop_event = None
+        collector_thread = None
+        if self.args.booking_mode == BOOKING_MODE_GUIDED_FAST:
+            guide_state = GuidedBookingState(self.court_rank)
+            stop_event, collector_thread = self.start_guided_collector(
+                guide_state,
+                self.direct_deadline,
+                account_context=contexts[0],
+            )
+
+        hour_owners = {}
+        context_by_slot = {context.slot: context for context in contexts}
+        attempted_pairs = set()
+        try:
+            pair_index = 0
+            while time.monotonic() < self.direct_deadline:
+                snapshot_before = self.multi_pool_coordinator.snapshot()
+                target_hours = self._next_multi_pool_pair(snapshot_before, attempted_pairs)
+                if target_hours is None:
+                    break
+                pair_index += 1
+                attempted_pairs.add(target_hours)
+                self.multi_pool_coordinator.set_target_hours(target_hours)
+                assigned_slots = []
+                for target_hour in target_hours:
+                    existing_record = snapshot_before.get(target_hour, {})
+                    assigned_slots.append(
+                        existing_record.get("account_slot") or hour_owners.get(target_hour)
+                    )
+                used_slots = {slot for slot in assigned_slots if slot}
+                available_slots = [slot for slot in MULTI_POOL_SLOTS if slot not in used_slots]
+                for index, slot in enumerate(assigned_slots):
+                    if slot is None:
+                        if not available_slots:
+                            raise RuntimeError("multi_pool adjacent hours must use different account slots")
+                        assigned_slots[index] = available_slots.pop(0)
+                    hour_owners.setdefault(target_hours[index], assigned_slots[index])
+
+                self.log_event(
+                    "multi_pool_pair_start",
+                    pair_index=pair_index,
+                    target_hours=list(target_hours),
+                    assignments=[
+                        {"account_slot": slot, "hour": hour}
+                        for slot, hour in zip(assigned_slots, target_hours)
+                    ],
+                )
+                result_map = {}
+                result_lock = threading.Lock()
+                threads = []
+                current_snapshot = self.multi_pool_coordinator.snapshot()
+                for slot, target_hour in zip(assigned_slots, target_hours):
+                    if current_snapshot[target_hour]["state"] != "available":
+                        continue
+                    thread = threading.Thread(
+                        target=self._run_multi_pool_account,
+                        args=(
+                            context_by_slot[slot],
+                            target_hour,
+                            self.multi_pool_coordinator,
+                            guide_state,
+                            result_map,
+                            result_lock,
+                            DEFAULT_MULTI_POOL_SECOND_ACCOUNT_DELAY
+                            if slot == "pool_2"
+                            else 0.0,
+                        ),
+                    )
+                    thread.start()
+                    threads.append(thread)
+                for thread in threads:
+                    thread.join()
+
+                pair_snapshot = self.multi_pool_coordinator.snapshot()
+                if self.args.dry_run or self._multi_pool_goal_saturated(pair_snapshot):
+                    break
+        finally:
+            if stop_event is not None:
+                stop_event.set()
+            if collector_thread is not None:
+                collector_thread.join(timeout=1.0)
+
+        snapshot = self.multi_pool_coordinator.snapshot()
+        confirmed = sorted(hour for hour, record in snapshot.items() if record["state"] == "confirmed")
+        unknown = sorted(hour for hour, record in snapshot.items() if record["state"] == "unknown")
+        tombstoned = sorted(hour for hour, record in snapshot.items() if record["state"] == "tombstoned")
+        confirmed_candidates = [
+            snapshot[hour]["candidate"] for hour in confirmed if snapshot[hour]["candidate"]
+        ]
+        confirmed_candidates.sort(key=lambda candidate: candidate["hour"])
+        self.first_booking = confirmed_candidates[0] if confirmed_candidates else None
+        self.second_booking = confirmed_candidates[1] if len(confirmed_candidates) > 1 else None
+        self.last_unknown_candidates = [
+            snapshot[hour]["candidate"] for hour in unknown if snapshot[hour]["candidate"]
+        ]
+        confirmed_goal = any(
+            right - left == 1 for left, right in zip(confirmed, confirmed[1:])
+        )
+        if self.args.dry_run:
+            status = "dry_run"
+        elif confirmed_goal:
+            status = "success"
+        elif unknown:
+            status = "unknown"
+        elif confirmed:
+            status = "partial"
+        else:
+            status = "failed"
+        self.log_event(
+            "multi_pool_complete",
+            status=status,
+            confirmed_hours=confirmed,
+            unknown_hours=unknown,
+            tombstoned_hours=tombstoned,
+        )
+        self.fail_stats.update(
+            Counter(
+                {
+                    f"{context.slot}:{key}": value
+                    for context in contexts
+                    for key, value in context.fail_stats.items()
+                }
+            )
+        )
+        return status
+
     def run_guided_mode(self):
         guide_state = GuidedBookingState(self.court_rank)
         guide_deadline = time.monotonic() + self.args.window_seconds * (2 if self.target_duration == 2 else 1)
@@ -2553,17 +3208,17 @@ class SmartBookingBotV2:
             stop_event.set()
             collector_thread.join(timeout=1.0)
 
-    def start_guided_collector(self, guide_state, deadline):
+    def start_guided_collector(self, guide_state, deadline, account_context=None):
         stop_event = threading.Event()
         thread = threading.Thread(
             target=self._guided_collector_loop,
-            args=(guide_state, deadline, stop_event),
+            args=(guide_state, deadline, stop_event, account_context),
             daemon=True,
         )
         thread.start()
         return stop_event, thread
 
-    def _guided_collector_loop(self, guide_state, deadline, stop_event):
+    def _guided_collector_loop(self, guide_state, deadline, stop_event, account_context=None):
         inflight = set()
         probe_index = 0
         next_tick = time.monotonic()
@@ -2575,9 +3230,14 @@ class SmartBookingBotV2:
             inflight = {thread for thread in inflight if thread.is_alive()}
             if len(inflight) < self.args.guide_max_inflight:
                 probe_index += 1
+                worker_args = (
+                    (guide_state, probe_index, account_context)
+                    if account_context is not None
+                    else (guide_state, probe_index)
+                )
                 thread = threading.Thread(
                     target=self._guided_probe_worker,
-                    args=(guide_state, probe_index),
+                    args=worker_args,
                     daemon=True,
                 )
                 thread.start()
@@ -2593,11 +3253,11 @@ class SmartBookingBotV2:
         alive = sum(1 for thread in inflight if thread.is_alive())
         self.logger.info(f"[引导采集] 停止 | alive_probes={alive}")
 
-    def _guided_probe_worker(self, guide_state, probe_index):
+    def _guided_probe_worker(self, guide_state, probe_index, account_context=None):
         local_stats = Counter()
         client = KeepAliveClient(
             self.base_url,
-            self._headers(),
+            self._headers(account_context),
             timeout=self.args.timeout,
             logger=self.logger,
             fail_stats=local_stats,
@@ -2610,7 +3270,7 @@ class SmartBookingBotV2:
                     "shopNum": SHOP_NUM,
                     "dateymd": self.target_date,
                     "shortName": SHORT_NAME,
-                    "token": self.args.token,
+                    "token": account_context.token if account_context else self.args.token,
                 },
                 label=f"guided_get_places_{probe_index}",
             )
@@ -2778,6 +3438,11 @@ class SmartBookingBotV2:
                 f"目标时长={self.target_duration}小时 | mode={self.args.booking_mode}"
             )
 
+            if self.multi_pool_enabled:
+                self.run_multi_pool_mode()
+                self.print_summary()
+                return
+
             if self.args.booking_mode == BOOKING_MODE_DIRECT_FAST:
                 self.run_direct_mode()
                 self.print_summary()
@@ -2810,7 +3475,12 @@ class SmartBookingBotV2:
             self.print_summary()
         finally:
             self._close_direct_clients()
-            self.client.close()
+            if self.multi_pool_enabled:
+                for context in self.account_pool:
+                    if context.client:
+                        context.client.close()
+            else:
+                self.client.close()
 
 
 def build_parser():
@@ -2895,14 +3565,38 @@ Examples:
     parser.add_argument("--error-backoff", type=float, default=0.25, help="服务错误初始退避，默认0.25秒")
     parser.add_argument("--dry-run", action="store_true", help="只查询和生成候选，不调用下单接口")
     parser.add_argument("--check-session", action="store_true", help="只检测 JSESSIONID 是否可用，不等待也不下单")
+    parser.add_argument(
+        "--account-pool-stdin",
+        action="store_true",
+        help="从 stdin 单行 JSON 读取两个账号上下文；凭据不进入命令行",
+    )
     parser.add_argument("--timeout", type=float, default=5.0, help="HTTP 超时时间，默认5秒")
     return parser
+
+
+def enforce_multi_pool_runtime_mode(args, environ=None):
+    if not args.account_pool_stdin:
+        return "single"
+    environment = os.environ if environ is None else environ
+    runtime_mode = str(environment.get("DAYDAYUP_MULTI_POOL_MODE", "off")).strip().lower()
+    if runtime_mode == "dry_run":
+        args.dry_run = True
+        return runtime_mode
+    if runtime_mode != "live":
+        raise ValueError("multi_pool runtime mode is disabled")
+    return runtime_mode
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
     try:
+        enforce_multi_pool_runtime_mode(args)
+        args.account_pool = (
+            load_booking_account_pool(sys.stdin)
+            if args.account_pool_stdin
+            else []
+        )
         bot = SmartBookingBotV2(args)
         bot.run()
     except ValueError as exc:

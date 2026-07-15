@@ -294,6 +294,17 @@
             </div>
 
             <div class="option-grid">
+              <div class="option-card multi-pool-option" id="multiPoolOption" hidden>
+                <label class="checkline">
+                  <input id="multiPoolEnabled" name="multi_pool_enabled" type="checkbox" />
+                  <span>双账号组合预约</span>
+                </label>
+                <label class="multi-pool-account">
+                  <span>第二账号</span>
+                  <select id="multiPoolSecondaryUser" name="secondary_user_key" disabled></select>
+                </label>
+                <small id="multiPoolWarning">两个账号分别支付一个相邻小时；部分成功不会自动退订。</small>
+              </div>
               <div class="option-card">
                 <label class="checkline">
                   <input name="force" type="checkbox" />
@@ -394,7 +405,7 @@
                 </label>
                 <label>
                   <span>密码</span>
-                  <input name="token_password" type="password" autocomplete="current-password" />
+                  <input name="token_password" type="password" autocomplete="new-password" />
                 </label>
               </div>
               <label>

@@ -846,6 +846,27 @@ select:focus-visible {
   line-height: 1.45;
 }
 
+.multi-pool-option {
+  border-color: color-mix(in oklch, var(--primary-amber), var(--border-muted) 55%);
+  background: color-mix(in oklch, var(--primary-amber-soft), var(--surface-raised) 55%);
+}
+
+.multi-pool-account {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.multi-pool-account select {
+  min-width: 0;
+  width: 100%;
+}
+
+.multi-pool-option small {
+  color: var(--text-primary);
+}
+
 .scan-target-list {
   display: grid;
   gap: 8px;
@@ -2680,9 +2701,15 @@ body.modal-open {
   gap: 4px;
 }
 
-.booking-form > .option-grid .option-card:nth-child(1),
-.booking-form > .option-grid .option-card:nth-child(2) {
+.booking-form > .option-grid .option-card:nth-child(2),
+.booking-form > .option-grid .option-card:nth-child(3) {
   display: none;
+}
+
+.booking-form > .option-grid .multi-pool-option small {
+  display: block;
+  font-size: 0.72rem;
+  line-height: 1.25;
 }
 
 .action-row {
