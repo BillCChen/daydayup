@@ -42,7 +42,7 @@ BOOKING_MODE_BALANCED = "balanced"
 BOOKING_MODE_DIRECT_FAST = "direct-fast"
 BOOKING_MODE_GUIDED_FAST = "guided-fast"
 BOOKING_MODES = (BOOKING_MODE_BALANCED, BOOKING_MODE_DIRECT_FAST, BOOKING_MODE_GUIDED_FAST)
-BOOKING_ENGINE_VERSION = "3.6.0"
+BOOKING_ENGINE_VERSION = "3.7.0"
 PREWARM_SECONDS = 6.0
 BUSY_RETRY_TEXT = "当前排队人数较多"
 FAST_RETRY_TEXT = "操作过快"
@@ -52,9 +52,10 @@ DEFAULT_DIRECT_MAX_INFLIGHT = 3
 DEFAULT_DIRECT_MAX_ATTEMPTS = 2
 DEFAULT_RESERVATION_PLACE_GAP = 0.35
 DEFAULT_RESERVATION_PLACE_FAST_RETRY_GAP = 1.2
+DEFAULT_RESERVATION_PLACE_SUCCESS_GAP = 1.8
 DEFAULT_RESERVATION_PLACE_TIMEOUT = 2.5
 DEFAULT_RESERVATION_PLACE_MIN_BUDGET = 0.75
-DEFAULT_RESERVATION_RECONCILE_DELAY = 0.25
+DEFAULT_RESERVATION_RECONCILE_DELAYS = (0.25, 1.0, 2.5)
 DEFAULT_RESERVATION_RECONCILE_TIMEOUT = 1.5
 DEFAULT_RESERVATION_PLACE_MAX_FAST_RETRY_GAP = 3.0
 RESERVATION_PLACE_FAST_RETRY_FACTOR = 1.5
@@ -160,6 +161,7 @@ class ReservationPlaceGate:
         logger=None,
         required_hours=2,
         max_fast_retry_gap_seconds=DEFAULT_RESERVATION_PLACE_MAX_FAST_RETRY_GAP,
+        success_gap_seconds=None,
     ):
         self.gap_seconds = max(float(gap_seconds or 0), 0.0)
         self.fast_retry_gap_seconds = max(float(fast_retry_gap_seconds or 0), 0.0)
@@ -167,6 +169,9 @@ class ReservationPlaceGate:
             float(max_fast_retry_gap_seconds or 0),
             self.fast_retry_gap_seconds,
         )
+        if success_gap_seconds is None:
+            success_gap_seconds = max(self.gap_seconds, self.fast_retry_gap_seconds)
+        self.success_gap_seconds = max(float(success_gap_seconds or 0), self.gap_seconds)
         self.required_hours = 1 if int(required_hours or 1) <= 1 else 2
         self.logger = logger
         self.condition = threading.Condition()
@@ -326,34 +331,34 @@ class ReservationPlaceGate:
                 self.unknowns.pop(candidate_key, None)
             elif result == "unknown_outcome" and candidate_key not in self.successes:
                 self.unknowns[candidate_key] = candidate
-            if fast_retry and not defer_retry:
-                self.retry_owner_key = candidate_key
-                self.retry_owner_label = label
-                self.retry_owner_until = time.monotonic() + self.fast_retry_gap_seconds + 2.0
-            elif self.retry_owner_key == candidate_key or result == "success":
-                self.retry_owner_key = None
-                self.retry_owner_label = None
-                self.retry_owner_until = 0.0
             if fast_retry:
                 self.fast_retry_streak += 1
                 gap = min(
                     self.fast_retry_gap_seconds
-                    * (RESERVATION_PLACE_FAST_RETRY_FACTOR ** (self.fast_retry_streak - 1)),
+                    * (RESERVATION_PLACE_FAST_RETRY_FACTOR ** self.fast_retry_streak),
                     self.max_fast_retry_gap_seconds,
                 )
                 cooldown_reason = "too_fast"
             elif result == "success":
                 self.fast_retry_streak = 0
-                gap = max(self.gap_seconds, self.fast_retry_gap_seconds)
+                gap = self.success_gap_seconds
                 cooldown_reason = "success"
             elif result == "unknown_outcome":
                 self.fast_retry_streak = 0
-                gap = max(self.gap_seconds, self.fast_retry_gap_seconds)
+                gap = self.success_gap_seconds
                 cooldown_reason = "unknown_outcome"
             else:
                 self.fast_retry_streak = 0
                 gap = self.gap_seconds
                 cooldown_reason = result or "failed"
+            if fast_retry and not defer_retry:
+                self.retry_owner_key = candidate_key
+                self.retry_owner_label = label
+                self.retry_owner_until = time.monotonic() + gap + 2.0
+            elif self.retry_owner_key == candidate_key or result == "success":
+                self.retry_owner_key = None
+                self.retry_owner_label = None
+                self.retry_owner_until = 0.0
             self.last_cooldown_seconds = gap
             self.last_cooldown_reason = cooldown_reason
             self.next_allowed_at = time.monotonic() + gap
@@ -851,8 +856,10 @@ class SmartBookingBotV2:
                 f"direct_max_attempts={self.args.direct_max_attempts} | "
                 f"reservation_place_gap={self.args.reservation_place_gap}s | "
                 f"reservation_place_fast_retry_gap={self.args.reservation_place_fast_retry_gap}s | "
+                f"reservation_place_success_gap={DEFAULT_RESERVATION_PLACE_SUCCESS_GAP}s | "
                 f"reservation_place_timeout={self.args.reservation_place_timeout}s | "
-                f"reservation_place_min_budget={DEFAULT_RESERVATION_PLACE_MIN_BUDGET}s"
+                f"reservation_place_min_budget={DEFAULT_RESERVATION_PLACE_MIN_BUDGET}s | "
+                f"reservation_reconcile_delays={DEFAULT_RESERVATION_RECONCILE_DELAYS}s"
             )
         if self.args.booking_mode == BOOKING_MODE_GUIDED_FAST:
             self.logger.info(
@@ -878,8 +885,10 @@ class SmartBookingBotV2:
             direct_max_attempts=self.args.direct_max_attempts,
             reservation_place_gap=self.args.reservation_place_gap,
             reservation_place_fast_retry_gap=self.args.reservation_place_fast_retry_gap,
+            reservation_place_success_gap=DEFAULT_RESERVATION_PLACE_SUCCESS_GAP,
             reservation_place_timeout=self.args.reservation_place_timeout,
             reservation_place_min_budget=DEFAULT_RESERVATION_PLACE_MIN_BUDGET,
+            reservation_reconcile_delays=DEFAULT_RESERVATION_RECONCILE_DELAYS,
             court_count=len(self.court_pool),
         )
         self.logger.info("=" * 110)
@@ -1642,6 +1651,8 @@ class SmartBookingBotV2:
                     if reconciliation == "confirmed":
                         reservation_outcome = "success"
                         success_source = "order_reconciliation"
+                    elif reconciliation == "stable_not_found":
+                        reservation_outcome = "not_confirmed"
                     else:
                         reservation_outcome = "unknown_outcome"
             finally:
@@ -1696,6 +1707,23 @@ class SmartBookingBotV2:
                     transport_error=r3.error_kind if r3 else "no_result",
                 )
                 return "unknown_outcome"
+
+            if reservation_outcome == "not_confirmed":
+                stats = failure_stats if failure_stats is not None else self.fail_stats
+                stats[f"{reservation_label}_stable_not_found"] += 1
+                self.logger.warning(
+                    f"[未落单] label={reservation_label} 最终提交超时，连续只读对账均未发现目标订单；"
+                    f"不重试同一候选，继续其他候选 | hour={hour} court={court_id}"
+                )
+                self.log_event(
+                    "reservation_not_confirmed",
+                    label=reservation_label,
+                    hour=hour,
+                    court=court_id,
+                    transport_error=r3.error_kind if r3 else "no_result",
+                    recovery="continue_other_candidates",
+                )
+                return "reservation_not_confirmed"
 
             if (
                 reservation_attempt < max_reservation_attempts
@@ -1762,8 +1790,8 @@ class SmartBookingBotV2:
             timeout = min(timeout, remaining)
         return max(float(timeout), 0.001)
 
-    def _sleep_before_reconciliation(self):
-        delay = DEFAULT_RESERVATION_RECONCILE_DELAY
+    def _sleep_before_reconciliation(self, delay):
+        delay = max(float(delay or 0), 0.0)
         remaining = self._remaining_direct_budget()
         if remaining is not None:
             if remaining <= 0:
@@ -1774,65 +1802,93 @@ class SmartBookingBotV2:
         return self.direct_deadline is None or time.monotonic() < self.direct_deadline
 
     def _reconcile_reservation_outcome(self, request_client, candidate, reservation_label):
+        started_at = time.monotonic()
         self.log_event(
             "reservation_reconcile_start",
             label=reservation_label,
             hour=candidate["hour"],
             court=candidate["court_id"],
-            delay_ms=round(DEFAULT_RESERVATION_RECONCILE_DELAY * 1000),
+            scheduled_delay_ms=[round(delay * 1000) for delay in DEFAULT_RESERVATION_RECONCILE_DELAYS],
         )
-        if not self._sleep_before_reconciliation():
-            outcome = "deadline_expired"
+        successful_snapshots = 0
+        for attempt, scheduled_delay in enumerate(DEFAULT_RESERVATION_RECONCILE_DELAYS, start=1):
+            elapsed = time.monotonic() - started_at
+            wait_seconds = max(scheduled_delay - elapsed, 0.0)
+            if not self._sleep_before_reconciliation(wait_seconds):
+                outcome = "deadline_expired"
+                self.log_event(
+                    "reservation_reconcile_snapshot",
+                    label=reservation_label,
+                    hour=candidate["hour"],
+                    court=candidate["court_id"],
+                    attempt=attempt,
+                    outcome=outcome,
+                    order_count=0,
+                    scheduled_delay_ms=round(scheduled_delay * 1000),
+                )
+                break
+
+            query_timeout = DEFAULT_RESERVATION_RECONCILE_TIMEOUT
+            remaining = self._remaining_direct_budget()
+            if remaining is not None:
+                query_timeout = min(query_timeout, remaining)
+            if query_timeout <= 0:
+                outcome = "deadline_expired"
+                break
+
+            result = request_client.request(
+                "GET",
+                "/place/getPlaceOrder",
+                params={
+                    "pageNo": 0,
+                    "pageSize": 20,
+                    "shopNum": SHOP_NUM,
+                    "token": self.args.token,
+                },
+                timeout=query_timeout,
+                label=f"{reservation_label}_reconcile_getPlaceOrder_{attempt}",
+                retry_transport=False,
+            )
+            orders = result.json_data.get("data") if self._response_success(result) else None
+            if not isinstance(orders, list):
+                outcome = "query_failed"
+                order_count = 0
+            else:
+                successful_snapshots += 1
+                order_count = len(orders)
+                outcome = (
+                    "confirmed"
+                    if any(self._order_matches_candidate(order, candidate) for order in orders)
+                    else "not_found"
+                )
+            remaining = self._remaining_direct_budget()
             self.log_event(
-                "reservation_reconcile_result",
+                "reservation_reconcile_snapshot",
                 label=reservation_label,
                 hour=candidate["hour"],
                 court=candidate["court_id"],
+                attempt=attempt,
                 outcome=outcome,
-                order_count=0,
+                order_count=order_count,
+                scheduled_delay_ms=round(scheduled_delay * 1000),
+                query_elapsed_ms=round(result.elapsed * 1000),
+                query_status=result.status,
+                remaining_ms=None if remaining is None else max(round(remaining * 1000), 0),
             )
-            return outcome
-
-        query_timeout = DEFAULT_RESERVATION_RECONCILE_TIMEOUT
-        remaining = self._remaining_direct_budget()
-        if remaining is not None:
-            query_timeout = min(query_timeout, remaining)
-        if query_timeout <= 0:
-            return "deadline_expired"
-
-        result = request_client.request(
-            "GET",
-            "/place/getPlaceOrder",
-            params={
-                "pageNo": 0,
-                "pageSize": 20,
-                "shopNum": SHOP_NUM,
-                "token": self.args.token,
-                "startTime": self.target_date,
-                "endTime": self.target_date,
-            },
-            timeout=query_timeout,
-            label=f"{reservation_label}_reconcile_getPlaceOrder",
-            retry_transport=False,
-        )
-        orders = result.json_data.get("data") if self._response_success(result) else None
-        if not isinstance(orders, list):
-            outcome = "query_failed"
-            order_count = 0
+            if outcome in ("confirmed", "query_failed"):
+                break
         else:
-            order_count = len(orders)
-            outcome = (
-                "confirmed"
-                if any(self._order_matches_candidate(order, candidate) for order in orders)
-                else "not_found"
-            )
+            outcome = "stable_not_found"
+
         self.log_event(
             "reservation_reconcile_result",
             label=reservation_label,
             hour=candidate["hour"],
             court=candidate["court_id"],
             outcome=outcome,
-            order_count=order_count,
+            successful_snapshots=successful_snapshots,
+            attempts=attempt,
+            elapsed_ms=round((time.monotonic() - started_at) * 1000),
         )
         return outcome
 
@@ -2323,6 +2379,7 @@ class SmartBookingBotV2:
             self.args.reservation_place_fast_retry_gap,
             logger=self.logger,
             required_hours=self.target_duration,
+            success_gap_seconds=DEFAULT_RESERVATION_PLACE_SUCCESS_GAP,
         )
         self.log_event(
             "direct_scheduler_start",
