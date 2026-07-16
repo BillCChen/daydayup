@@ -383,6 +383,17 @@ class MultiPoolHistoryTest(unittest.TestCase):
 
 
 class MultiPoolFrontendSafetyTest(unittest.TestCase):
+    def test_user_management_panel_has_a_targeted_visible_override(self):
+        root = Path(web_console.ROOT)
+        html = (root / "web" / "index.html").read_text(encoding="utf-8")
+        css = (root / "web" / "styles.css").read_text(encoding="utf-8")
+        compact_rules = css.split("/* Compact console workspace */", 1)[1]
+
+        self.assertIn('class="panel user-panel utility-panel" id="users"', html)
+        self.assertNotIn('id="users" hidden', html)
+        self.assertIn(".utility-panel,", compact_rules)
+        self.assertIn("#users.utility-panel {\n  display: block !important;\n}", compact_rules)
+
     def test_token_password_is_ephemeral_and_new_password_autocomplete(self):
         root = Path(web_console.ROOT)
         html = (root / "web" / "index.html").read_text(encoding="utf-8")

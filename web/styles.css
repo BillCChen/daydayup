@@ -1994,6 +1994,10 @@ body.modal-open {
   display: none !important;
 }
 
+#users.utility-panel {
+  display: block !important;
+}
+
 .shell {
   display: block;
   min-height: 100vh;
