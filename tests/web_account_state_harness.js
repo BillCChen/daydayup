@@ -100,6 +100,41 @@ async function main() {
   const source = fs.readFileSync(appPath, "utf8").split("els.authForm.addEventListener", 1)[0];
   const testProgram = `
     (async () => {
+      state.multiPoolMode = "live";
+      state.users = [
+        {
+          key: "shared_1",
+          label: "Shared 1",
+          enabled: true,
+          credential_conflict: true,
+          credential_conflicts_with: ["shared_2"],
+        },
+        {
+          key: "shared_2",
+          label: "Shared 2",
+          enabled: true,
+          credential_conflict: true,
+          credential_conflicts_with: ["shared_1"],
+        },
+      ];
+      state.selectedUserKey = "shared_1";
+      renderUsers();
+      renderBookings([{
+        bill_num: "synthetic-bill",
+        date: "2099-07-20",
+        time_range: "18:00-19:00",
+        court: "Court 7",
+      }]);
+      if (!els.userSelect.innerHTML.includes("共享授权") || !els.activeUserLabel.textContent.includes("授权冲突")) {
+        throw new Error("shared-credential account marker was not rendered");
+      }
+      if (!els.bookingList.innerHTML.includes("共享授权数据") || !els.bookingList.innerHTML.includes("无法按页面用户拆分")) {
+        throw new Error("shared active-booking warning was not rendered");
+      }
+      if (!els.multiPoolEnabled.disabled || !els.multiPoolSecondaryUser.innerHTML.includes("共享授权，不可用")) {
+        throw new Error("shared-credential secondary account remained available for multi-pool");
+      }
+
       state.users = [
         { key: "old_user", label: "Old", enabled: true },
         { key: "new_user", label: "New", enabled: true },

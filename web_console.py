@@ -1867,7 +1867,7 @@ class WebConsole:
         users = self.users.list_users()
         default_user = self.users.get_user("")
         return {
-            "users": [serialize_user(user) for user in users],
+            "users": serialize_users(users),
             "default_user_key": default_user.key,
             "multi_pool_mode": configured_multi_pool_mode(),
             "updated_at": time.time(),
@@ -1884,7 +1884,7 @@ class WebConsole:
         if not self.users.verify_admin(admin_password):
             raise EasySerpAuthError("invalid admin password")
         user = self.users.upsert_user(payload)
-        return {"user": serialize_user(user), "users": [serialize_user(item) for item in self.users.list_users()]}
+        return {"user": serialize_user(user), "users": serialize_users(self.users.list_users())}
 
     def token_auth_url(self, payload: dict[str, Any]) -> dict[str, Any]:
         admin_password = clean_string(payload.get("admin_password"))
@@ -2497,6 +2497,21 @@ def serialize_user(user: UserAccount) -> dict[str, Any]:
             "jsessionid": credential_state(user.jsessionid),
         },
     }
+
+
+def serialize_users(users: list[UserAccount]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for user in users:
+        conflicts = [
+            other.key
+            for other in users
+            if other.key != user.key and user.token and other.token == user.token
+        ]
+        serialized = serialize_user(user)
+        serialized["credential_conflict"] = bool(conflicts)
+        serialized["credential_conflicts_with"] = conflicts
+        result.append(serialized)
+    return result
 
 
 def serialize_card(card: dict[str, Any]) -> dict[str, Any]:

@@ -585,11 +585,14 @@ async function loadUsers() {
 function renderUsers() {
   els.userSelect.innerHTML = state.users.map((user) => `
     <option value="${escapeAttr(user.key)}" ${user.key === state.selectedUserKey ? "selected" : ""}>
-      ${escapeHtml(user.label)}
+      ${escapeHtml(user.label)}${user.credential_conflict ? "（共享授权）" : ""}
     </option>
   `).join("");
   const current = currentUser();
-  els.activeUserLabel.textContent = current ? current.label : "未选择";
+  els.activeUserLabel.textContent = current
+    ? `${current.label}${current.credential_conflict ? " · 授权冲突" : ""}`
+    : "未选择";
+  els.activeUserLabel.className = `chip${current?.credential_conflict ? " warning" : ""}`;
   renderMultiPoolControl();
   renderUserManagementLock();
 }
@@ -600,22 +603,24 @@ function renderMultiPoolControl() {
   }
   const enabledUsers = state.users.filter((user) => user.enabled);
   const secondaryUsers = enabledUsers.filter((user) => user.key !== state.selectedUserKey);
+  const primaryUser = enabledUsers.find((user) => user.key === state.selectedUserKey) || null;
+  const eligibleSecondaryUsers = secondaryUsers.filter((user) => !usersShareCredential(primaryUser, user));
   const primaryEnabled = enabledUsers.some((user) => user.key === state.selectedUserKey);
   const durationSupported = formValue(els.bookingForm, "duration", "2") === "2";
   const bookingMode = formValue(els.bookingForm, "booking_mode", "direct-fast");
   const bookingModeSupported = ["direct-fast", "guided-fast"].includes(bookingMode);
   const available = state.multiPoolMode !== "off"
     && primaryEnabled
-    && enabledUsers.length >= 2
+    && eligibleSecondaryUsers.length >= 1
     && durationSupported
     && bookingModeSupported;
   els.multiPoolOption.hidden = state.multiPoolMode === "off";
-  if (!secondaryUsers.some((user) => user.key === state.secondaryUserKey)) {
-    state.secondaryUserKey = secondaryUsers[0]?.key || "";
+  if (!eligibleSecondaryUsers.some((user) => user.key === state.secondaryUserKey)) {
+    state.secondaryUserKey = eligibleSecondaryUsers[0]?.key || secondaryUsers[0]?.key || "";
   }
   els.multiPoolSecondaryUser.innerHTML = secondaryUsers.map((user) => `
-    <option value="${escapeAttr(user.key)}" ${user.key === state.secondaryUserKey ? "selected" : ""}>
-      ${escapeHtml(user.label)}
+    <option value="${escapeAttr(user.key)}" ${user.key === state.secondaryUserKey ? "selected" : ""} ${usersShareCredential(primaryUser, user) ? "disabled" : ""}>
+      ${escapeHtml(user.label)}${usersShareCredential(primaryUser, user) ? "（共享授权，不可用）" : ""}
     </option>
   `).join("");
   els.multiPoolEnabled.disabled = !available;
@@ -625,6 +630,8 @@ function renderMultiPoolControl() {
   els.multiPoolSecondaryUser.disabled = !available || !els.multiPoolEnabled.checked;
   if (!durationSupported || !bookingModeSupported) {
     els.multiPoolWarning.textContent = "双账号组合预约只支持 2 小时快速直抢或快速引导。";
+  } else if (secondaryUsers.length && !eligibleSecondaryUsers.length) {
+    els.multiPoolWarning.textContent = "两个用户共享同一微信授权，无法作为独立账号组合预约。请用另一个微信身份重新授权。";
   } else if (state.multiPoolMode === "dry_run") {
     els.multiPoolWarning.textContent = "服务器当前为演练模式：两个账号只查询候选，不会提交订单。";
   } else if (!available) {
@@ -636,6 +643,14 @@ function renderMultiPoolControl() {
 
 function currentUser() {
   return state.users.find((user) => user.key === state.selectedUserKey) || null;
+}
+
+function usersShareCredential(left, right) {
+  if (!left || !right) {
+    return false;
+  }
+  return Array.isArray(left.credential_conflicts_with)
+    && left.credential_conflicts_with.includes(right.key);
 }
 
 function renderUserManagementLock() {
@@ -718,8 +733,11 @@ async function loadBookings() {
 
 function renderBookings(bookings) {
   const sortedBookings = sortBookingsByStart(bookings || []).filter(isUpcomingBooking);
+  const credentialWarning = currentUser()?.credential_conflict
+    ? `<div class="account-credential-warning" role="alert"><strong>共享授权数据</strong><span>当前用户与另一用户使用同一微信 Token，以下预约来自同一个上游账号，无法按页面用户拆分。</span></div>`
+    : "";
   if (!sortedBookings.length) {
-    els.bookingList.innerHTML = `<div class="empty-state compact">没有活跃预约</div>`;
+    els.bookingList.innerHTML = `${credentialWarning}<div class="empty-state compact">没有活跃预约</div>`;
     return;
   }
 
@@ -729,6 +747,7 @@ function renderBookings(bookings) {
     : "";
 
   els.bookingList.innerHTML = `
+    ${credentialWarning}
     <div class="active-booking-grid">
       ${visibleBookings.map((booking) => {
     const refundState = bookingRefundState(booking);

@@ -28,6 +28,9 @@ class FakeUserStore:
     def __init__(self, users):
         self.users = list(users)
 
+    def list_users(self):
+        return list(self.users)
+
     def get_user(self, user_key=""):
         enabled = [user for user in self.users if user.enabled]
         if not user_key:
@@ -222,6 +225,19 @@ class MultiPoolStartTest(unittest.TestCase):
             with self.assertRaisesRegex(web_console.EasySerpError, "distinct account tokens"):
                 console.start_booking(self.payload())
         self.assertEqual(console.jobs.calls, [])
+
+    def test_user_list_marks_shared_credentials_without_exposing_tokens(self):
+        console = self.make_console()
+        console.users = FakeUserStore(
+            [make_user("user_1", token="shared-token"), make_user("user_2", token="shared-token")]
+        )
+
+        users = console.user_list()["users"]
+
+        self.assertEqual(users[0]["credential_conflicts_with"], ["user_2"])
+        self.assertEqual(users[1]["credential_conflicts_with"], ["user_1"])
+        self.assertTrue(all(user["credential_conflict"] for user in users))
+        self.assertTrue(all("token" not in user for user in users))
 
     def test_disabled_or_unknown_account_fails_before_process_start(self):
         console = self.make_console()
@@ -458,6 +474,9 @@ class MultiPoolFrontendSafetyTest(unittest.TestCase):
         self.assertIn('showAvailabilityWarning(`${removedCount} 个已选场地已失效，已从选择中移除`)', javascript)
         self.assertIn('className = `chip availability-refresh-state ${tone}`.trim()', javascript)
         self.assertIn('setUserSaveMessage(`保存失败: ${error.message}`, "danger-text")', javascript)
+        self.assertIn("共享授权数据", javascript)
+        self.assertIn("credential_conflicts_with", javascript)
+        self.assertIn("共享同一微信授权，无法作为独立账号组合预约", javascript)
 
     def test_user_management_panel_has_a_targeted_visible_override(self):
         root = Path(web_console.ROOT)

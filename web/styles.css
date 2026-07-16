@@ -215,6 +215,23 @@ button {
   padding: 8px 10px;
 }
 
+.account-credential-warning {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--primary-amber);
+  border-radius: 8px;
+  background: var(--primary-amber-soft);
+  color: var(--text-primary);
+  line-height: 1.4;
+}
+
+.account-credential-warning span {
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+
 .topbar h1,
 .section-head h2,
 .detail-pane h2 {
