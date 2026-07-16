@@ -92,7 +92,7 @@ const els = {
   sessionState: document.querySelector("#sessionState"),
   sessionHelp: document.querySelector("#sessionHelp"),
   sessionHelpWrap: document.querySelector(".status-help"),
-  sessionHelpTrigger: document.querySelector("#sessionHelpTrigger"),
+  sessionHelpTrigger: document.querySelector("#sessionState"),
   lastRefresh: document.querySelector("#lastRefresh"),
   primaryCard: document.querySelector("#primaryCard"),
   otherCards: document.querySelector("#otherCards"),
@@ -475,7 +475,11 @@ async function showApp() {
 }
 
 function setPill(el, text, tone = "") {
-  el.className = `status-pill ${tone}`.trim();
+  el.classList.remove("ok", "warn", "danger");
+  el.classList.add("status-pill");
+  if (tone) {
+    el.classList.add(tone);
+  }
   el.textContent = text;
 }
 
@@ -676,8 +680,10 @@ async function loadStatus() {
     hasSession ? "ok" : "warn",
   );
   els.sessionHelpWrap.classList.toggle("session-ok", hasSession);
-  els.sessionHelpTrigger.hidden = hasSession;
-  els.sessionHelp.hidden = hasSession;
+  els.sessionHelpTrigger.setAttribute(
+    "aria-label",
+    `查看 Session 状态指引，当前${hasSession ? "已传" : "未传"}`,
+  );
   els.sessionHelpTrigger.setAttribute("aria-expanded", "false");
   markConnectivity(true);
   return status;

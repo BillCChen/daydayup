@@ -100,6 +100,12 @@ async function main() {
   const source = fs.readFileSync(appPath, "utf8").split("els.authForm.addEventListener", 1)[0];
   const testProgram = `
     (async () => {
+      els.sessionState.classList.add("status-help-trigger");
+      setPill(els.sessionState, "Session ready", "ok");
+      if (!els.sessionState.classList.contains("status-help-trigger")) {
+        throw new Error("session status refresh removed the help trigger class");
+      }
+
       state.multiPoolMode = "live";
       state.users = [
         {

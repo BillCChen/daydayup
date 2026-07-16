@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -478,16 +479,57 @@ class MultiPoolFrontendSafetyTest(unittest.TestCase):
         self.assertIn("credential_conflicts_with", javascript)
         self.assertIn("共享同一微信授权，无法作为独立账号组合预约", javascript)
 
-    def test_user_management_panel_has_a_targeted_visible_override(self):
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for the visual contract harness")
+    def test_browser_computed_visual_contract(self):
+        root = Path(web_console.ROOT)
+        result = subprocess.run(
+            [shutil.which("node"), str(root / "tests" / "web_visual_contract_harness.js")],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.startswith("SKIP:"):
+            self.skipTest(result.stdout.strip())
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_borderless_semantic_workspace_contract(self):
         root = Path(web_console.ROOT)
         html = (root / "web" / "index.html").read_text(encoding="utf-8")
         css = (root / "web" / "styles.css").read_text(encoding="utf-8")
-        compact_rules = css.split("/* Compact console workspace */", 1)[1]
+        javascript = (root / "web" / "app.js").read_text(encoding="utf-8")
 
         self.assertIn('class="panel user-panel utility-panel" id="users"', html)
         self.assertNotIn('id="users" hidden', html)
-        self.assertIn(".utility-panel,", compact_rules)
-        self.assertIn("#users.utility-panel {\n  display: block !important;\n}", compact_rules)
+        self.assertIn('class="lower-workspace"', html)
+        self.assertIn('class="lower-side"', html)
+        self.assertIn('class="status-pill status-help-trigger"', html)
+        self.assertNotIn('id="sessionHelpTrigger"', html)
+        self.assertNotIn("本地访问密码默认", html)
+        self.assertIn('sessionHelpTrigger: document.querySelector("#sessionState")', javascript)
+        self.assertIn(".utility-panel,", css)
+        self.assertIn("#users.utility-panel {\n  display: block !important;\n}", css)
+        self.assertIn(".topbar {\n  z-index: 10;", css)
+        self.assertIn("overflow: visible;", css)
+        self.assertIn(
+            '.booking-form input:not([type="checkbox"]):not([type="range"]):not([type="hidden"])',
+            css,
+        )
+
+        border_values = re.findall(
+            r"(?<!-)\bborder(?:-(?:top|right|bottom|left))?\s*:\s*([^;}{]+)",
+            css,
+        )
+        self.assertTrue(border_values)
+        self.assertTrue(
+            all(value.strip() in {"0", "none"} for value in border_values),
+            border_values,
+        )
+        for selector in ("#wallet", "#availability", "#scanTasks", "#submit", "#bookingHistory", "#users"):
+            self.assertIn(f"{selector} {{", css)
+        for ambient_selector in ("body::before", "body::after", ".panel::after", ".lower-side::after"):
+            self.assertIn(ambient_selector, css)
 
     def test_token_password_is_ephemeral_and_new_password_autocomplete(self):
         root = Path(web_console.ROOT)

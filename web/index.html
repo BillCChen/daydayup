@@ -16,7 +16,7 @@
           <input name="password" type="password" autocomplete="current-password" required />
         </label>
         <button class="button primary" type="submit">进入</button>
-        <p class="form-note" id="authMessage">本地访问密码默认 abc123；登录 1 小时后自动过期。</p>
+        <p class="form-note" id="authMessage">请输入访问密码；登录 1 小时后自动过期。</p>
       </form>
     </main>
 
@@ -49,11 +49,19 @@
             </div>
             <div class="status-band" aria-label="连接状态">
               <div class="status-help">
-                <div class="status-pill" id="sessionState">Session 检查中</div>
-                <button class="help-dot" id="sessionHelpTrigger" type="button" aria-label="查看 Session 指引" aria-expanded="false" aria-describedby="sessionHelp">?</button>
+                <button
+                  class="status-pill status-help-trigger"
+                  id="sessionState"
+                  type="button"
+                  aria-label="查看 Session 状态指引"
+                  aria-expanded="false"
+                  aria-describedby="sessionHelp"
+                >
+                  Session 检查中
+                </button>
                 <div class="status-popover" id="sessionHelp" role="tooltip">
-                  <strong>为什么会显示 Session 未传</strong>
-                  <p>当前服务没有收到 `DAYDAYUP_JSESSIONID` 或 `-j` 参数，所以请求不会携带登录 Cookie。查询余额和活跃预约通常只需要 Token；正式预约前建议手动登录微信页面，用 Reqable 抓取 Cookie 里的 JSESSIONID，再重启本地服务。</p>
+                  <strong>Session 状态指引</strong>
+                  <p>显示未传或失效时，请重新登录微信页面并更新 JSESSIONID。余额和活跃预约通常只需要 Token；正式预约前建议同时确认 Session 有效。</p>
                 </div>
               </div>
               <div class="status-pill" id="tokenState">Token 检查中</div>
@@ -199,7 +207,8 @@
           </div>
         </section>
 
-        <section class="panel console-row submit-console-row" id="submit" aria-labelledby="submitTitle">
+        <div class="lower-workspace">
+          <section class="panel console-row submit-console-row" id="submit" aria-labelledby="submitTitle">
           <div class="section-label compact-label">
             <div>
               <p class="eyebrow">Submit</p>
@@ -334,112 +343,115 @@
               <button class="button secondary" id="stopJob" type="button">停止任务</button>
             </div>
           </form>
-        </section>
+          </section>
 
-        <section class="panel console-row history-console-row" id="bookingHistory" aria-labelledby="bookingHistoryTitle">
-          <div class="section-label compact-label">
-            <div>
-              <p class="eyebrow">History</p>
-              <h2 id="bookingHistoryTitle">历史预约</h2>
-            </div>
-          </div>
-          <div class="log-window-control hidden-control" data-log-window-control aria-label="历史预约时间窗"></div>
-          <button class="button secondary compact hidden-control" id="refreshBookingHistory" type="button">刷新历史</button>
-          <div class="history-list" id="bookingHistoryList">
-            <div class="empty-state compact">暂无历史预约。</div>
-          </div>
-        </section>
-
-        <section class="panel utility-panel" id="logs" aria-labelledby="logsTitle">
-          <div class="section-head">
-            <div>
-              <p class="eyebrow">Log</p>
-              <h2 id="logsTitle">预约成功/失败日志</h2>
-            </div>
-            <div class="section-actions">
-              <div class="log-window-control" data-log-window-control aria-label="页面日志时间窗"></div>
-              <span class="chip" id="jobState">空闲</span>
-            </div>
-          </div>
-          <div class="log-stream" id="logStream" aria-live="polite"></div>
-        </section>
-
-        <section class="panel user-panel utility-panel" id="users" aria-labelledby="usersTitle">
-          <div class="section-head">
-            <div>
-              <p class="eyebrow">Users</p>
-              <h2 id="usersTitle">用户管理</h2>
-            </div>
-            <div class="user-panel-actions">
-              <span class="chip" id="activeUserLabel">未选择</span>
-              <button class="button secondary compact hidden" id="lockUserPanel" type="button">锁定</button>
-            </div>
-          </div>
-          <form class="user-unlock" id="userUnlockForm">
-            <label>
-              <span>管理密码</span>
-              <input name="admin_password" type="password" autocomplete="current-password" required />
-            </label>
-            <button class="button secondary" type="submit">进入管理</button>
-          </form>
-          <form class="user-form hidden" id="userForm">
-            <label>
-              <span>用户标识</span>
-              <input name="key" type="text" autocomplete="off" placeholder="friend_1" required />
-            </label>
-            <label>
-              <span>用户名称</span>
-              <input name="label" type="text" autocomplete="off" required />
-            </label>
-            <div class="token-helper">
-              <div class="token-helper-head">
+          <div class="lower-side">
+            <section class="panel console-row history-console-row" id="bookingHistory" aria-labelledby="bookingHistoryTitle">
+              <div class="section-label compact-label">
                 <div>
-                  <strong>获取个人 Token</strong>
-                  <p>复制授权链接到电脑微信打开，把跳转后的地址粘回这里。</p>
+                  <p class="eyebrow">History</p>
+                  <h2 id="bookingHistoryTitle">历史预约</h2>
                 </div>
-                <button class="button secondary compact" id="copyTokenAuthUrl" type="button">复制链接</button>
               </div>
-              <div class="token-helper-grid">
+              <div class="log-window-control hidden-control" data-log-window-control aria-label="历史预约时间窗"></div>
+              <button class="button secondary compact hidden-control" id="refreshBookingHistory" type="button">刷新历史</button>
+              <div class="history-list" id="bookingHistoryList">
+                <div class="empty-state compact">暂无历史预约。</div>
+              </div>
+            </section>
+
+            <section class="panel utility-panel" id="logs" aria-labelledby="logsTitle">
+              <div class="section-head">
+                <div>
+                  <p class="eyebrow">Log</p>
+                  <h2 id="logsTitle">预约成功/失败日志</h2>
+                </div>
+                <div class="section-actions">
+                  <div class="log-window-control" data-log-window-control aria-label="页面日志时间窗"></div>
+                  <span class="chip" id="jobState">空闲</span>
+                </div>
+              </div>
+              <div class="log-stream" id="logStream" aria-live="polite"></div>
+            </section>
+
+            <section class="panel user-panel utility-panel" id="users" aria-labelledby="usersTitle">
+              <div class="section-head">
+                <div>
+                  <p class="eyebrow">Users</p>
+                  <h2 id="usersTitle">用户管理</h2>
+                </div>
+                <div class="user-panel-actions">
+                  <span class="chip" id="activeUserLabel">未选择</span>
+                  <button class="button secondary compact hidden" id="lockUserPanel" type="button">锁定</button>
+                </div>
+              </div>
+              <form class="user-unlock" id="userUnlockForm">
                 <label>
-                  <span>账号</span>
-                  <input name="token_username" type="text" autocomplete="username" />
+                  <span>管理密码</span>
+                  <input name="admin_password" type="password" autocomplete="current-password" required />
+                </label>
+                <button class="button secondary" type="submit">进入管理</button>
+              </form>
+              <form class="user-form hidden" id="userForm">
+                <label>
+                  <span>用户标识</span>
+                  <input name="key" type="text" autocomplete="off" placeholder="friend_1" required />
                 </label>
                 <label>
-                  <span>密码</span>
-                  <input name="token_password" type="password" autocomplete="new-password" />
+                  <span>用户名称</span>
+                  <input name="label" type="text" autocomplete="off" required />
                 </label>
-              </div>
-              <label>
-                <span>微信跳转地址</span>
-                <input name="token_redirect_url" type="url" autocomplete="off" placeholder="https://www.147soft.cn/easyserp/index.html?code=..." />
-              </label>
-              <div class="token-helper-actions">
-                <button class="button primary" id="exchangeToken" type="button">兑换并填入 Token</button>
-                <span class="form-note" id="tokenHelperMessage">不会保存账号密码。</span>
-              </div>
-            </div>
-            <label>
-              <span>Token</span>
-              <input name="token" type="password" autocomplete="off" required />
-            </label>
-            <label>
-              <span>Session</span>
-              <input name="jsessionid" type="password" autocomplete="off" />
-            </label>
-            <label>
-              <span>卡名称</span>
-              <input name="card_name" type="text" autocomplete="off" placeholder="学生球类卡" required />
-            </label>
-            <label class="checkline">
-              <input name="enabled" type="checkbox" checked />
-              <span>启用</span>
-            </label>
-            <div class="user-save-actions">
-              <button class="button secondary" type="submit">保存用户</button>
-              <span class="form-note" id="userSaveMessage" role="status" aria-live="polite"></span>
-            </div>
-          </form>
-        </section>
+                <div class="token-helper">
+                  <div class="token-helper-head">
+                    <div>
+                      <strong>获取个人 Token</strong>
+                      <p>复制授权链接到电脑微信打开，把跳转后的地址粘回这里。</p>
+                    </div>
+                    <button class="button secondary compact" id="copyTokenAuthUrl" type="button">复制链接</button>
+                  </div>
+                  <div class="token-helper-grid">
+                    <label>
+                      <span>账号</span>
+                      <input name="token_username" type="text" autocomplete="username" />
+                    </label>
+                    <label>
+                      <span>密码</span>
+                      <input name="token_password" type="password" autocomplete="new-password" />
+                    </label>
+                  </div>
+                  <label>
+                    <span>微信跳转地址</span>
+                    <input name="token_redirect_url" type="url" autocomplete="off" placeholder="https://www.147soft.cn/easyserp/index.html?code=..." />
+                  </label>
+                  <div class="token-helper-actions">
+                    <button class="button primary" id="exchangeToken" type="button">兑换并填入 Token</button>
+                    <span class="form-note" id="tokenHelperMessage">不会保存账号密码。</span>
+                  </div>
+                </div>
+                <label>
+                  <span>Token</span>
+                  <input name="token" type="password" autocomplete="off" required />
+                </label>
+                <label>
+                  <span>Session</span>
+                  <input name="jsessionid" type="password" autocomplete="off" />
+                </label>
+                <label>
+                  <span>卡名称</span>
+                  <input name="card_name" type="text" autocomplete="off" placeholder="学生球类卡" required />
+                </label>
+                <label class="checkline">
+                  <input name="enabled" type="checkbox" checked />
+                  <span>启用</span>
+                </label>
+                <div class="user-save-actions">
+                  <button class="button secondary" type="submit">保存用户</button>
+                  <span class="form-note" id="userSaveMessage" role="status" aria-live="polite"></span>
+                </div>
+              </form>
+            </section>
+          </div>
+        </div>
       </main>
 
       <aside class="detail-pane" id="detailPane" aria-labelledby="detailTitle">
