@@ -261,6 +261,7 @@ class UserStore:
                         jsessionid = clean_string(row.get("jsessionid"))
                     if not token:
                         raise EasySerpError("token is required")
+                    self._assert_unique_token(rows, key, token)
                     row.update(
                         {
                             "label": label,
@@ -276,6 +277,7 @@ class UserStore:
             if not updated:
                 if not token:
                     raise EasySerpError("token is required")
+                self._assert_unique_token(rows, key, token)
                 rows.append(
                     {
                         "type": "user",
@@ -291,6 +293,14 @@ class UserStore:
                 saved_row = dict(rows[-1])
             self._write_rows_unlocked(rows)
         return self._row_to_account(saved_row or {})
+
+    @staticmethod
+    def _assert_unique_token(rows: list[dict[str, str]], key: str, token: str) -> None:
+        for row in rows:
+            if row.get("type") != "user" or clean_string(row.get("key")) == key:
+                continue
+            if clean_string(row.get("token")) == token:
+                raise EasySerpError("token is already used by another user; authorize with a different WeChat identity")
 
     def _read_rows_unlocked(self) -> list[dict[str, str]]:
         if not self.path.exists():
@@ -2156,12 +2166,14 @@ class WebConsole:
         users = self.users.get_users(payload.get("user_keys"))
         if len(users) != 2:
             raise EasySerpError("multi-pool booking requires two different enabled users")
+        if any(not user.token for user in users):
+            raise EasySerpError("token is required for every multi-pool account")
+        if len({user.token for user in users}) != 2:
+            raise EasySerpError("multi-pool booking requires two distinct account tokens")
         required_balance = multi_pool_required_balance(payload)
         accounts: list[tuple[UserAccount, str]] = []
         masked_cards: list[dict[str, Any]] = []
         for user in users:
-            if not user.token:
-                raise EasySerpError("token is required for every multi-pool account")
             card = self.resolve_booking_card(user)
             card_index = clean_string(card.get("card_index_raw"))
             if not card_index:

@@ -100,6 +100,7 @@
               <p class="eyebrow">Availability</p>
               <h2 id="availabilityTitle">可约分布</h2>
             </div>
+            <span class="chip availability-refresh-state" id="availabilityRefreshState" role="status" aria-live="polite">等待刷新</span>
           </div>
           <div class="availability-list" id="availabilityList">
             <div class="empty-state compact">等待可约分布刷新。</div>
@@ -433,7 +434,10 @@
               <input name="enabled" type="checkbox" checked />
               <span>启用</span>
             </label>
-            <button class="button secondary" type="submit">保存用户</button>
+            <div class="user-save-actions">
+              <button class="button secondary" type="submit">保存用户</button>
+              <span class="form-note" id="userSaveMessage" role="status" aria-live="polite"></span>
+            </div>
           </form>
         </section>
       </main>

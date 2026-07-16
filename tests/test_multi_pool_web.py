@@ -1,6 +1,8 @@
 import json
 import os
+import shutil
 import stat
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -119,6 +121,24 @@ class MultiPoolUserStoreTest(unittest.TestCase):
             store.ensure_exists()
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
+    def test_duplicate_token_is_rejected_without_writing_a_second_user(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "users.csv"
+            store = web_console.UserStore(path, default_token="shared-token", default_jsessionid="")
+
+            with self.assertRaisesRegex(web_console.EasySerpError, "different WeChat identity"):
+                store.upsert_user(
+                    {
+                        "key": "user_2",
+                        "label": "User 2",
+                        "token": "shared-token",
+                        "card_name": "学生球类卡",
+                        "enabled": True,
+                    }
+                )
+
+            self.assertEqual(len(store.list_users()), 1)
+
 
 class MultiPoolStartTest(unittest.TestCase):
     def make_console(self):
@@ -180,6 +200,26 @@ class MultiPoolStartTest(unittest.TestCase):
         console.users = FakeUserStore([make_user("user_1"), make_user("user_2", token="")])
         with mock.patch.dict(os.environ, {"DAYDAYUP_MULTI_POOL_MODE": "live"}, clear=False):
             with self.assertRaisesRegex(web_console.EasySerpError, "token"):
+                console.start_booking(self.payload())
+        self.assertEqual(console.jobs.calls, [])
+
+    def test_two_missing_tokens_report_missing_token_before_card_preflight(self):
+        console = self.make_console()
+        console.users = FakeUserStore(
+            [make_user("user_1", token=""), make_user("user_2", token="")]
+        )
+        with mock.patch.dict(os.environ, {"DAYDAYUP_MULTI_POOL_MODE": "live"}, clear=False):
+            with self.assertRaisesRegex(web_console.EasySerpError, "token is required"):
+                console.start_booking(self.payload())
+        self.assertEqual(console.jobs.calls, [])
+
+    def test_duplicate_account_tokens_fail_before_card_preflight(self):
+        console = self.make_console()
+        console.users = FakeUserStore(
+            [make_user("user_1", token="shared-token"), make_user("user_2", token="shared-token")]
+        )
+        with mock.patch.dict(os.environ, {"DAYDAYUP_MULTI_POOL_MODE": "live"}, clear=False):
+            with self.assertRaisesRegex(web_console.EasySerpError, "distinct account tokens"):
                 console.start_booking(self.payload())
         self.assertEqual(console.jobs.calls, [])
 
@@ -383,6 +423,42 @@ class MultiPoolHistoryTest(unittest.TestCase):
 
 
 class MultiPoolFrontendSafetyTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for the frontend state harness")
+    def test_account_scoped_runtime_state_harness(self):
+        root = Path(web_console.ROOT)
+        result = subprocess.run(
+            [shutil.which("node"), str(root / "tests" / "web_account_state_harness.js")],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_account_switch_discards_stale_responses_and_exposes_availability_freshness(self):
+        root = Path(web_console.ROOT)
+        html = (root / "web" / "index.html").read_text(encoding="utf-8")
+        javascript = (root / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="availabilityRefreshState" role="status" aria-live="polite"', html)
+        self.assertIn('id="userSaveMessage" role="status" aria-live="polite"', html)
+        for function_name in ("loadStatus", "loadCards", "loadBookings", "loadBookingHistory", "loadScanTasks"):
+            body = javascript.split(f"async function {function_name}()", 1)[1].split("\n}", 1)[0]
+            self.assertIn("const requestUserKey = state.selectedUserKey;", body)
+            self.assertIn("if (!isCurrentUserRequest(requestUserKey))", body)
+
+        change_user = javascript.split("async function changeUser()", 1)[1].split("function showAccountDataLoading()", 1)[0]
+        self.assertIn("showAccountDataLoading();", change_user)
+        self.assertIn("await triggerRefresh({ includeUsers: false, force: true });", change_user)
+        save_user = javascript.split("async function saveUser(event)", 1)[1].split("function setTokenHelperMessage", 1)[0]
+        self.assertIn("if (previousUserKey !== state.selectedUserKey)", save_user)
+        self.assertIn("showAccountDataLoading();", save_user)
+        self.assertIn('setAvailabilityRefreshState(`${fmtTime(updatedAt)} 已更新`, "success")', javascript)
+        self.assertIn('showAvailabilityWarning(`${removedCount} 个已选场地已失效，已从选择中移除`)', javascript)
+        self.assertIn('className = `chip availability-refresh-state ${tone}`.trim()', javascript)
+        self.assertIn('setUserSaveMessage(`保存失败: ${error.message}`, "danger-text")', javascript)
+
     def test_user_management_panel_has_a_targeted_visible_override(self):
         root = Path(web_console.ROOT)
         html = (root / "web" / "index.html").read_text(encoding="utf-8")

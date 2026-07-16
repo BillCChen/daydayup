@@ -103,6 +103,11 @@ button {
   color: var(--danger-red);
 }
 
+.user-save-actions {
+  display: grid;
+  gap: 8px;
+}
+
 .rail {
   display: none;
 }
@@ -2125,6 +2130,19 @@ body.modal-open {
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 6px;
   overflow: visible;
+}
+
+.availability-row.is-refreshing .availability-list,
+.availability-row.is-refreshing .availability-combos,
+.availability-row.is-refreshing .availability-selection {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+.availability-refresh-state {
+  align-self: end;
+  justify-self: start;
+  white-space: nowrap;
 }
 
 .view-detail-group {
