@@ -70,7 +70,7 @@
           </div>
           <div class="topbar-actions">
             <label class="user-select">
-              <span>用户</span>
+              <span>操作账号</span>
               <select id="userSelect"></select>
             </label>
             <button class="button secondary compact" id="refreshAll" type="button">刷新</button>
@@ -82,24 +82,22 @@
         <section class="panel console-row wallet-active-row" id="wallet" aria-labelledby="walletTitle">
           <div class="section-label compact-label">
             <div>
-              <p class="eyebrow">Wallet</p>
-              <h2 id="walletTitle">卡余额</h2>
+              <p class="eyebrow">Accounts</p>
+              <h2 id="walletTitle">账号概览</h2>
             </div>
           </div>
-          <div class="balance-block" id="primaryCard">
-            <span class="skeleton wide"></span>
-            <span class="skeleton"></span>
+          <div class="account-overview" id="accountOverview" role="list" aria-live="polite">
+            <article class="account-lane is-loading" role="listitem">
+              <span class="skeleton wide"></span>
+              <span class="skeleton"></span>
+            </article>
+            <article class="account-lane is-loading" role="listitem">
+              <span class="skeleton wide"></span>
+              <span class="skeleton"></span>
+            </article>
           </div>
           <button class="button secondary compact hidden-control" id="refreshCards" type="button">刷新余额</button>
-          <div class="section-label compact-label active-label" aria-labelledby="bookingsTitle">
-            <div>
-              <p class="eyebrow">Active</p>
-              <h2 id="bookingsTitle">活跃预约</h2>
-            </div>
-          </div>
-          <div class="booking-list" id="bookingList"></div>
           <button class="button secondary compact hidden-control" id="refreshBookings" type="button">刷新活跃</button>
-          <div id="otherCards" class="mini-list hidden-control"></div>
         </section>
 
         <section class="panel console-row availability-row" id="availability" aria-labelledby="availabilityTitle">

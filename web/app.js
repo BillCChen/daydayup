@@ -20,6 +20,7 @@ const state = {
   cancelDialogPreview: null,
   cancelDialogError: "",
   cancelDialogLoading: false,
+  cancelDialogSubmitting: false,
   historyDetailId: "",
   cards: [],
   startHour: 17,
@@ -37,6 +38,10 @@ const state = {
   viewMode: "default",
   users: [],
   selectedUserKey: "",
+  primaryUserKey: "",
+  secondaryAccountUserKey: "",
+  accountSnapshots: {},
+  accountBookingsExpanded: {},
   multiPoolMode: "off",
   secondaryUserKey: "",
   userManagementUnlocked: false,
@@ -94,9 +99,7 @@ const els = {
   sessionHelpWrap: document.querySelector(".status-help"),
   sessionHelpTrigger: document.querySelector("#sessionState"),
   lastRefresh: document.querySelector("#lastRefresh"),
-  primaryCard: document.querySelector("#primaryCard"),
-  otherCards: document.querySelector("#otherCards"),
-  bookingList: document.querySelector("#bookingList"),
+  accountOverview: document.querySelector("#accountOverview"),
   refreshBookings: document.querySelector("#refreshBookings"),
   availabilitySection: document.querySelector("#availability"),
   scanAvailability: document.querySelector("#scanAvailability"),
@@ -324,6 +327,9 @@ function shouldRefreshAvailability(force = false) {
 }
 
 async function refreshAvailabilityIfDue({ force = false } = {}) {
+  if (state.exactBookingLoading) {
+    return null;
+  }
   if (!shouldRefreshAvailability(force)) {
     return null;
   }
@@ -341,9 +347,7 @@ async function refreshLiveData({ force = false } = {}) {
   state.refreshInFlight = true;
   try {
     const operations = [
-      ["status", loadStatus()],
-      ["cards", loadCards()],
-      ["bookings", loadBookings()],
+      ["accounts", loadAllAccountOverviews()],
       ["history", loadBookingHistory()],
       ["scan_tasks", loadScanTasks()],
       ["job", loadJob()],
@@ -390,28 +394,15 @@ async function triggerRefresh({ includeUsers = false, force = false } = {}) {
 function renderAccountRefreshFailures(failures) {
   const names = new Set(failures.map((item) => item.name));
   const labels = {
-    status: "凭据状态",
-    cards: "卡余额",
-    bookings: "活跃预约",
+    accounts: "账号状态",
     history: "预约历史",
     scan_tasks: "扫描任务",
     job: "任务状态",
     availability: "可约分布",
   };
-  if (names.has("status")) {
-    setPill(els.tokenState, "Token 检查失败", "danger");
-    setPill(els.sessionState, "Session 检查失败", "danger");
-  }
-  if (names.has("cards")) {
-    state.cards = [];
-    state.primaryCard = null;
-    els.primaryCard.innerHTML = `<div class="empty-state">卡余额刷新失败</div>`;
-    els.otherCards.innerHTML = "";
-    renderAvailabilityTools();
-  }
-  if (names.has("bookings")) {
-    state.bookings = [];
-    els.bookingList.innerHTML = `<div class="empty-state compact">活跃预约刷新失败</div>`;
+  if (names.has("accounts")) {
+    renderSelectedCredentialStatus();
+    renderAccountOverview();
   }
   if (names.has("history")) {
     state.bookingHistory = [];
@@ -575,30 +566,112 @@ async function loadUsers() {
   const data = await api("/api/users");
   state.users = data.users || [];
   state.multiPoolMode = ["off", "dry_run", "live"].includes(data.multi_pool_mode) ? data.multi_pool_mode : "off";
+  state.primaryUserKey = data.primary_user_key || data.default_user_key || state.users.find((user) => user.enabled)?.key || "";
+  state.secondaryAccountUserKey = data.secondary_user_key || state.users.find((user) => user.enabled && user.key !== state.primaryUserKey)?.key || "";
   const previousUserKey = state.selectedUserKey;
   if (!state.selectedUserKey || !state.users.some((user) => user.key === state.selectedUserKey)) {
-    state.selectedUserKey = data.default_user_key || state.users[0]?.key || "";
+    state.selectedUserKey = state.primaryUserKey;
   }
   if (previousUserKey !== state.selectedUserKey) {
     clearRefreshStamps();
   }
   renderUsers();
+  renderAccountOverview();
   return data;
 }
 
+function accountDisplayUsers() {
+  const enabledUsers = state.users.filter((user) => user.enabled);
+  const primary = enabledUsers.find((user) => user.key === state.primaryUserKey) || enabledUsers[0] || null;
+  const secondaryKey = state.secondaryAccountUserKey || state.secondaryUserKey;
+  const secondary = enabledUsers.find((user) => user.key === secondaryKey && user.key !== primary?.key)
+    || enabledUsers.find((user) => user.key !== primary?.key)
+    || null;
+  return [primary, secondary].filter(Boolean);
+}
+
+function accountRoleLabel(userKey) {
+  const secondaryRoleKey = state.secondaryAccountUserKey || state.secondaryUserKey;
+  return userKey === state.primaryUserKey ? "主账号" : userKey === secondaryRoleKey ? "辅账号" : "账号";
+}
+
+function ensureAccountSnapshot(userKey) {
+  if (!userKey) {
+    return null;
+  }
+  if (!state.accountSnapshots[userKey]) {
+    state.accountSnapshots[userKey] = {
+      status: null,
+      cards: [],
+      primaryCard: null,
+      bookings: [],
+      errors: {},
+      loading: true,
+      updatedAt: 0,
+    };
+  }
+  return state.accountSnapshots[userKey];
+}
+
+function selectedAccountSnapshot() {
+  return ensureAccountSnapshot(state.selectedUserKey);
+}
+
+function snapshotCredentials(user, snapshot) {
+  return snapshot?.status || user?.credential_status || {};
+}
+
+function renderSelectedCredentialStatus() {
+  const user = currentUser();
+  const snapshot = selectedAccountSnapshot();
+  const credentials = snapshotCredentials(user, snapshot);
+  const tokenState = credentials.token || {};
+  const sessionState = credentials.jsessionid || {};
+  const hasStatus = Boolean(snapshot?.status || user?.credential_status);
+  const hasSession = Boolean(sessionState.present);
+  setPill(
+    els.tokenState,
+    hasStatus ? (tokenState.present ? "Token ✅" : "Token ❌") : "Token 检查中",
+    hasStatus ? (tokenState.present ? "ok" : "danger") : "warning",
+  );
+  setPill(
+    els.sessionState,
+    hasStatus ? (hasSession ? "Session ✅" : "Session ❌") : "Session 检查中",
+    hasStatus ? (hasSession ? "ok" : "warn") : "warning",
+  );
+  els.sessionHelpWrap.classList.toggle("session-ok", hasSession);
+  els.sessionHelpTrigger.setAttribute(
+    "aria-label",
+    `查看 Session 状态指引，当前${hasSession ? "已传" : "未传"}`,
+  );
+  els.sessionHelpTrigger.setAttribute("aria-expanded", "false");
+}
+
+function syncSelectedAccountAliases() {
+  const snapshot = selectedAccountSnapshot();
+  state.cards = snapshot?.cards || [];
+  state.primaryCard = snapshot?.primaryCard || null;
+  state.bookings = snapshot?.bookings || [];
+  renderSelectedCredentialStatus();
+  renderAvailabilityTools();
+  renderViewModeDetails();
+}
+
 function renderUsers() {
+  const secondaryRoleKey = state.secondaryAccountUserKey || state.secondaryUserKey;
   els.userSelect.innerHTML = state.users.map((user) => `
     <option value="${escapeAttr(user.key)}" ${user.key === state.selectedUserKey ? "selected" : ""}>
-      ${escapeHtml(user.label)}${user.credential_conflict ? "（共享授权）" : ""}
+      ${escapeHtml(user.label)}${user.key === state.primaryUserKey ? "（主）" : user.key === secondaryRoleKey ? "（辅）" : ""}${user.credential_conflict ? "（共享授权）" : ""}
     </option>
   `).join("");
   const current = currentUser();
   els.activeUserLabel.textContent = current
-    ? `${current.label}${current.credential_conflict ? " · 授权冲突" : ""}`
+    ? `操作：${current.label}${current.credential_conflict ? " · 授权冲突" : ""}`
     : "未选择";
   els.activeUserLabel.className = `chip${current?.credential_conflict ? " warning" : ""}`;
   renderMultiPoolControl();
   renderUserManagementLock();
+  renderSelectedCredentialStatus();
 }
 
 function renderMultiPoolControl() {
@@ -663,119 +736,171 @@ function renderUserManagementLock() {
   els.lockUserPanel.classList.toggle("hidden", !state.userManagementUnlocked);
 }
 
-async function loadStatus() {
-  const requestUserKey = state.selectedUserKey;
-  const status = await api(userScopedPath("/api/status", requestUserKey));
-  if (!isCurrentUserRequest(requestUserKey)) {
+async function loadStatus(userKey = state.selectedUserKey) {
+  const snapshot = ensureAccountSnapshot(userKey);
+  try {
+    const status = await api(userScopedPath("/api/status", userKey));
+    snapshot.status = status.user?.credential_status || status;
+    delete snapshot.errors.status;
+    snapshot.updatedAt = Date.now();
+    if (userKey === state.selectedUserKey) {
+      renderSelectedCredentialStatus();
+    }
+    renderAccountOverview();
+    markConnectivity(true);
     return status;
+  } catch (error) {
+    snapshot.errors.status = error.message;
+    renderAccountOverview();
+    throw error;
   }
-  const credentials = status.user?.credential_status || status;
-  const tokenState = credentials.token || {};
-  const sessionState = credentials.jsessionid || {};
-  const hasSession = Boolean(sessionState.present);
-  setPill(els.tokenState, tokenState.present ? "Token ✅" : "Token ❌", tokenState.present ? "ok" : "danger");
-  setPill(
-    els.sessionState,
-    hasSession ? "Session ✅" : "Session ❌",
-    hasSession ? "ok" : "warn",
-  );
-  els.sessionHelpWrap.classList.toggle("session-ok", hasSession);
-  els.sessionHelpTrigger.setAttribute(
-    "aria-label",
-    `查看 Session 状态指引，当前${hasSession ? "已传" : "未传"}`,
-  );
-  els.sessionHelpTrigger.setAttribute("aria-expanded", "false");
-  markConnectivity(true);
-  return status;
 }
 
-async function loadCards() {
-  const requestUserKey = state.selectedUserKey;
-  const data = await api(userScopedPath("/api/cards", requestUserKey));
-  if (!isCurrentUserRequest(requestUserKey)) {
+async function loadCards(userKey = state.selectedUserKey) {
+  const snapshot = ensureAccountSnapshot(userKey);
+  try {
+    const data = await api(userScopedPath("/api/cards", userKey));
+    delete snapshot.errors.cards;
+    renderCards(data.cards, data.primary_card, userKey);
+    snapshot.updatedAt = Date.now();
     return data;
+  } catch (error) {
+    snapshot.errors.cards = error.message;
+    renderAccountOverview();
+    throw error;
   }
-  renderCards(data.cards, data.primary_card);
-  return data;
 }
 
-function renderCards(cards, primaryCard) {
-  state.cards = cards || [];
-  state.primaryCard = primaryCard || null;
-  if (!primaryCard) {
-    els.primaryCard.innerHTML = `<div class="empty-state">未查询到会员卡</div>`;
-    els.otherCards.innerHTML = "";
-    renderAvailabilityTools();
+function renderCards(cards, primaryCard, userKey = state.selectedUserKey) {
+  const snapshot = ensureAccountSnapshot(userKey);
+  snapshot.cards = cards || [];
+  snapshot.primaryCard = primaryCard || null;
+  if (userKey === state.selectedUserKey) {
+    syncSelectedAccountAliases();
+  }
+  renderAccountOverview();
+}
+
+async function loadBookings(userKey = state.selectedUserKey) {
+  const snapshot = ensureAccountSnapshot(userKey);
+  try {
+    const data = await api(userScopedPath("/api/bookings?success=1&all=0", userKey));
+    delete snapshot.errors.bookings;
+    renderBookings(data.bookings, userKey);
+    snapshot.updatedAt = Date.now();
+    return data;
+  } catch (error) {
+    snapshot.errors.bookings = error.message;
+    renderAccountOverview();
+    throw error;
+  }
+}
+
+function renderBookings(bookings, userKey = state.selectedUserKey) {
+  const snapshot = ensureAccountSnapshot(userKey);
+  snapshot.bookings = bookings || [];
+  if (userKey === state.selectedUserKey) {
+    state.bookings = snapshot.bookings;
+    renderViewModeDetails();
+  }
+  renderAccountOverview();
+}
+
+async function loadAccountOverview(userKey) {
+  const snapshot = ensureAccountSnapshot(userKey);
+  snapshot.loading = true;
+  renderAccountOverview();
+  const results = await Promise.allSettled([loadStatus(userKey), loadCards(userKey), loadBookings(userKey)]);
+  snapshot.loading = false;
+  snapshot.updatedAt = Date.now();
+  renderAccountOverview();
+  const failed = results.filter((result) => result.status === "rejected");
+  if (failed.length) {
+    throw new Error(`${userKey} 的 ${failed.length} 项账号数据刷新失败`);
+  }
+  return snapshot;
+}
+
+async function loadAllAccountOverviews() {
+  const users = accountDisplayUsers();
+  const results = await Promise.allSettled(users.map((user) => loadAccountOverview(user.key)));
+  syncSelectedAccountAliases();
+  if (results.some((result) => result.status === "rejected")) {
+    throw new Error("部分账号数据刷新失败");
+  }
+  return results;
+}
+
+function findAccountBooking(userKey, billNum) {
+  return (state.accountSnapshots[userKey]?.bookings || []).find((item) => item.bill_num === billNum) || null;
+}
+
+function renderAccountOverview() {
+  if (!els.accountOverview) {
     return;
   }
-
-  els.primaryCard.innerHTML = `
-    <div class="balance-value">${escapeHtml(primaryCard.cash_balance)}</div>
-  `;
-
-  const others = cards.filter((card) => card.card_index !== primaryCard.card_index);
-  els.otherCards.innerHTML = others.length
-    ? others.map((card) => `
-      <div class="mini-item">
-        <span>${escapeHtml(card.card_name)} · ${escapeHtml(card.card_index)}</span>
-        <span class="numeric">${escapeHtml(card.cash_balance)}</span>
-      </div>
-    `).join("")
-    : `<div class="mini-item"><span>没有其他卡</span></div>`;
-  renderAvailabilityTools();
-}
-
-async function loadBookings() {
-  const requestUserKey = state.selectedUserKey;
-  const data = await api(userScopedPath("/api/bookings?success=1&all=0", requestUserKey));
-  if (!isCurrentUserRequest(requestUserKey)) {
-    return data;
-  }
-  state.bookings = data.bookings;
-  renderBookings(data.bookings);
-  renderViewModeDetails();
-  return data;
-}
-
-function renderBookings(bookings) {
-  const sortedBookings = sortBookingsByStart(bookings || []).filter(isUpcomingBooking);
-  const credentialWarning = currentUser()?.credential_conflict
-    ? `<div class="account-credential-warning" role="alert"><strong>共享授权数据</strong><span>当前用户与另一用户使用同一微信 Token，以下预约来自同一个上游账号，无法按页面用户拆分。</span></div>`
-    : "";
-  if (!sortedBookings.length) {
-    els.bookingList.innerHTML = `${credentialWarning}<div class="empty-state compact">没有活跃预约</div>`;
+  const users = accountDisplayUsers();
+  if (!users.length) {
+    els.accountOverview.innerHTML = `<div class="empty-state compact">没有已启用账号</div>`;
     return;
   }
-
-  const visibleBookings = state.activeBookingsExpanded ? sortedBookings : sortedBookings.slice(0, 3);
-  const toggleMarkup = sortedBookings.length > 3
-    ? `<button class="button secondary compact active-toggle" type="button" data-active-toggle>${state.activeBookingsExpanded ? "收起" : `展开 ${sortedBookings.length - 3}`}</button>`
-    : "";
-
-  els.bookingList.innerHTML = `
-    ${credentialWarning}
-    <div class="active-booking-grid">
-      ${visibleBookings.map((booking) => {
-    const refundState = bookingRefundState(booking);
+  els.accountOverview.innerHTML = users.map((user) => {
+    const snapshot = ensureAccountSnapshot(user.key);
+    const credentials = snapshotCredentials(user, snapshot);
+    const primary = user.key === state.primaryUserKey;
+    const expanded = Boolean(state.accountBookingsExpanded[user.key]);
+    const bookings = sortBookingsByStart(snapshot.bookings || []).filter(isUpcomingBooking);
+    const visibleBookings = expanded ? bookings : bookings.slice(0, 3);
+    const errorMessages = Object.values(snapshot.errors || {}).filter(Boolean);
+    const credentialWarning = user.credential_conflict
+      ? `<div class="account-credential-warning" role="alert"><strong>共享授权数据</strong><span>该用户与另一用户使用同一微信 Token，预约无法按页面用户拆分。</span></div>`
+      : "";
+    const bookingsMarkup = visibleBookings.length
+      ? `<div class="active-booking-grid">${visibleBookings.map((booking) => {
+        const refundState = bookingRefundState(booking);
+        return `<div class="booking-row"><span class="booking-summary"><span class="booking-time">${escapeHtml(activeBookingLabel(booking))}</span></span>${renderRefundAction(booking, refundState, user.key)}</div>`;
+      }).join("")}</div>`
+      : `<div class="empty-state compact">${snapshot.loading ? "正在刷新活跃预约" : "没有活跃预约"}</div>`;
+    const toggleMarkup = bookings.length > 3
+      ? `<button class="button secondary compact active-toggle" type="button" data-active-toggle="${escapeAttr(user.key)}">${expanded ? "收起" : `展开 ${bookings.length - 3}`}</button>`
+      : "";
     return `
-      <div class="booking-row">
-        <span class="booking-summary"><span class="booking-time">${escapeHtml(activeBookingLabel(booking))}</span></span>
-        ${renderRefundAction(booking, refundState)}
-      </div>
+      <article class="account-lane ${primary ? "is-primary" : ""} ${user.key === state.selectedUserKey ? "is-operation-account" : ""}" role="listitem" data-account-user-key="${escapeAttr(user.key)}">
+        <div class="account-lane-head">
+          <div class="account-lane-identity">
+            <span class="chip account-role-chip ${primary ? "" : "secondary"}">${accountRoleLabel(user.key)}</span>
+            <h3>${escapeHtml(user.label)}</h3>
+          </div>
+          ${user.key === state.selectedUserKey ? `<span class="chip success">当前操作</span>` : ""}
+        </div>
+        <div class="account-lane-meta">
+          <span class="chip ${credentials.token?.present ? "success" : "danger"}">Token ${credentials.token?.present ? "正常" : "缺失"}</span>
+          <span class="chip ${credentials.jsessionid?.present ? "success" : "warning"}">Session ${credentials.jsessionid?.present ? "正常" : "未传"}</span>
+        </div>
+        <div class="balance-block" aria-label="${escapeAttr(user.label)}可用余额">
+          <div class="balance-value">${escapeHtml(snapshot.primaryCard?.cash_balance || "—")}</div>
+        </div>
+        <div class="account-bookings">
+          <div class="account-balance-head"><strong>活跃预约</strong><span class="chip">${bookings.length} 条</span></div>
+          ${credentialWarning}
+          ${errorMessages.length ? `<div class="empty-state compact danger-text">部分数据刷新失败：${escapeHtml(errorMessages.join("；"))}</div>` : ""}
+          ${bookingsMarkup}
+          ${toggleMarkup}
+        </div>
+      </article>
     `;
-      }).join("")}
-    </div>
-    ${toggleMarkup}
-  `;
-
-  els.bookingList.querySelector("[data-active-toggle]")?.addEventListener("click", () => {
-    state.activeBookingsExpanded = !state.activeBookingsExpanded;
-    renderBookings(state.bookings);
+  }).join("");
+  els.accountOverview.querySelectorAll("[data-active-toggle]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const userKey = button.dataset.activeToggle;
+      state.accountBookingsExpanded[userKey] = !state.accountBookingsExpanded[userKey];
+      renderAccountOverview();
+    });
   });
-  els.bookingList.querySelectorAll("[data-cancel-bill]").forEach((button) => {
+  els.accountOverview.querySelectorAll("[data-cancel-bill]").forEach((button) => {
     button.addEventListener("click", (event) => {
       event.stopPropagation();
-      openCancelDialog(button.dataset.cancelBill);
+      openCancelDialog(button.dataset.cancelBill, button.dataset.cancelUserKey);
     });
   });
 }
@@ -826,9 +951,10 @@ function courtShortLabel(value) {
   return match ? `球${match[1]}` : text;
 }
 
-function renderRefundAction(booking, refundState) {
+function renderRefundAction(booking, refundState, userKey = "") {
   if (!booking.cancelled && !refundState.expired) {
-    return `<button class="chip chip-button ${refundState.tone}" type="button" data-cancel-bill="${escapeAttr(booking.bill_num)}">${escapeHtml(refundState.label)}</button>`;
+    const ownerAttribute = userKey ? ` data-cancel-user-key="${escapeAttr(userKey)}"` : "";
+    return `<button class="chip chip-button ${refundState.tone}" type="button" data-cancel-bill="${escapeAttr(booking.bill_num)}"${ownerAttribute}>${escapeHtml(refundState.label)}</button>`;
   }
   return `<span class="chip ${refundState.tone}">${escapeHtml(refundState.label)}</span>`;
 }
@@ -914,17 +1040,23 @@ async function loadCancelPreview(billNum) {
   }
 }
 
-async function openCancelDialog(billNum) {
-  const booking = state.bookings.find((item) => item.bill_num === billNum);
+async function openCancelDialog(billNum, userKey = state.selectedUserKey) {
+  if (state.cancelDialogSubmitting) {
+    addUiLog("退订请求提交中，已阻止打开另一笔退订", true);
+    return;
+  }
+  const booking = findAccountBooking(userKey, billNum)
+    || (userKey === state.selectedUserKey ? state.bookings.find((item) => item.bill_num === billNum) : null);
   if (!booking) {
     addUiLog(`退订失败: 未找到 bill ${billNum}`, true);
     return;
   }
   state.cancelDialogBill = billNum;
-  state.cancelDialogUserKey = state.selectedUserKey;
+  state.cancelDialogUserKey = userKey;
   state.cancelDialogPreview = null;
   state.cancelDialogError = "";
   state.cancelDialogLoading = true;
+  state.cancelDialogSubmitting = false;
   showCancelDialog();
   renderCancelDialog();
   try {
@@ -947,7 +1079,10 @@ function showCancelDialog() {
   document.body.classList.add("modal-open");
 }
 
-function closeCancelDialog() {
+function closeCancelDialog(force = false) {
+  if (state.cancelDialogSubmitting && force !== true) {
+    return;
+  }
   els.cancelDialog.classList.add("hidden");
   document.body.classList.remove("modal-open");
   state.cancelDialogBill = "";
@@ -955,16 +1090,19 @@ function closeCancelDialog() {
   state.cancelDialogPreview = null;
   state.cancelDialogError = "";
   state.cancelDialogLoading = false;
+  state.cancelDialogSubmitting = false;
 }
 
 function renderCancelDialog() {
   const billNum = state.cancelDialogBill;
-  const booking = state.bookings.find((item) => item.bill_num === billNum);
+  const booking = findAccountBooking(state.cancelDialogUserKey, billNum)
+    || (state.cancelDialogUserKey === state.selectedUserKey ? state.bookings.find((item) => item.bill_num === billNum) : null);
   const preview = state.cancelDialogPreview || {};
   const refund = preview.refund || {};
   const rule = preview.rule || {};
   const loadingMarkup = state.cancelDialogLoading ? `<div class="refund-box">正在读取退款预览...</div>` : "";
-  const errorMarkup = state.cancelDialogError ? `<div class="refund-box danger"><strong>退款预览不可用</strong><p>${escapeHtml(state.cancelDialogError)}</p></div>` : "";
+  const errorTitle = preview.refund ? "退订未确认" : "退款预览不可用";
+  const errorMarkup = state.cancelDialogError ? `<div class="refund-box danger"><strong>${errorTitle}</strong><p>${escapeHtml(state.cancelDialogError)}</p></div>` : "";
   const previewMarkup = preview.refund
     ? `
       <div class="refund-box">
@@ -994,20 +1132,51 @@ function renderCancelDialog() {
     </label>
   `;
   const input = document.querySelector("#cancelDialogText");
+  input.disabled = state.cancelDialogLoading || state.cancelDialogSubmitting;
   const updateSubmit = () => {
-    els.cancelDialogSubmit.disabled = input.value.trim() !== "CANCEL" || state.cancelDialogLoading;
+    els.cancelDialogSubmit.disabled = input.value.trim() !== "CANCEL" || state.cancelDialogLoading || state.cancelDialogSubmitting;
   };
   input.addEventListener("input", updateSubmit);
+  els.cancelDialogSubmit.textContent = state.cancelDialogSubmitting ? "退订中" : "确认退订";
+  els.cancelDialogSubmit.setAttribute("aria-busy", state.cancelDialogSubmitting ? "true" : "false");
+  els.closeCancelDialog.disabled = state.cancelDialogSubmitting;
+  els.cancelDialogBack.disabled = state.cancelDialogSubmitting;
   updateSubmit();
 }
 
+function setCancelSubmittingControls(submitting) {
+  const detailInput = document.querySelector("#confirmText");
+  const detailButton = document.querySelector("#confirmCancel");
+  if (detailInput) {
+    detailInput.disabled = submitting;
+  }
+  if (detailButton) {
+    detailButton.disabled = submitting;
+    detailButton.textContent = submitting ? "退订中" : "确认取消该预约";
+    detailButton.setAttribute("aria-busy", submitting ? "true" : "false");
+  }
+}
+
 async function cancelBooking(billNum, confirmationValue = null, userKey = "") {
+  if (state.cancelDialogSubmitting) {
+    addUiLog("退订请求提交中，已阻止重复点击", true);
+    return;
+  }
   const confirmation = confirmationValue === null ? document.querySelector("#confirmText")?.value.trim() || "" : confirmationValue;
   if (confirmation !== "CANCEL") {
     addUiLog("取消被阻止: 二次确认文本不匹配", true);
     return;
   }
 
+  const requestUserKey = userKey || state.cancelDialogUserKey || state.selectedUserKey;
+  let cancellationConfirmed = false;
+  state.cancelDialogSubmitting = true;
+  state.cancelDialogError = "";
+  els.userSelect.disabled = true;
+  setCancelSubmittingControls(true);
+  if (state.cancelDialogBill === billNum) {
+    renderCancelDialog();
+  }
   try {
     addUiLog(`开始取消 ${billNum}`, true);
     const result = await api("/api/cancel", {
@@ -1016,19 +1185,61 @@ async function cancelBooking(billNum, confirmationValue = null, userKey = "") {
         bill_num: billNum,
         confirmation,
         reason: "天气原因",
-        user_key: userKey || state.cancelDialogUserKey || state.selectedUserKey,
+        user_key: requestUserKey,
+        require_confirmed: true,
       }),
     });
-    addUiLog(result.confirmed ? "取消已确认，余额已刷新" : "取消接口返回后仍未确认状态", true);
-    renderCards(result.cards || [], result.primary_card || null);
-    await loadBookings();
-    const latest = state.bookings.find((item) => item.bill_num === billNum) || result.booking;
-    renderDetail(latest || null);
-    if (state.cancelDialogBill === billNum) {
-      closeCancelDialog();
+    if (!result.confirmed) {
+      throw new Error("退订结果尚未由订单状态确认");
     }
+    cancellationConfirmed = true;
+    const refreshErrors = result.refresh_errors || [];
+    const balanceRefreshed = !refreshErrors.includes("cards");
+    addUiLog(
+      `${result.reconciled ? "取消已通过原账号订单对账确认" : "取消已确认"}${balanceRefreshed ? "，余额已刷新" : ""}`,
+      true,
+    );
+    if (balanceRefreshed) {
+      renderCards(result.cards || [], result.primary_card || null, requestUserKey);
+    }
+    if (refreshErrors.length) {
+      addUiLog(`退订已确认，但状态刷新待重试: ${refreshErrors.join(", ")}`, true);
+    }
+    await loadBookings(requestUserKey);
+    const latest = findAccountBooking(requestUserKey, billNum) || result.booking;
+    renderDetail(latest || null);
   } catch (error) {
-    addUiLog(`取消失败: ${error.message}`, true);
+    if (cancellationConfirmed) {
+      addUiLog(`退订已确认，但页面状态刷新失败: ${error.message}`, true);
+    } else {
+      let refreshConfirmed = false;
+      const [bookingsRefresh, cardsRefresh] = await Promise.allSettled([loadBookings(requestUserKey), loadCards(requestUserKey)]);
+      if (bookingsRefresh.status === "fulfilled") {
+        refreshConfirmed = !findAccountBooking(requestUserKey, billNum);
+      } else {
+        addUiLog(`退订订单对账失败: ${bookingsRefresh.reason?.message || bookingsRefresh.reason}`, true);
+      }
+      if (cardsRefresh.status === "rejected") {
+        addUiLog(`退订后余额刷新失败: ${cardsRefresh.reason?.message || cardsRefresh.reason}`, true);
+      }
+      if (refreshConfirmed) {
+        cancellationConfirmed = true;
+        addUiLog("取消请求返回异常，但已通过原账号活跃预约对账确认", true);
+        renderDetail(null);
+      } else {
+        state.cancelDialogError = error.message;
+        addUiLog(`取消未确认: ${error.message}`, true);
+      }
+    }
+  } finally {
+    state.cancelDialogSubmitting = false;
+    setCancelSubmittingControls(false);
+    els.userSelect.disabled = state.exactBookingLoading;
+    if (cancellationConfirmed && state.cancelDialogBill === billNum) {
+      closeCancelDialog(true);
+    } else if (state.cancelDialogBill === billNum) {
+      renderCancelDialog();
+    }
   }
 }
 
@@ -1253,7 +1464,7 @@ async function scanAvailability() {
 }
 
 async function loadAvailabilitySnapshot({ silent = false, preserveSelection = true } = {}) {
-  const requestUserKey = state.selectedUserKey;
+  const requestUserKey = state.primaryUserKey || state.selectedUserKey;
   if (state.availabilityLoading && state.availabilityRequestUserKey === requestUserKey) {
     return state.availabilityRequestPromise;
   }
@@ -1287,7 +1498,7 @@ async function loadAvailabilitySnapshot({ silent = false, preserveSelection = tr
   const requestPromise = (async () => {
     try {
       const data = await api(userScopedPath("/api/availability?days=5", requestUserKey));
-      if (!isCurrentUserRequest(requestUserKey) || requestId !== state.availabilityRequestId) {
+      if (requestUserKey !== state.availabilityRequestUserKey || requestId !== state.availabilityRequestId) {
         return data;
       }
       state.availabilityDays = data.days || [];
@@ -1318,7 +1529,7 @@ async function loadAvailabilitySnapshot({ silent = false, preserveSelection = tr
       }
       return data;
     } catch (error) {
-      if (!isCurrentUserRequest(requestUserKey) || requestId !== state.availabilityRequestId) {
+      if (requestUserKey !== state.availabilityRequestUserKey || requestId !== state.availabilityRequestId) {
         return null;
       }
       state.availabilityDays = [];
@@ -1335,8 +1546,6 @@ async function loadAvailabilitySnapshot({ silent = false, preserveSelection = tr
         state.availabilityLoading = false;
         state.availabilityRequestPromise = null;
         setAvailabilityBusy(false);
-        els.scanAvailability.disabled = false;
-        els.scanAvailability.textContent = "查询 5 天分布";
       }
     }
   })();
@@ -1347,18 +1556,22 @@ async function loadAvailabilitySnapshot({ silent = false, preserveSelection = tr
 function setAvailabilityBusy(busy) {
   els.availabilitySection.classList.toggle("is-refreshing", busy);
   els.availabilitySection.setAttribute("aria-busy", busy ? "true" : "false");
-  els.availabilityList.inert = busy;
-  els.availabilityCombos.inert = busy;
-  els.availabilitySelection.inert = busy;
-  if (busy) {
-    els.exactSubmit.disabled = true;
-  }
+  const interactionLocked = busy || state.exactBookingLoading;
+  els.availabilityList.inert = interactionLocked;
+  els.availabilityCombos.inert = interactionLocked;
+  els.availabilitySelection.inert = interactionLocked;
+  els.scanAvailability.disabled = interactionLocked;
+  els.scanAvailability.textContent = busy
+    ? "查询中"
+    : (state.exactBookingLoading ? "预约提交中" : "查询 5 天分布");
+  renderExactSelection();
 }
 
 function setAvailabilityRefreshState(text, tone = "", title = "") {
   els.availabilityRefreshState.className = `chip availability-refresh-state ${tone}`.trim();
   els.availabilityRefreshState.textContent = text;
-  els.availabilityRefreshState.title = title || `自动每 60 秒刷新，当前用户：${currentUser()?.label || "未选择"}`;
+  const sourceUser = state.users.find((user) => user.key === (state.primaryUserKey || state.selectedUserKey));
+  els.availabilityRefreshState.title = title || `自动每 60 秒刷新，公共分布由主账号 ${sourceUser?.label || "未选择"} 查询`;
 }
 
 function renderAvailability(days) {
@@ -1555,6 +1768,11 @@ function renderExactSelection() {
   }
   const slots = state.selectedAvailabilitySlots;
   els.availabilitySelection.hidden = !slots.length;
+  els.exactSubmit.disabled = !slots.length || state.exactBookingLoading || state.availabilityLoading;
+  els.exactSubmit.textContent = state.exactBookingLoading
+    ? "提交中"
+    : (state.availabilityLoading ? "分布刷新中" : "提交预约");
+  els.exactSubmit.setAttribute("aria-busy", state.exactBookingLoading ? "true" : "false");
   if (els.availabilitySelection.hidden) {
     return;
   }
@@ -1574,8 +1792,6 @@ function renderExactSelection() {
     : `<div class="empty-state compact">从可约分布里选择 1 到 2 个时间段。</div>`;
   els.exactSelectionTotal.textContent = `合计 ${formatMoney(total)}`;
   els.exactSelectionBalance.textContent = `余额 ${formatMoney(balance)}`;
-  els.exactSubmit.disabled = !slots.length || state.exactBookingLoading;
-  els.exactSubmit.textContent = state.exactBookingLoading ? "提交中" : "提交预约";
 }
 
 function availabilitySlotFromDataset(dataset) {
@@ -1716,19 +1932,34 @@ function showAvailabilityWarning(message) {
 }
 
 async function submitExactBooking() {
-  if (state.exactBookingLoading || !state.selectedAvailabilitySlots.length) {
+  if (state.exactBookingLoading) {
+    showAvailabilityWarning("预约正在提交，请勿重复点击");
+    addUiLog("精确预约提交中，已阻止重复点击", true);
     return;
   }
-  if (!selectionWithinBalance(state.selectedAvailabilitySlots)) {
+  if (state.availabilityLoading) {
+    showAvailabilityWarning("可约分布正在刷新，请等待刷新完成");
+    addUiLog("精确预约被阻止: 可约分布正在刷新", true);
+    return;
+  }
+  if (!state.selectedAvailabilitySlots.length) {
+    showAvailabilityWarning("未选择可预约场地，请重新选择");
+    addUiLog("精确预约被阻止: 未选择可预约场地", true);
+    return;
+  }
+  const requestUserKey = state.selectedUserKey;
+  const selectedSlots = state.selectedAvailabilitySlots.map((slot) => ({ ...slot }));
+  if (!selectionWithinBalance(selectedSlots)) {
     showAvailabilityWarning("已选时间段总实扣超过卡余额");
     return;
   }
   state.exactBookingLoading = true;
-  renderExactSelection();
+  els.userSelect.disabled = true;
+  setAvailabilityBusy(state.availabilityLoading);
   const payload = {
-    user_key: state.selectedUserKey,
+    user_key: requestUserKey,
     dry_run: els.bookingForm.elements.dry_run.checked,
-    slots: state.selectedAvailabilitySlots.map((slot) => ({
+    slots: selectedSlots.map((slot) => ({
       date: slot.date,
       start_time: slot.start_time,
       end_time: slot.end_time,
@@ -1749,7 +1980,7 @@ async function submitExactBooking() {
       result.failures.forEach((item) => addUiLog(`精确预约失败: ${item.error}`, true));
     }
     state.selectedAvailabilitySlots = [];
-    await Promise.all([loadBookings(), loadCards(), loadBookingHistory()]);
+    await Promise.all([loadBookings(requestUserKey), loadCards(requestUserKey), loadBookingHistory()]);
     renderAvailability(state.availabilityDays);
     renderAvailabilityTools();
   } catch (error) {
@@ -1757,7 +1988,8 @@ async function submitExactBooking() {
     addUiLog(`精确预约失败: ${error.message}`, true);
   } finally {
     state.exactBookingLoading = false;
-    renderExactSelection();
+    els.userSelect.disabled = state.cancelDialogSubmitting;
+    setAvailabilityBusy(state.availabilityLoading);
   }
 }
 
@@ -2270,13 +2502,12 @@ async function changeUser() {
     return;
   }
   state.selectedUserKey = nextUserKey;
-  clearRefreshStamps();
   showAccountDataLoading();
   renderUsers();
   addUiLog(`切换用户: ${currentUser()?.label || state.selectedUserKey}`, true);
   els.userSelect.disabled = true;
   try {
-    const result = await triggerRefresh({ includeUsers: false, force: true });
+    const result = await triggerRefresh({ includeUsers: false, force: false });
     if (result.ok) {
       addUiLog(`当前用户数据已刷新: ${currentUser()?.label || state.selectedUserKey}`, true);
     } else {
@@ -2288,32 +2519,13 @@ async function changeUser() {
 }
 
 function showAccountDataLoading() {
-  state.cards = [];
-  state.primaryCard = null;
-  state.bookings = [];
+  syncSelectedAccountAliases();
   state.bookingHistory = [];
   state.scanTasks = [];
   state.scanEvents = [];
-  state.availabilityDays = [];
   state.selectedAvailabilitySlots = [];
-  state.activeBookingsExpanded = false;
-  state.availabilityExpandedDates.clear();
-  state.availabilityUpdatedAt = 0;
-  state.availabilityUpdatedUserKey = "";
-  setPill(els.tokenState, "Token 检查中", "warning");
-  setPill(els.sessionState, "Session 检查中", "warning");
   setPill(els.lastRefresh, "用户数据刷新中", "warning");
-  els.primaryCard.innerHTML = `<span class="skeleton wide"></span>`;
-  els.otherCards.innerHTML = "";
-  els.bookingList.innerHTML = `<div class="empty-state compact">正在刷新当前用户的活跃预约。</div>`;
-  els.availabilityList.innerHTML = `
-    <div class="availability-day compact-day">
-      <div class="availability-head"><strong>切换用户</strong><span class="chip warning">刷新中</span></div>
-      <div class="availability-hours"><span class="skeleton wide"></span></div>
-    </div>
-  `;
-  setAvailabilityBusy(true);
-  setAvailabilityRefreshState("可约分布刷新中", "warning");
+  renderAccountOverview();
   renderBookingHistory([]);
   renderScanTasks();
   renderScanEvents();
@@ -2384,8 +2596,7 @@ async function loadJob() {
     if (activeCount === 0 && state.jobTimer) {
       window.clearInterval(state.jobTimer);
       state.jobTimer = null;
-      await loadBookings();
-      await loadCards();
+      await loadAllAccountOverviews();
       await loadBookingHistory();
     }
     renderViewModeDetails();
@@ -2835,8 +3046,8 @@ els.userForm.addEventListener("submit", saveUser);
 els.copyTokenAuthUrl.addEventListener("click", copyTokenAuthUrl);
 els.exchangeToken.addEventListener("click", exchangeUserToken);
 els.refreshAll.addEventListener("click", refreshAll);
-els.refreshCards.addEventListener("click", () => loadCards().catch((error) => addUiLog(`余额刷新失败: ${error.message}`, true)));
-els.refreshBookings.addEventListener("click", () => loadBookings().catch((error) => addUiLog(`活跃预约刷新失败: ${error.message}`, true)));
+els.refreshCards.addEventListener("click", () => loadAllAccountOverviews().catch((error) => addUiLog(`余额刷新失败: ${error.message}`, true)));
+els.refreshBookings.addEventListener("click", () => loadAllAccountOverviews().catch((error) => addUiLog(`活跃预约刷新失败: ${error.message}`, true)));
 els.scanAvailability.addEventListener("click", () => scanAvailability().catch((error) => addUiLog(`可约分布查询失败: ${error.message}`, true)));
 els.exactSubmit.addEventListener("click", () => submitExactBooking());
 els.refreshScanTasks.addEventListener("click", () => loadScanTasks().catch((error) => addUiLog(`扫描任务刷新失败: ${error.message}`, true)));

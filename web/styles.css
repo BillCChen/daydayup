@@ -742,8 +742,91 @@ a:focus-visible {
 }
 
 .wallet-active-row {
-  grid-template-columns: minmax(120px, 0.46fr) minmax(210px, 0.8fr) minmax(120px, 0.46fr) minmax(0, 2.1fr);
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+}
+
+.account-overview {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  min-width: 0;
+}
+
+.account-lane {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  border-radius: 28px 40px 28px 40px;
+  background: color-mix(in oklch, var(--paper), transparent 20%);
+  box-shadow: var(--shadow-control);
+  padding: 17px;
+}
+
+.account-lane.is-primary {
+  background:
+    radial-gradient(circle at 12% 8%, color-mix(in oklch, var(--sage), transparent 68%) 0 5rem, transparent 5.2rem),
+    color-mix(in oklch, var(--paper), transparent 10%);
+}
+
+.account-lane.is-operation-account {
+  box-shadow: var(--shadow-float);
+}
+
+.account-lane-head,
+.account-lane-identity,
+.account-lane-meta,
+.account-balance-head {
+  display: flex;
+  gap: 9px;
   align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.account-lane-identity {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.account-lane-identity h3,
+.account-balance-head strong {
+  margin: 0;
+}
+
+.account-lane-identity h3 {
+  font-size: 1.18rem;
+  letter-spacing: -0.02em;
+}
+
+.account-lane-meta {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.account-lane .balance-block {
+  min-height: 104px;
+}
+
+.account-lane .balance-value {
+  font-size: clamp(2.65rem, 5vw, 3.45rem);
+}
+
+.account-bookings {
+  display: grid;
+  gap: 10px;
+}
+
+.account-bookings .active-booking-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.account-role-chip {
+  background: color-mix(in oklch, var(--sage), var(--paper) 64%);
+}
+
+.account-role-chip.secondary {
+  background: color-mix(in oklch, var(--blue-soft), var(--paper) 38%);
 }
 
 .balance-block {
@@ -1729,7 +1812,7 @@ body.modal-open {
   }
 
   .wallet-active-row {
-    grid-template-columns: minmax(120px, 0.5fr) minmax(210px, 0.8fr) minmax(120px, 0.5fr) minmax(0, 1.7fr);
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .availability-list {
@@ -1778,15 +1861,11 @@ body.modal-open {
   }
 
   .wallet-active-row {
-    grid-template-columns: minmax(120px, 0.5fr) minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
   }
 
-  .wallet-active-row > .active-label {
-    grid-column: 1;
-  }
-
-  .wallet-active-row > .booking-list {
-    grid-column: 2;
+  .account-overview {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .availability-list,
@@ -1945,11 +2024,6 @@ body.modal-open {
   .wallet-active-row {
     grid-template-columns: minmax(0, 1fr);
     gap: 12px;
-  }
-
-  .wallet-active-row > .active-label,
-  .wallet-active-row > .booking-list {
-    grid-column: 1;
   }
 
   .compact-label {

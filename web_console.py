@@ -64,11 +64,14 @@ USER_FIELDS = ("type", "key", "label", "password", "token", "jsessionid", "card_
 DEFAULT_CARD_NAME = "学生球类卡"
 DEFAULT_USER_KEY = "chen_qixuan"
 DEFAULT_USER_LABEL = "陈启轩"
+DEFAULT_SECONDARY_USER_KEY = "mingyue"
+DEFAULT_SECONDARY_USER_LABEL = "张明月"
 DEFAULT_OAUTH_REDIRECT_URL = "https://www.147soft.cn/easyserp/index.html"
 PROJECT_TYPE = "3"
 BOOKING_ITEM_TYPE = "羽毛球"
 BOOKING_CALL_DELAY_SECONDS = 0.03
 EXACT_BOOKING_FAST_RETRY_SECONDS = 0.8
+CANCEL_RECONCILIATION_DELAYS_SECONDS = (0.4, 0.8, 1.2)
 BOOKING_MODES = {"balanced", "direct-fast", "guided-fast"}
 MULTI_POOL_BOOKING_MODES = {"direct-fast", "guided-fast"}
 MULTI_POOL_MODES = {"off", "dry_run", "live"}
@@ -212,7 +215,7 @@ class UserStore:
         if not users:
             raise EasySerpError("no enabled users")
         if not user_key:
-            return users[0]
+            return next((user for user in users if user.key == DEFAULT_USER_KEY), users[0])
         for user in users:
             if user.key == user_key:
                 return user
@@ -1866,9 +1869,20 @@ class WebConsole:
     def user_list(self) -> dict[str, Any]:
         users = self.users.list_users()
         default_user = self.users.get_user("")
+        enabled_users = [user for user in users if user.enabled]
+        secondary_user = next(
+            (
+                user
+                for user in enabled_users
+                if user.key == DEFAULT_SECONDARY_USER_KEY and user.key != default_user.key
+            ),
+            next((user for user in enabled_users if user.key != default_user.key), None),
+        )
         return {
             "users": serialize_users(users),
             "default_user_key": default_user.key,
+            "primary_user_key": default_user.key,
+            "secondary_user_key": secondary_user.key if secondary_user else "",
             "multi_pool_mode": configured_multi_pool_mode(),
             "updated_at": time.time(),
         }
@@ -2111,30 +2125,71 @@ class WebConsole:
         if is_cancelled(order):
             raise EasySerpError("booking is already cancelled")
 
-        response = self.client(user).post(
-            "place/canclePlaceAppointment",
-            data={
-                "outtradeno": bill_num,
-                "token": user.token,
-                "reason": reason,
-                "affiliateCard": clean_string(payload.get("affiliate_card")),
-            },
-        )
-        response_data = require_success(response, "canclePlaceAppointment")
-        time.sleep(0.8)
-        bookings = self.bookings(user.key, include_cancelled=True)
-        cards = self.cards(user.key)
-        order = next((item for item in bookings["bookings"] if item["bill_num"] == bill_num), None)
-        confirmed = order is None or "取消" in (order.get("status") or "")
+        response: dict[str, Any] | None = None
+        response_data: Any = None
+        upstream_error: EasySerpError | None = None
+        try:
+            response = self.client(user).post(
+                "place/canclePlaceAppointment",
+                data={
+                    "outtradeno": bill_num,
+                    "token": user.token,
+                    "reason": reason,
+                    "affiliateCard": clean_string(payload.get("affiliate_card")),
+                },
+            )
+            response_data = require_success(response, "canclePlaceAppointment")
+        except EasySerpError as exc:
+            upstream_error = exc
+
+        order = None
+        confirmed = False
+        reconciliation_checks = 0
+        for delay_seconds in CANCEL_RECONCILIATION_DELAYS_SECONDS:
+            time.sleep(delay_seconds)
+            reconciliation_checks += 1
+            try:
+                order = self._find_recent_order(bill_num, user)
+            except EasySerpError:
+                continue
+            confirmed = order is None or is_cancelled(order)
+            if confirmed:
+                break
+
+        if not confirmed and upstream_error is not None:
+            raise upstream_error
         if payload.get("require_confirmed") and not confirmed:
             raise EasySerpError("cancel was not confirmed")
+
+        refresh_errors: list[str] = []
+        serialized_order = serialize_order(order) if order else None
+        try:
+            bookings = self.bookings(user.key, include_cancelled=True)
+            refreshed_order = next((item for item in bookings["bookings"] if item["bill_num"] == bill_num), None)
+            confirmed = confirmed or refreshed_order is None or "取消" in (refreshed_order.get("status") or "")
+            serialized_order = refreshed_order
+        except EasySerpError:
+            refresh_errors.append("bookings")
+            bookings = {"bookings": []}
+        try:
+            cards = self.cards(user.key)
+        except EasySerpError:
+            refresh_errors.append("cards")
+            cards = {"cards": [], "primary_card": None}
+        response_summary = response if isinstance(response, dict) else {}
         return {
-            "response": {"msg": response.get("msg"), "data": response_data},
+            "response": {
+                "msg": response_summary.get("msg") or ("request_error" if upstream_error else "unknown"),
+                "data": response_data if upstream_error is None else response_summary.get("data"),
+            },
             "confirmed": confirmed,
-            "booking": order,
+            "reconciled": upstream_error is not None or reconciliation_checks > 1,
+            "reconciliation_checks": reconciliation_checks,
+            "booking": serialized_order,
             "bookings": bookings["bookings"],
             "cards": cards["cards"],
             "primary_card": cards["primary_card"],
+            "refresh_errors": refresh_errors,
             "user": serialize_user(user),
             "updated_at": time.time(),
         }

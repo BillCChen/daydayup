@@ -107,6 +107,8 @@ async function main() {
       }
 
       state.multiPoolMode = "live";
+      state.primaryUserKey = "chen_qixuan";
+      state.secondaryUserKey = "mingyue";
       state.users = [
         {
           key: "shared_1",
@@ -134,7 +136,7 @@ async function main() {
       if (!els.userSelect.innerHTML.includes("共享授权") || !els.activeUserLabel.textContent.includes("授权冲突")) {
         throw new Error("shared-credential account marker was not rendered");
       }
-      if (!els.bookingList.innerHTML.includes("共享授权数据") || !els.bookingList.innerHTML.includes("无法按页面用户拆分")) {
+      if (!els.accountOverview.innerHTML.includes("共享授权数据") || !els.accountOverview.innerHTML.includes("无法按页面用户拆分")) {
         throw new Error("shared active-booking warning was not rendered");
       }
       if (!els.multiPoolEnabled.disabled || !els.multiPoolSecondaryUser.innerHTML.includes("共享授权，不可用")) {
@@ -142,10 +144,77 @@ async function main() {
       }
 
       state.users = [
+        {
+          key: "chen_qixuan",
+          label: "陈启轩",
+          enabled: true,
+          credential_status: {
+            token: { present: true },
+            jsessionid: { present: true },
+          },
+        },
+        {
+          key: "mingyue",
+          label: "张明月",
+          enabled: true,
+          credential_status: {
+            token: { present: true },
+            jsessionid: { present: false },
+          },
+        },
+      ];
+      state.primaryUserKey = "chen_qixuan";
+      state.secondaryUserKey = "mingyue";
+      state.selectedUserKey = "chen_qixuan";
+      state.accountSnapshots = {
+        chen_qixuan: {
+          status: { token: { present: true }, jsessionid: { present: true } },
+          cards: [{ card_index: "primary-card", cash_balance: "120.00" }],
+          primaryCard: { card_index: "primary-card", cash_balance: "120.00", cash_balance_value: 120 },
+          bookings: [{
+            bill_num: "primary-bill",
+            date: "2099-07-20",
+            time_range: "18:00-19:00",
+            court: "Court 7",
+          }],
+          errors: {},
+          loading: false,
+        },
+        mingyue: {
+          status: { token: { present: true }, jsessionid: { present: false } },
+          cards: [{ card_index: "secondary-card", cash_balance: "88.00" }],
+          primaryCard: { card_index: "secondary-card", cash_balance: "88.00", cash_balance_value: 88 },
+          bookings: [{
+            bill_num: "secondary-bill",
+            date: "2099-07-21",
+            time_range: "19:00-20:00",
+            court: "Court 8",
+          }],
+          errors: {},
+          loading: false,
+        },
+      };
+      renderUsers();
+      renderAccountOverview();
+      if (!els.userSelect.innerHTML.includes("陈启轩（主）") || !els.userSelect.innerHTML.includes("张明月（辅）")) {
+        throw new Error("primary and secondary roles were not rendered in the operation-account selector");
+      }
+      if (
+        !els.accountOverview.innerHTML.includes("主账号")
+        || !els.accountOverview.innerHTML.includes("辅账号")
+        || !els.accountOverview.innerHTML.includes("120.00")
+        || !els.accountOverview.innerHTML.includes("88.00")
+        || !els.accountOverview.innerHTML.includes('data-cancel-user-key="mingyue"')
+      ) {
+        throw new Error("dual-account overview did not render independent account-owned state");
+      }
+
+      state.users = [
         { key: "old_user", label: "Old", enabled: true },
         { key: "new_user", label: "New", enabled: true },
       ];
       state.selectedUserKey = "old_user";
+      state.accountSnapshots = {};
       let resolveOldCards;
       const oldCards = new Promise((resolve) => { resolveOldCards = resolve; });
       api = async (requestPath) => requestPath.includes("old_user")
@@ -155,7 +224,7 @@ async function main() {
           primary_card: { card_index: "new-card", cash_balance: "88.00" },
         };
 
-      const staleRequest = loadCards();
+      const staleRequest = loadCards("old_user");
       state.selectedUserKey = "new_user";
       state.cards = [];
       state.primaryCard = null;
@@ -164,11 +233,14 @@ async function main() {
         primary_card: { card_index: "old-card", cash_balance: "11.00" },
       });
       await staleRequest;
+      if (state.accountSnapshots.old_user?.primaryCard?.cash_balance !== "11.00") {
+        throw new Error("non-selected account card response was discarded instead of stored independently");
+      }
       if (state.cards.length !== 0 || state.primaryCard !== null) {
-        throw new Error("stale card response replaced the selected user's cleared state");
+        throw new Error("non-selected account card response replaced selected-account compatibility state");
       }
 
-      await loadCards();
+      await loadCards("new_user");
       if (state.primaryCard?.cash_balance !== "88.00") {
         throw new Error("current user card response did not render");
       }
@@ -221,17 +293,78 @@ async function main() {
         throw new Error("current availability selection was not preserved");
       }
 
+      state.availabilityLoading = true;
+      state.exactBookingLoading = false;
+      renderExactSelection();
+      if (!els.exactSubmit.disabled || els.exactSubmit.textContent !== "分布刷新中") {
+        throw new Error("exact submit did not expose the availability refresh lock");
+      }
+      state.availabilityLoading = false;
+      renderExactSelection();
+      if (els.exactSubmit.disabled || els.exactSubmit.textContent !== "提交预约") {
+        throw new Error("exact submit did not recover after availability refresh");
+      }
+
+      state.uiLogs = [];
+      state.selectedAvailabilitySlots = [];
+      await submitExactBooking();
+      if (!state.uiLogs.some((item) => item.text.includes("未选择可预约场地"))) {
+        throw new Error("empty exact submit guard remained silent");
+      }
+
+      const cancelBill = "synthetic-cancel-bill";
+      state.bookings = [{
+        bill_num: cancelBill,
+        date: "2099-07-21",
+        time_range: "18:00-19:00",
+        court: "Court 8",
+      }];
+      state.cancelDialogBill = cancelBill;
+      state.cancelDialogUserKey = "new_user";
+      state.cancelDialogPreview = { refund: {}, rule: {} };
+      state.cancelDialogLoading = false;
+      let releaseCancel;
+      let cancelRequests = 0;
+      const cancelGate = new Promise((resolve) => { releaseCancel = resolve; });
+      api = async (requestPath) => {
+        if (requestPath !== "/api/cancel") {
+          throw new Error("unexpected request " + requestPath);
+        }
+        cancelRequests += 1;
+        await cancelGate;
+        return { confirmed: true, cards: [], primary_card: null, booking: null };
+      };
+      loadBookings = async () => { state.bookings = []; };
+      const pendingCancel = cancelBooking(cancelBill, "CANCEL", "new_user");
+      await Promise.resolve();
+      const duplicateCancel = cancelBooking(cancelBill, "CANCEL", "new_user");
+      if (
+        !state.cancelDialogSubmitting
+        || !els.cancelDialogSubmit.disabled
+        || els.cancelDialogSubmit.textContent !== "退订中"
+        || !els.closeCancelDialog.disabled
+        || !els.cancelDialogBack.disabled
+      ) {
+        throw new Error("cancel dialog did not enter a locked pending state");
+      }
+      if (cancelRequests !== 1 || !els.userSelect.disabled) {
+        throw new Error("duplicate cancellation was not blocked for the original account");
+      }
+      releaseCancel();
+      await Promise.all([pendingCancel, duplicateCancel]);
+      if (state.cancelDialogSubmitting || cancelRequests !== 1 || els.userSelect.disabled) {
+        throw new Error("cancel pending state did not settle cleanly");
+      }
+
       let releaseFirstRefresh;
       let statusCalls = 0;
       const firstRefreshGate = new Promise((resolve) => { releaseFirstRefresh = resolve; });
-      loadStatus = async () => {
+      loadAllAccountOverviews = async () => {
         statusCalls += 1;
         if (statusCalls === 1) {
           await firstRefreshGate;
         }
       };
-      loadCards = async () => {};
-      loadBookings = async () => {};
       loadBookingHistory = async () => {};
       loadScanTasks = async () => {};
       loadJob = async () => {};
@@ -254,7 +387,7 @@ async function main() {
       let releaseFailureRefresh;
       statusCalls = 0;
       const failureRefreshGate = new Promise((resolve) => { releaseFailureRefresh = resolve; });
-      loadStatus = async () => {
+      loadAllAccountOverviews = async () => {
         statusCalls += 1;
         if (statusCalls === 1) {
           await failureRefreshGate;
@@ -266,7 +399,7 @@ async function main() {
       const queuedFailureRefresh = refreshLiveData({ force: true });
       releaseFailureRefresh();
       const [, queuedFailureResult] = await Promise.all([activeFailureRefresh, queuedFailureRefresh]);
-      if (queuedFailureResult.ok || !queuedFailureResult.failures.includes("status")) {
+      if (queuedFailureResult.ok || !queuedFailureResult.failures.includes("accounts")) {
         throw new Error("queued refresh failure result was not propagated");
       }
     })();

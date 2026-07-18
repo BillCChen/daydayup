@@ -45,15 +45,37 @@ class FakeUserStore:
 
 
 class FakeCancelClient:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        cancel_response=None,
+        apply_cancel=True,
+        visibility_delay=0,
+        post_error=None,
+        reconcile_get_errors=0,
+        card_get_error=None,
+    ):
         self.gets = []
         self.posts = []
-        self.order_cancelled = False
+        self.cancel_response = cancel_response or {"msg": "success", "data": ""}
+        self.apply_cancel = apply_cancel
+        self.visibility_delay = visibility_delay
+        self.post_error = post_error
+        self.reconcile_get_errors = reconcile_get_errors
+        self.card_get_error = card_get_error
+        self.cancel_requested = False
+        self.reconcile_get_count = 0
 
     def get(self, endpoint, params=None):
         self.gets.append((endpoint, dict(params or {})))
         if endpoint == "place/getPlaceOrder":
-            return {"msg": "success", "data": [cancelled_order() if self.order_cancelled else active_order()]}
+            if self.cancel_requested:
+                self.reconcile_get_count += 1
+                if self.reconcile_get_count <= self.reconcile_get_errors:
+                    raise web_console.EasySerpError("order reconciliation unavailable")
+                cancellation_visible = self.apply_cancel and self.reconcile_get_count > self.visibility_delay
+                return {"msg": "success", "data": [cancelled_order() if cancellation_visible else active_order()]}
+            return {"msg": "success", "data": [active_order()]}
         if endpoint == "common/getRefundTime":
             return {
                 "msg": "success",
@@ -77,6 +99,8 @@ class FakeCancelClient:
                 },
             }
         if endpoint == "card/getCardByUser":
+            if self.card_get_error:
+                raise self.card_get_error
             return {
                 "msg": "success",
                 "data": [
@@ -92,8 +116,10 @@ class FakeCancelClient:
     def post(self, endpoint, data=None):
         self.posts.append((endpoint, dict(data or {})))
         if endpoint == "place/canclePlaceAppointment":
-            self.order_cancelled = True
-            return {"msg": "success", "data": ""}
+            self.cancel_requested = True
+            if self.post_error:
+                raise self.post_error
+            return self.cancel_response
         raise AssertionError(f"unexpected POST {endpoint}")
 
 
@@ -158,6 +184,124 @@ class CancelBookingTest(unittest.TestCase):
         )
         self.assertTrue(result["confirmed"])
         self.assertEqual(result["booking"]["status"], "取消")
+        self.assertEqual(len(client.posts), 1)
+
+    def test_cancel_reconciles_fail_response_after_applied_side_effect(self):
+        client = FakeCancelClient(cancel_response={"msg": "fail", "data": "fail"})
+        console = make_console(client)
+
+        with patch("web_console.time.sleep", return_value=None):
+            result = console.cancel(
+                {
+                    "user_key": "user_1",
+                    "bill_num": BILL_NUM,
+                    "confirmation": "CANCEL",
+                    "require_confirmed": True,
+                }
+            )
+
+        self.assertTrue(result["confirmed"])
+        self.assertTrue(result["reconciled"])
+        self.assertEqual(result["response"]["msg"], "fail")
+        self.assertEqual(len(client.posts), 1)
+        self.assertEqual(result["reconciliation_checks"], 1)
+
+    def test_cancel_reconciles_request_error_after_applied_side_effect(self):
+        client = FakeCancelClient(post_error=web_console.EasySerpError("cancel request timed out"))
+        console = make_console(client)
+
+        with patch("web_console.time.sleep", return_value=None):
+            result = console.cancel(
+                {
+                    "user_key": "user_1",
+                    "bill_num": BILL_NUM,
+                    "confirmation": "CANCEL",
+                    "require_confirmed": True,
+                }
+            )
+
+        self.assertTrue(result["confirmed"])
+        self.assertTrue(result["reconciled"])
+        self.assertEqual(len(client.posts), 1)
+
+    def test_cancel_retries_until_third_reconciliation_check(self):
+        client = FakeCancelClient(visibility_delay=2)
+        console = make_console(client)
+
+        with patch("web_console.time.sleep", return_value=None):
+            result = console.cancel(
+                {
+                    "user_key": "user_1",
+                    "bill_num": BILL_NUM,
+                    "confirmation": "CANCEL",
+                    "require_confirmed": True,
+                }
+            )
+
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(result["reconciliation_checks"], 3)
+        self.assertEqual(client.reconcile_get_count, 4)
+        self.assertEqual(len(client.posts), 1)
+
+    def test_cancel_preserves_upstream_failure_when_order_remains_active(self):
+        client = FakeCancelClient(
+            cancel_response={"msg": "fail", "data": "operation rejected"},
+            apply_cancel=False,
+        )
+        console = make_console(client)
+
+        with patch("web_console.time.sleep", return_value=None):
+            with self.assertRaisesRegex(web_console.EasySerpError, "canclePlaceAppointment failed: operation rejected"):
+                console.cancel(
+                    {
+                        "user_key": "user_1",
+                        "bill_num": BILL_NUM,
+                        "confirmation": "CANCEL",
+                        "require_confirmed": True,
+                    }
+                )
+
+        self.assertEqual(client.reconcile_get_count, 3)
+        self.assertEqual(len(client.posts), 1)
+
+    def test_cancel_preserves_failure_when_reconciliation_queries_fail(self):
+        client = FakeCancelClient(
+            cancel_response={"msg": "fail", "data": "fail"},
+            reconcile_get_errors=3,
+        )
+        console = make_console(client)
+
+        with patch("web_console.time.sleep", return_value=None):
+            with self.assertRaisesRegex(web_console.EasySerpError, "canclePlaceAppointment failed: fail"):
+                console.cancel(
+                    {
+                        "user_key": "user_1",
+                        "bill_num": BILL_NUM,
+                        "confirmation": "CANCEL",
+                        "require_confirmed": True,
+                    }
+                )
+
+        self.assertEqual(client.reconcile_get_count, 3)
+        self.assertEqual(len(client.posts), 1)
+
+    def test_confirmed_cancel_is_not_reclassified_when_balance_refresh_fails(self):
+        client = FakeCancelClient(card_get_error=web_console.EasySerpError("card refresh unavailable"))
+        console = make_console(client)
+
+        with patch("web_console.time.sleep", return_value=None):
+            result = console.cancel(
+                {
+                    "user_key": "user_1",
+                    "bill_num": BILL_NUM,
+                    "confirmation": "CANCEL",
+                    "require_confirmed": True,
+                }
+            )
+
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(result["refresh_errors"], ["cards"])
+        self.assertEqual(len(client.posts), 1)
 
 
 if __name__ == "__main__":

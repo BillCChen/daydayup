@@ -125,6 +125,35 @@ class MultiPoolUserStoreTest(unittest.TestCase):
             store.ensure_exists()
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
+    def test_primary_and_secondary_roles_do_not_depend_on_csv_order(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "users.csv"
+            store = web_console.UserStore(path, default_token="token-primary", default_jsessionid="session-primary")
+            store.upsert_user(
+                {
+                    "key": web_console.DEFAULT_SECONDARY_USER_KEY,
+                    "label": web_console.DEFAULT_SECONDARY_USER_LABEL,
+                    "token": "token-secondary",
+                    "jsessionid": "",
+                    "card_name": "学生球类卡",
+                    "enabled": True,
+                }
+            )
+            rows = store._read_rows_unlocked()
+            config_rows = [row for row in rows if row.get("type") == "config"]
+            user_rows = [row for row in rows if row.get("type") == "user"]
+            user_rows.sort(key=lambda row: row.get("key") != web_console.DEFAULT_SECONDARY_USER_KEY)
+            store._write_rows_unlocked(config_rows + user_rows)
+
+            self.assertEqual(store.get_user().key, web_console.DEFAULT_USER_KEY)
+
+            console = web_console.WebConsole.__new__(web_console.WebConsole)
+            console.users = store
+            result = console.user_list()
+            self.assertEqual(result["default_user_key"], web_console.DEFAULT_USER_KEY)
+            self.assertEqual(result["primary_user_key"], web_console.DEFAULT_USER_KEY)
+            self.assertEqual(result["secondary_user_key"], web_console.DEFAULT_SECONDARY_USER_KEY)
+
     def test_duplicate_token_is_rejected_without_writing_a_second_user(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "users.csv"
@@ -459,15 +488,18 @@ class MultiPoolFrontendSafetyTest(unittest.TestCase):
         javascript = (root / "web" / "app.js").read_text(encoding="utf-8")
 
         self.assertIn('id="availabilityRefreshState" role="status" aria-live="polite"', html)
+        self.assertIn('id="accountOverview" role="list" aria-live="polite"', html)
+        self.assertIn("操作账号", html)
+        self.assertEqual(html.count('id="availability"'), 1)
         self.assertIn('id="userSaveMessage" role="status" aria-live="polite"', html)
-        for function_name in ("loadStatus", "loadCards", "loadBookings", "loadBookingHistory", "loadScanTasks"):
-            body = javascript.split(f"async function {function_name}()", 1)[1].split("\n}", 1)[0]
-            self.assertIn("const requestUserKey = state.selectedUserKey;", body)
-            self.assertIn("if (!isCurrentUserRequest(requestUserKey))", body)
+        self.assertIn("accountSnapshots", javascript)
+        self.assertIn("async function loadAllAccountOverviews()", javascript)
+        self.assertIn("data-cancel-user-key", javascript)
+        self.assertIn("openCancelDialog(button.dataset.cancelBill, button.dataset.cancelUserKey)", javascript)
 
         change_user = javascript.split("async function changeUser()", 1)[1].split("function showAccountDataLoading()", 1)[0]
         self.assertIn("showAccountDataLoading();", change_user)
-        self.assertIn("await triggerRefresh({ includeUsers: false, force: true });", change_user)
+        self.assertIn("await triggerRefresh({ includeUsers: false, force: false });", change_user)
         save_user = javascript.split("async function saveUser(event)", 1)[1].split("function setTokenHelperMessage", 1)[0]
         self.assertIn("if (previousUserKey !== state.selectedUserKey)", save_user)
         self.assertIn("showAccountDataLoading();", save_user)
