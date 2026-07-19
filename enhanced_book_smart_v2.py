@@ -41,7 +41,7 @@ BOOKING_MODE_BALANCED = "balanced"
 BOOKING_MODE_DIRECT_FAST = "direct-fast"
 BOOKING_MODE_GUIDED_FAST = "guided-fast"
 BOOKING_MODES = (BOOKING_MODE_BALANCED, BOOKING_MODE_DIRECT_FAST, BOOKING_MODE_GUIDED_FAST)
-BOOKING_ENGINE_VERSION = "3.8.0"
+BOOKING_ENGINE_VERSION = "3.8.1"
 PREWARM_SECONDS = 6.0
 BUSY_RETRY_TEXT = "当前排队人数较多"
 FAST_RETRY_TEXT = "操作过快"
@@ -56,9 +56,12 @@ DEFAULT_RESERVATION_PLACE_TIMEOUT = 2.5
 DEFAULT_RESERVATION_PLACE_MIN_BUDGET = 0.75
 DEFAULT_RESERVATION_RECONCILE_DELAYS = (0.25, 1.0, 2.5)
 DEFAULT_RESERVATION_RECONCILE_TIMEOUT = 1.5
+DEFAULT_MULTI_POOL_POST_RECONCILE_DELAYS = (2.0, 5.0, 10.0)
+DEFAULT_MULTI_POOL_POST_RECONCILE_TIMEOUT = 2.0
+DEFAULT_MULTI_POOL_POST_RECONCILE_REQUIRED_ABSENCES = 2
 DEFAULT_RESERVATION_PLACE_MAX_FAST_RETRY_GAP = 3.0
 RESERVATION_PLACE_FAST_RETRY_FACTOR = 1.5
-DEFAULT_MULTI_POOL_SECOND_ACCOUNT_DELAY = 0.35
+DEFAULT_MULTI_POOL_SECOND_ACCOUNT_DELAY = 0.0
 MULTI_POOL_SLOTS = ("pool_1", "pool_2")
 USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 16; V2366HA Build/BP2A.250605.031.A3; wv) "
@@ -159,7 +162,7 @@ class MultiPoolCoordinator:
         self.event_callback = event_callback
         self.condition = threading.Condition()
         self.hour_states = {
-            hour: {"state": "available", "account_slot": None, "candidate": None}
+            hour: self._new_hour_record()
             for hour in hours
         }
         self.global_next_allowed_at = 0.0
@@ -168,6 +171,17 @@ class MultiPoolCoordinator:
     def _emit(self, event, **fields):
         if self.event_callback:
             self.event_callback(event, **fields)
+
+    @staticmethod
+    def _new_hour_record():
+        return {
+            "state": "available",
+            "account_slot": None,
+            "candidate": None,
+            "last_attempt_account_slot": None,
+            "last_attempt_candidate": None,
+            "last_attempt_result": None,
+        }
 
     @staticmethod
     def _normalize_target_hours(target_hours):
@@ -185,7 +199,7 @@ class MultiPoolCoordinator:
             for hour in hours:
                 self.hour_states.setdefault(
                     hour,
-                    {"state": "available", "account_slot": None, "candidate": None},
+                    self._new_hour_record(),
                 )
             self.condition.notify_all()
 
@@ -259,6 +273,9 @@ class MultiPoolCoordinator:
                 state="available" if result == "failed" else result,
                 account_slot=None if result == "failed" else account_slot,
                 candidate=None if result == "failed" else candidate,
+                last_attempt_account_slot=account_slot,
+                last_attempt_candidate=candidate,
+                last_attempt_result=result,
             )
             if too_fast:
                 self.global_fast_retry_streak += 1
@@ -291,6 +308,42 @@ class MultiPoolCoordinator:
             self.condition.notify_all()
             return record["state"]
 
+    def resolve_unknown(self, hour, account_slot, result, candidate=None):
+        with self.condition:
+            if hour not in self.hour_states:
+                raise ValueError("hour is outside the multi_pool target pair")
+            if result not in ("confirmed", "tombstoned"):
+                raise ValueError("unknown multi_pool result can only resolve to confirmed or tombstoned")
+            record = self.hour_states[hour]
+            if record["state"] != "unknown":
+                raise RuntimeError("multi_pool hour is not awaiting reconciliation")
+            if record["account_slot"] != account_slot:
+                raise RuntimeError("multi_pool unknown hour must be reconciled by the original account slot")
+            original_candidate = record["candidate"]
+            if candidate is not None and original_candidate is not None:
+                if (
+                    candidate.get("hour"),
+                    candidate.get("court_id"),
+                ) != (
+                    original_candidate.get("hour"),
+                    original_candidate.get("court_id"),
+                ):
+                    raise RuntimeError("multi_pool reconciliation candidate does not match the original write")
+            resolved_candidate = original_candidate or candidate
+            record.update(
+                state=result,
+                candidate=resolved_candidate,
+                last_attempt_result=result,
+            )
+            self._emit(
+                "multi_pool_unknown_resolved",
+                account_slot=account_slot,
+                hour=hour,
+                state=result,
+            )
+            self.condition.notify_all()
+            return result
+
     def snapshot(self):
         with self.condition:
             return {
@@ -298,6 +351,9 @@ class MultiPoolCoordinator:
                     "state": record["state"],
                     "account_slot": record["account_slot"],
                     "candidate": record["candidate"],
+                    "last_attempt_account_slot": record["last_attempt_account_slot"],
+                    "last_attempt_candidate": record["last_attempt_candidate"],
+                    "last_attempt_result": record["last_attempt_result"],
                 }
                 for hour, record in self.hour_states.items()
             }
@@ -379,6 +435,7 @@ class ReservationPlaceGate:
         required_hours=2,
         max_fast_retry_gap_seconds=DEFAULT_RESERVATION_PLACE_MAX_FAST_RETRY_GAP,
         success_gap_seconds=None,
+        business_failure_gap_seconds=None,
     ):
         self.gap_seconds = max(float(gap_seconds or 0), 0.0)
         self.fast_retry_gap_seconds = max(float(fast_retry_gap_seconds or 0), 0.0)
@@ -389,6 +446,12 @@ class ReservationPlaceGate:
         if success_gap_seconds is None:
             success_gap_seconds = max(self.gap_seconds, self.fast_retry_gap_seconds)
         self.success_gap_seconds = max(float(success_gap_seconds or 0), self.gap_seconds)
+        if business_failure_gap_seconds is None:
+            business_failure_gap_seconds = self.gap_seconds
+        self.business_failure_gap_seconds = max(
+            float(business_failure_gap_seconds or 0),
+            self.gap_seconds,
+        )
         self.required_hours = 1 if int(required_hours or 1) <= 1 else 2
         self.logger = logger
         self.condition = threading.Condition()
@@ -564,6 +627,10 @@ class ReservationPlaceGate:
                 self.fast_retry_streak = 0
                 gap = self.success_gap_seconds
                 cooldown_reason = "unknown_outcome"
+            elif result == "business_failure":
+                self.fast_retry_streak = 0
+                gap = self.business_failure_gap_seconds
+                cooldown_reason = "business_failure"
             else:
                 self.fast_retry_streak = 0
                 gap = self.gap_seconds
@@ -919,6 +986,7 @@ class SmartBookingBotV2:
                     logger=self.logger,
                     required_hours=1,
                     success_gap_seconds=DEFAULT_RESERVATION_PLACE_SUCCESS_GAP,
+                    business_failure_gap_seconds=DEFAULT_RESERVATION_PLACE_SUCCESS_GAP,
                 )
             self.client = self.account_pool[0].client
         else:
@@ -1980,11 +2048,20 @@ class SmartBookingBotV2:
                         and not self._response_success(r3)
                         and self._failure_data(r3).find(FAST_RETRY_TEXT) >= 0
                     )
+                    is_business_failure = (
+                        reservation_outcome == "failed"
+                        and r3 is not None
+                        and r3.status == 200
+                        and isinstance(r3.json_data, dict)
+                        and not is_fast_response
+                    )
                     gate_result = (
                         reservation_outcome
                         if reservation_outcome in ("success", "unknown_outcome")
                         else "fast_retry"
                         if is_fast_response
+                        else "business_failure"
+                        if is_business_failure
                         else "failed"
                     )
                     active_gate.record_response(
@@ -2158,6 +2235,13 @@ class SmartBookingBotV2:
             time.sleep(delay)
         return self.direct_deadline is None or time.monotonic() < self.direct_deadline
 
+    @staticmethod
+    def _sleep_before_multi_pool_post_reconciliation(delay):
+        delay = max(float(delay or 0), 0.0)
+        if delay > 0:
+            time.sleep(delay)
+        return True
+
     def _reconcile_reservation_outcome(
         self,
         request_client,
@@ -2254,6 +2338,166 @@ class SmartBookingBotV2:
             elapsed_ms=round((time.monotonic() - started_at) * 1000),
         )
         return outcome
+
+    def _reconcile_multi_pool_unknown_hour(
+        self,
+        coordinator,
+        account_context,
+        hour,
+    ):
+        initial_record = coordinator.snapshot().get(hour, {})
+        candidate = initial_record.get("candidate")
+        if (
+            initial_record.get("state") != "unknown"
+            or initial_record.get("account_slot") != account_context.slot
+            or not candidate
+        ):
+            return initial_record.get("state", "unknown")
+
+        label = f"multi_pool_{account_context.slot}_h{hour}_post_reconcile"
+        started_at = time.monotonic()
+        successful_absences = 0
+        self.log_event(
+            "multi_pool_post_reconcile_start",
+            account_slot=account_context.slot,
+            hour=hour,
+            court=candidate["court_id"],
+            scheduled_delay_ms=[
+                round(delay * 1000)
+                for delay in DEFAULT_MULTI_POOL_POST_RECONCILE_DELAYS
+            ],
+        )
+        for attempt, scheduled_delay in enumerate(
+            DEFAULT_MULTI_POOL_POST_RECONCILE_DELAYS,
+            start=1,
+        ):
+            wait_seconds = max(
+                scheduled_delay - (time.monotonic() - started_at),
+                0.0,
+            )
+            if not self._sleep_before_multi_pool_post_reconciliation(wait_seconds):
+                break
+
+            current_record = coordinator.snapshot().get(hour, {})
+            if (
+                current_record.get("state") != "unknown"
+                or current_record.get("account_slot") != account_context.slot
+            ):
+                self.log_event(
+                    "multi_pool_post_reconcile_stopped",
+                    account_slot=account_context.slot,
+                    hour=hour,
+                    reason="state_changed",
+                    state=current_record.get("state"),
+                )
+                return current_record.get("state", "unknown")
+
+            result = account_context.client.request(
+                "GET",
+                "/place/getPlaceOrder",
+                params={
+                    "pageNo": 0,
+                    "pageSize": 20,
+                    "shopNum": SHOP_NUM,
+                    "token": account_context.token,
+                },
+                timeout=DEFAULT_MULTI_POOL_POST_RECONCILE_TIMEOUT,
+                label=f"{label}_getPlaceOrder_{attempt}",
+                retry_transport=False,
+            )
+            orders = result.json_data.get("data") if self._response_success(result) else None
+            if not isinstance(orders, list):
+                outcome = "query_failed"
+                order_count = 0
+            else:
+                order_count = len(orders)
+                if any(self._order_matches_candidate(order, candidate) for order in orders):
+                    outcome = "confirmed"
+                else:
+                    successful_absences += 1
+                    outcome = "not_found"
+
+            self.log_event(
+                "multi_pool_post_reconcile_snapshot",
+                account_slot=account_context.slot,
+                hour=hour,
+                court=candidate["court_id"],
+                attempt=attempt,
+                scheduled_delay_ms=round(scheduled_delay * 1000),
+                outcome=outcome,
+                order_count=order_count,
+                successful_absences=successful_absences,
+                query_status=result.status,
+                query_elapsed_ms=round(result.elapsed * 1000),
+            )
+            if outcome == "confirmed":
+                coordinator.resolve_unknown(
+                    hour,
+                    account_context.slot,
+                    "confirmed",
+                    candidate,
+                )
+                self._log_multi_pool_slot_result(
+                    account_context,
+                    candidate,
+                    "confirmed",
+                    "post_run_order_reconciliation",
+                )
+                return "confirmed"
+            if (
+                outcome == "not_found"
+                and successful_absences
+                >= DEFAULT_MULTI_POOL_POST_RECONCILE_REQUIRED_ABSENCES
+            ):
+                coordinator.resolve_unknown(
+                    hour,
+                    account_context.slot,
+                    "tombstoned",
+                    candidate,
+                )
+                self._log_multi_pool_slot_result(
+                    account_context,
+                    candidate,
+                    "tombstoned",
+                    "post_run_order_reconciliation_stable_not_found",
+                )
+                return "tombstoned"
+
+        self.log_event(
+            "multi_pool_post_reconcile_result",
+            account_slot=account_context.slot,
+            hour=hour,
+            court=candidate["court_id"],
+            status="unknown",
+            successful_absences=successful_absences,
+        )
+        return "unknown"
+
+    def _reconcile_multi_pool_unknowns(self, contexts):
+        if self.args.dry_run:
+            return
+        snapshot = self.multi_pool_coordinator.snapshot()
+        context_by_slot = {context.slot: context for context in contexts}
+        workers = []
+        for hour, record in snapshot.items():
+            if record["state"] != "unknown":
+                continue
+            account_context = context_by_slot.get(record["account_slot"])
+            if account_context is None:
+                self.log_event(
+                    "multi_pool_post_reconcile_skipped",
+                    hour=hour,
+                    reason="original_account_unavailable",
+                )
+                continue
+            worker = threading.Thread(
+                target=self._reconcile_multi_pool_unknown_hour,
+                args=(self.multi_pool_coordinator, account_context, hour),
+            )
+            worker.start()
+            workers.append(worker)
+        for worker in workers:
+            worker.join()
 
     def _order_matches_candidate(self, order, candidate):
         if not isinstance(order, dict) or "取消" in str(order.get("prestatus") or ""):
@@ -3044,10 +3288,20 @@ class SmartBookingBotV2:
                 pending.append(candidate)
 
         if final_result in ("failed", "dry_run"):
-            source = "dry_run" if self.args.dry_run else "candidate_exhausted"
+            final_record = coordinator.snapshot()[target_hour]
+            attempted_candidate = final_record.get("last_attempt_candidate")
+            if self.args.dry_run:
+                result_candidate = last_candidate
+                source = "dry_run"
+            elif final_record.get("last_attempt_result") == "failed" and attempted_candidate:
+                result_candidate = attempted_candidate
+                source = "reservation_failed"
+            else:
+                result_candidate = last_candidate
+                source = "candidate_exhausted"
             self._log_multi_pool_slot_result(
                 account_context,
-                last_candidate,
+                result_candidate,
                 final_result,
                 source,
             )
@@ -3154,6 +3408,7 @@ class SmartBookingBotV2:
             if collector_thread is not None:
                 collector_thread.join(timeout=1.0)
 
+        self._reconcile_multi_pool_unknowns(contexts)
         snapshot = self.multi_pool_coordinator.snapshot()
         confirmed = sorted(hour for hour, record in snapshot.items() if record["state"] == "confirmed")
         unknown = sorted(hour for hour, record in snapshot.items() if record["state"] == "unknown")

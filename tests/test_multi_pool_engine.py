@@ -95,6 +95,8 @@ class FakeClient:
                 "timeout_query_failure",
                 "timeout_confirm",
                 "timeout_confirm_third",
+                "timeout_post_confirm",
+                "timeout_post_empty",
             ):
                 return smart.HttpResult(0, "", 2.5, error_kind="timeout")
             return smart.HttpResult(
@@ -109,7 +111,9 @@ class FakeClient:
             if mode == "timeout_query_failure":
                 return smart.HttpResult(0, "", 0.01, error_kind="timeout")
             orders = []
-            if mode == "timeout_confirm" or (
+            if mode in ("timeout_post_confirm", "timeout_post_empty") and self.order_query_count == 1:
+                return smart.HttpResult(0, "", 0.01, error_kind="timeout")
+            if mode in ("timeout_confirm", "timeout_post_confirm") or (
                 mode == "timeout_confirm_third" and self.order_query_count == 3
             ):
                 hour = self._reconcile_hour()
@@ -200,7 +204,7 @@ class AccountPoolInputTest(unittest.TestCase):
 
         parsed = smart.build_parser().parse_args(["-t", "18-20"])
         self.assertFalse(parsed.account_pool_stdin)
-        self.assertEqual(smart.BOOKING_ENGINE_VERSION, "3.8.0")
+        self.assertEqual(smart.BOOKING_ENGINE_VERSION, "3.8.1")
 
     def test_runtime_mode_is_enforced_again_inside_the_engine(self):
         args = make_args()
@@ -346,12 +350,102 @@ class MultiPoolCoordinatorTest(unittest.TestCase):
         self.assertEqual(coordinator.try_acquire(19, "pool_2", candidate, now=1), "global_cooldown")
         self.assertEqual(coordinator.try_acquire(19, "pool_2", candidate, now=1.8), "acquired")
 
+    def test_unknown_can_only_be_resolved_by_original_owner(self):
+        coordinator = smart.MultiPoolCoordinator((18, 19), 1.2)
+        candidate = {"hour": 18, "court_id": "ymq7"}
+        coordinator.try_acquire(18, "pool_1", candidate, now=0)
+        coordinator.record(18, "pool_1", "unknown", candidate, now=0)
+
+        with self.assertRaisesRegex(RuntimeError, "original account"):
+            coordinator.resolve_unknown(18, "pool_2", "confirmed", candidate)
+        self.assertEqual(
+            coordinator.resolve_unknown(18, "pool_1", "confirmed", candidate),
+            "confirmed",
+        )
+        self.assertEqual(coordinator.snapshot()[18]["state"], "confirmed")
+
 
 class MultiPoolBookingTest(unittest.TestCase):
     def make_bot(self, **overrides):
         bot = smart.SmartBookingBotV2(make_args(**overrides))
         bot._sleep_before_reconciliation = lambda _delay: True
+        bot._sleep_before_multi_pool_post_reconciliation = lambda _delay: True
         return bot
+
+    def test_secondary_account_has_no_fixed_start_delay(self):
+        bot = self.make_bot()
+        clients = (FakeClient(), FakeClient())
+        attach_clients(bot, *clients)
+        events = []
+        bot.log_event = lambda event, **fields: events.append((event, fields))
+
+        status = bot.run_multi_pool_mode()
+
+        self.assertEqual(status, "success")
+        start = next(fields for event, fields in events if event == "multi_pool_start")
+        self.assertEqual(start["second_account_delay_ms"], 0)
+        self.assertFalse(any(event == "multi_pool_account_start_delay" for event, _fields in events))
+
+    def test_final_submit_business_failure_uses_write_cooldown(self):
+        bot = self.make_bot()
+        client = FakeClient("business")
+        context = bot.account_pool[0]
+        context.client = client
+        coordinator = smart.MultiPoolCoordinator((18, 19), 1.2)
+        bot.direct_deadline = time.monotonic() + 1
+        candidate = bot._synthetic_candidate(18, "ymq7")
+
+        result = bot.attempt_single_hour_booking(
+            candidate,
+            "multi_pool_pool_1_h18",
+            1,
+            1,
+            1,
+            client=client,
+            account_context=context,
+            multi_pool_coordinator=coordinator,
+        )
+
+        self.assertEqual(result, "candidate_taken")
+        self.assertAlmostEqual(
+            context.reservation_gate.last_cooldown_seconds,
+            smart.DEFAULT_RESERVATION_PLACE_SUCCESS_GAP,
+        )
+        self.assertEqual(context.reservation_gate.last_cooldown_reason, "business_failure")
+
+    def test_failed_hour_reports_last_final_submit_candidate(self):
+        class FinalThenCanBookMissClient(FakeClient):
+            @staticmethod
+            def _court(data):
+                fields = json.loads(data["fieldinfo"])
+                return fields[0]["placeShortName"]
+
+            def request(self, method, endpoint, **kwargs):
+                if endpoint == "/place/canBook" and self._court(kwargs["data"]) == "ymq8":
+                    with self.lock:
+                        self.calls.append((method, endpoint, kwargs, self._hour(kwargs.get("data"))))
+                    return smart.HttpResult(
+                        200,
+                        "",
+                        0.01,
+                        json_data={"msg": "fail", "data": smart.TAKEN_RETRY_TEXT},
+                    )
+                return super().request(method, endpoint, **kwargs)
+
+        bot = self.make_bot(priority=[7], backup=[8])
+        context = bot.account_pool[0]
+        context.client = FinalThenCanBookMissClient("business")
+        coordinator = smart.MultiPoolCoordinator((18, 19), 1.2)
+        bot.direct_deadline = time.monotonic() + 2
+        events = []
+        bot.log_event = lambda event, **fields: events.append((event, fields))
+
+        bot._run_multi_pool_account(context, 18, coordinator, None, {}, threading.Lock(), 0)
+
+        result = next(fields for event, fields in events if event == "multi_pool_slot_result")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["court"], "ymq7")
+        self.assertEqual(result["source"], "reservation_failed")
 
     def test_prewarm_uses_each_account_client_and_never_builds_legacy_workers(self):
         bot = self.make_bot()
@@ -410,6 +504,64 @@ class MultiPoolBookingTest(unittest.TestCase):
         self.assertFalse(any(call[1] == "/place/getPlaceOrder" for call in pool_1.calls))
         complete = next(fields for event, fields in events if event == "multi_pool_complete")
         self.assertEqual(complete["unknown_hours"], [19])
+
+    def test_delayed_original_account_reconciliation_can_resolve_unknown(self):
+        bot = self.make_bot()
+        pool_1 = FakeClient("success")
+        pool_2 = FakeClient("timeout_post_confirm")
+        attach_clients(bot, pool_1, pool_2)
+        events = []
+        bot.log_event = lambda event, **fields: events.append((event, fields))
+
+        status = bot.run_multi_pool_mode()
+
+        self.assertEqual(status, "success")
+        self.assertEqual(bot.multi_pool_coordinator.snapshot()[19]["state"], "confirmed")
+        self.assertEqual(
+            len([call for call in pool_2.calls if call[1] == "/place/reservationPlace"]),
+            1,
+        )
+        order_calls = [call for call in pool_2.calls if call[1] == "/place/getPlaceOrder"]
+        self.assertGreaterEqual(len(order_calls), 2)
+        self.assertTrue(all(call[2]["params"]["token"] == "token-b" for call in order_calls))
+        self.assertFalse(any(call[1] == "/place/getPlaceOrder" for call in pool_1.calls))
+        pool_2_results = [
+            fields
+            for event, fields in events
+            if event == "multi_pool_slot_result" and fields["account_slot"] == "pool_2"
+        ]
+        self.assertEqual([item["status"] for item in pool_2_results], ["unknown", "confirmed"])
+        self.assertEqual(pool_2_results[-1]["source"], "post_run_order_reconciliation")
+
+    def test_delayed_original_account_reconciliation_can_tombstone_stable_absence(self):
+        bot = self.make_bot()
+        pool_1 = FakeClient("success")
+        pool_2 = FakeClient("timeout_post_empty")
+        attach_clients(bot, pool_1, pool_2)
+        events = []
+        bot.log_event = lambda event, **fields: events.append((event, fields))
+
+        status = bot.run_multi_pool_mode()
+
+        self.assertEqual(status, "partial")
+        self.assertEqual(bot.multi_pool_coordinator.snapshot()[19]["state"], "tombstoned")
+        self.assertEqual(
+            len([call for call in pool_2.calls if call[1] == "/place/reservationPlace"]),
+            1,
+        )
+        order_calls = [call for call in pool_2.calls if call[1] == "/place/getPlaceOrder"]
+        self.assertEqual(len(order_calls), 3)
+        self.assertTrue(all(call[2]["params"]["token"] == "token-b" for call in order_calls))
+        pool_2_results = [
+            fields
+            for event, fields in events
+            if event == "multi_pool_slot_result" and fields["account_slot"] == "pool_2"
+        ]
+        self.assertEqual([item["status"] for item in pool_2_results], ["unknown", "tombstoned"])
+        self.assertEqual(
+            pool_2_results[-1]["source"],
+            "post_run_order_reconciliation_stable_not_found",
+        )
 
     def test_both_unknown_stops_as_unknown(self):
         bot = self.make_bot()
@@ -535,7 +687,7 @@ class MultiPoolBookingTest(unittest.TestCase):
         self.assertEqual(bot.account_pool[1].reservation_gate.last_cooldown_seconds, 0)
 
     def test_confirmed_anchor_tries_alternate_neighbor_and_keeps_hour_owner(self):
-        bot = self.make_bot(time="17-21", window_seconds=2)
+        bot = self.make_bot(time="17-21", window_seconds=3)
         pool_1 = FakeClient(mode_by_hour={18: "success", 20: "success", 17: "success"})
         pool_2 = FakeClient(mode_by_hour={19: "business", 17: "success", 20: "success"})
         attach_clients(bot, pool_1, pool_2)

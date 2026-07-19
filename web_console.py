@@ -1401,7 +1401,7 @@ def parse_multi_pool_events(
         for item in participant_users
         if isinstance(item, dict)
     }
-    hour_ownership: list[dict[str, Any]] = []
+    hour_ownership_by_key: dict[tuple[str, int], dict[str, Any]] = {}
     pool_summary: dict[str, Any] = {}
     for line in lines:
         match = re.search(r"\[EVENT\]\s*(\{.*\})\s*$", line)
@@ -1437,7 +1437,7 @@ def parse_multi_pool_events(
                 "court": clean_string(event.get("court")),
                 "source": clean_string(event.get("source")),
             }
-            hour_ownership.append(item)
+            hour_ownership_by_key[(item["target_date"], item["hour"])] = item
         elif event_name == "multi_pool_complete":
             status = clean_string(event.get("status"))
             if status not in {"success", "partial", "unknown", "failed", "dry_run"}:
@@ -1448,6 +1448,14 @@ def parse_multi_pool_events(
                 "unknown_hours": parse_int_list(event.get("unknown_hours")),
                 "tombstoned_hours": parse_int_list(event.get("tombstoned_hours")),
             }
+    hour_ownership = sorted(
+        hour_ownership_by_key.values(),
+        key=lambda item: (
+            item["target_date"],
+            item["hour"],
+            item["account_slot"],
+        ),
+    )
     return {"hour_ownership": hour_ownership, "pool_summary": pool_summary}
 
 

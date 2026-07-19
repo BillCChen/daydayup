@@ -447,6 +447,38 @@ class MultiPoolHistoryTest(unittest.TestCase):
         self.assertEqual(summary["pool_summary"]["unknown_hours"], [21])
         self.assertNotIn("prefix", json.dumps(summary, ensure_ascii=False))
 
+    def test_latest_slot_result_replaces_stale_unknown_history_row(self):
+        participants = [
+            {"slot": "pool_1", "user_key": "user_1", "user_label": "User 1"},
+            {"slot": "pool_2", "user_key": "user_2", "user_label": "User 2"},
+        ]
+        lines = [
+            'prefix [EVENT] {"event":"multi_pool_slot_result","account_slot":"pool_2","status":"unknown","target_date":"2026-07-19","hour":19,"end_hour":20,"court":"ymq6","source":"reconcile"}',
+            'prefix [EVENT] {"event":"multi_pool_slot_result","account_slot":"pool_2","status":"confirmed","target_date":"2026-07-19","hour":19,"end_hour":20,"court":"ymq6","source":"post_run_order_reconciliation"}',
+            'prefix [EVENT] {"event":"multi_pool_complete","status":"success","confirmed_hours":[18,19],"unknown_hours":[],"tombstoned_hours":[]}',
+        ]
+        job = web_console.BookingJob(
+            id=1,
+            process=SimpleNamespace(),
+            started_at=1.0,
+            command_label="multi_pool",
+            history_id="history-1",
+            lines=lines,
+            status="completed",
+            returncode=0,
+            participant_users=participants,
+        )
+
+        summary = web_console.summarize_job_history(job)
+
+        self.assertEqual(summary["result"], "成功")
+        self.assertEqual(len(summary["hour_ownership"]), 1)
+        self.assertEqual(summary["hour_ownership"][0]["status"], "confirmed")
+        self.assertEqual(
+            summary["hour_ownership"][0]["source"],
+            "post_run_order_reconciliation",
+        )
+
     def test_history_filter_matches_any_participant_and_keeps_legacy_fallback(self):
         record = {
             "user_key": "user_1",
